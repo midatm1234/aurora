@@ -28,6 +28,7 @@ htmlcov
 # Other
 .DS_Store
 *.swp
+*.gif
 .envrc
 
 checkpoints/
