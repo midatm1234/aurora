@@ -1,0 +1,203 @@
+paths:
+  project_root: .
+  data_dir: ../data
+  train_data_path: ../data/train.nc
+  val_data_path: ../data/train.nc
+  test_data_path: ../data/test.nc
+  output_dir: ./outputs
+  checkpoint_dir: ./outputs/checkpoints
+  pretrained_checkpoint: ""  # Optional local checkpoint path. Empty uses model default HF checkpoint.
+  static_data_path: /mnt/data3/cams/aurora-0.4-air-pollution-static.pickle  # Pickle with lsm, z, slt (from HuggingFace)
+  optional_resume_checkpoint: ""
+
+data:
+  predictor_variables:
+    - dataset_name: t2m
+      aurora_name: 2t
+      kind: surf
+    - dataset_name: u10
+      aurora_name: 10u
+      kind: surf
+    - dataset_name: v10
+      aurora_name: 10v
+      kind: surf
+    - dataset_name: msl
+      aurora_name: msl
+      kind: surf
+    - dataset_name: tcno2
+      aurora_name: tcno2
+      kind: surf
+    - dataset_name: z
+      aurora_name: z
+      kind: atmos
+    - dataset_name: u
+      aurora_name: u
+      kind: atmos
+    - dataset_name: v
+      aurora_name: v
+      kind: atmos
+    - dataset_name: t
+      aurora_name: t
+      kind: atmos
+    - dataset_name: q
+      aurora_name: q
+      kind: atmos
+    - dataset_name: no2
+      aurora_name: no2
+      kind: atmos
+
+  target_variables:
+    - dataset_name: no2
+      aurora_name: no2
+      kind: atmos
+    - dataset_name: tcno2
+      aurora_name: tcno2
+      kind: surf
+
+  static_variables:
+    - dataset_name: lsm
+      aurora_name: lsm
+      kind: static
+    - dataset_name: z_static
+      aurora_name: z
+      kind: static
+    - dataset_name: slt
+      aurora_name: slt
+      kind: static
+    - dataset_name: static_ammonia
+      aurora_name: static_ammonia
+      kind: static
+    - dataset_name: static_ammonia_log
+      aurora_name: static_ammonia_log
+      kind: static
+    - dataset_name: static_co
+      aurora_name: static_co
+      kind: static
+    - dataset_name: static_co_log
+      aurora_name: static_co_log
+      kind: static
+    - dataset_name: static_nox
+      aurora_name: static_nox
+      kind: static
+    - dataset_name: static_nox_log
+      aurora_name: static_nox_log
+      kind: static
+    - dataset_name: static_so2
+      aurora_name: static_so2
+      kind: static
+    - dataset_name: static_so2_log
+      aurora_name: static_so2_log
+      kind: static
+
+  atmos_levels: [50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000]
+  input_time_steps: 2
+  target_lead_times: [1,2]  # Lead in Aurora model steps (12h for AuroraAirPollution).
+  target_type: next-step  # next-step | multi-step | rollout
+
+  domain_type: regional  # global | regional
+  lat_min: 25.0
+  lat_max: 50.0
+  lon_min: -125.0
+  lon_max: -50.0
+
+  data_format: netcdf  # netcdf | zarr | xarray
+  backend: netcdf
+  predictor_mapping_to_aurora_names: {}
+  target_mapping_from_aurora_outputs: {}
+  static_mapping_to_aurora_names: {}
+
+  time_dim: time
+  lat_dim: latitude
+  lon_dim: longitude
+  level_dim: level
+  extra_dim_indexers: {}  # Example: {member: 0}
+
+  normalization:
+    enabled: false
+    mode: none
+    input_stats: {}
+    target_stats: {}
+
+  split_controls:
+    train:
+      start_offset: 0
+      end_offset: null
+      stride: 1
+      max_samples: null
+    val:
+      start_offset: 0
+      end_offset: null
+      stride: 1
+      max_samples: null
+    test:
+      start_offset: 0
+      end_offset: null
+      stride: 1
+      max_samples: null
+
+  optional_masks_for_missing_values: {}  # Example: {t2m: valid_mask_t2m}
+
+  loss_mask_options:
+    mode: none  # none | land | ocean
+    threshold: 0.5
+
+  include_target_variables_as_predictors: false
+  patch_alignment_strategy: crop
+
+model:
+  model_variant: aurora_air_pollution
+  patch_size: 3  # AuroraAirPollution uses patch_size=3.
+  use_pretrained_weights: true
+  backbone_freeze: true
+  freeze_embeddings: true
+  freeze_encoder: true
+  freeze_decoder: false
+  trainable_head_only: false
+  gradient_checkpointing: true
+  mixed_precision: bf16  # none | bf16 | fp16
+  device: cuda
+  compile_model: false
+  model_kwargs: {}
+
+training:
+  seed: 42
+  batch_size: 2
+  num_epochs: 10
+  learning_rate: 3.0e-4
+  optimizer: adamw
+  weight_decay: 1.0e-2
+  scheduler: none  # none | cosine | step
+  scheduler_t_max: 100
+  scheduler_eta_min: 0.0
+  scheduler_step_size: 10
+  scheduler_gamma: 0.5
+  gradient_clip_val: 1.0
+  accumulation_steps: 8
+  early_stopping:
+    enabled: false
+    patience: 5
+    min_delta: 0.0
+  validation_frequency: 1
+  save_best_only: true
+  save_last: true
+  resume_training: false
+  resume_from: ""  # "best", "last", or a path to a .ckpt file. Empty = no resume.
+  loss_function: mse  # mse | mae | smooth_l1
+  multi_target_loss_weights: {}
+
+rollout:
+  run_rollout_after_training: true
+  rollout_num_steps: 2
+  rollout_step_hours: 12
+  autoregressive_inputs: true
+  predicted_fields_get_fed_back: []  # Empty => all model-predicted vars are fed back.
+  keep_exogenous_predictors: fixed  # fixed | refresh_from_dataset
+  save_predictions_to_netcdf: true
+  save_plots: true
+
+notebook:
+  quicklook_sample_index: 0
+  plot_variables:
+    - no2
+    - tcno2
+  verbosity: 1
