@@ -212,12 +212,45 @@ def _worker(rank: int, world_size: int, local_gpu: int, cfg: dict):
     if bool(model_cfg.get("gradient_checkpointing", True)):
         model.configure_activation_checkpointing()
 
+    # Optionally wrap with convolutional refinement heads.
+    model = ft.maybe_wrap_conv_refine(model, cfg, resolved_specs)
+
+    # Optionally wrap with rectified-flow residual refine heads. Mutually
+    # exclusive with conv-refine (the helper checks the flag itself).
+    model = ft.maybe_wrap_flow_refine(model, cfg, resolved_specs)
+    # If the flow wrapper is in use, hand it the per-variable normalisation
+    # stats so its de-normalisation step at inference time matches the
+    # space the FM head was trained in.
+    try:
+        from finetune.flow_refine import AuroraFlowRefine as _AFR
+        if isinstance(model, _AFR):
+            model.set_norm_stats(norm_stats)
+            _print0(
+                rank,
+                f"Flow-refine head active: {model.refine_parameter_count():,} "
+                f"trainable refine params, sampling_steps={model.sampling_steps}",
+            )
+    except Exception:
+        pass
+
     param_summary = ft.configure_trainable_parameters(model, cfg)
     _print0(rank, f"Parameters: {json.dumps(param_summary)}")
 
     if use_bf16:
-        model = model.to(dtype=torch.bfloat16)
-        _print0(rank, "Model converted to bfloat16")
+        # Per Aurora paper §B.7 ("32-bit floating-point computation"):
+        # encoder, decoder, heads, and normalise/unnormalise are run in fp32
+        # — only the backbone uses bf16.  We achieve this by keeping all
+        # *parameters* in fp32 (so master weights and AdamW moments are
+        # precise) and relying on torch.autocast(bf16) inside the loss
+        # function to cast backbone activations to bf16 transparently.
+        # This avoids the catastrophic precision loss observed when the
+        # whole model is cast to bf16: with output scales ~1.9e-7, a 7-bit
+        # bf16 mantissa introduces ~1.5e-9 quantisation noise per element —
+        # the same magnitude as the upper-level NO2 signal itself.
+        _print0(
+            rank,
+            "Params kept in fp32; using autocast(bf16) for backbone compute.",
+        )
 
     model = model.to(device)
     _print0(rank, f"GPU memory after model load: {torch.cuda.memory_allocated(device) / 1e9:.2f} GB")
@@ -235,15 +268,138 @@ def _worker(rank: int, world_size: int, local_gpu: int, cfg: dict):
     lr = float(train_cfg.get("learning_rate", 3e-4))
     weight_decay = float(train_cfg.get("weight_decay", 0.0))
     optimizer_name = str(train_cfg.get("optimizer", "adamw")).lower()
-    params = [p for p in model.parameters() if p.requires_grad]
+
+    # ---- per-parameter (trust-ratio-style) LR scaling --------------------
+    # Aurora's pretrained per-level heads/embeds for top-of-atmosphere NO2
+    # have weight magnitudes ~1e-9. AdamW's step is independent of the
+    # parameter's own scale (≈ ±lr · sign(g) / sqrt(v)), so an unscaled step
+    # at lr=2e-6 perturbs a 1e-9 weight by ~10^3× its natural magnitude and
+    # destroys the pretrained mapping (this is exactly what produced
+    # |pred|max=1283 at step 8). The fix is to scale each parameter's LR by
+    # its own RMS, so tiny channels learn slowly and large channels learn at
+    # the configured base rate.
+    sa_cfg = train_cfg.get("scale_aware_lr", {}) or {}
+    scale_aware_enabled = bool(sa_cfg.get("enabled", False))
+    sa_min_scale = float(sa_cfg.get("min_scale", 1.0e-3))
+    sa_rms_floor = float(sa_cfg.get("rms_floor", 1.0e-4))
+    sa_ref_rms_cfg = sa_cfg.get("reference_rms", None)
+    # Multiplicative LR scale applied to Aurora-pretrained params on top of
+    # the RMS-based bucket scale. Default 1.0 = no extra damping. Set this
+    # to a small value (e.g. 1e-2) to "anchor" the pretrained model at its
+    # near-optimum and let the newly-initialised refinement heads carry
+    # most of the learning signal.
+    pretrained_lr_scale = float(sa_cfg.get("pretrained_lr_scale", 1.0))
+
+    # Identify Aurora-pretrained vs newly-initialised params. The model is
+    # AuroraConvRefine(base=AuroraAirPollution, surf_refine=..., atmos_refine=...)
+    # under DDP; everything reachable via `.base` is pretrained, everything
+    # else (surf_refine / atmos_refine) is newly initialised in this run.
+    pretrained_param_ids: set[int] = set()
+    inner = model.module if hasattr(model, "module") else model
+    base_attr = getattr(inner, "base", None)
+    if base_attr is not None:
+        pretrained_param_ids = {id(p) for p in base_attr.parameters()}
+
+    # If the user wants pretrained params frozen, set requires_grad=False on
+    # them BEFORE collecting the trainable list, so they are excluded from
+    # both the optimizer and the manual all-reduce in the training loop.
+    if scale_aware_enabled and pretrained_lr_scale == 0.0 and pretrained_param_ids:
+        n_frozen = 0
+        for _, p in model.named_parameters():
+            if id(p) in pretrained_param_ids and p.requires_grad:
+                p.requires_grad = False
+                n_frozen += 1
+        if rank == 0:
+            print(
+                f"[opt] pretrained_lr_scale=0 -> froze {n_frozen} Aurora-pretrained "
+                "tensors (only the conv-refine heads will train)"
+            )
+
+    named_trainable = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
+
+    if scale_aware_enabled:
+        with torch.no_grad():
+            rms_values = [
+                float(p.detach().float().pow(2).mean().sqrt().item())
+                for _, p in named_trainable
+            ]
+        if sa_ref_rms_cfg is not None:
+            ref_rms = float(sa_ref_rms_cfg)
+        else:
+            # Compute reference RMS only over pretrained params so the
+            # newly-initialised refine heads don't pull the median up/down.
+            well_cond = [
+                r for r, (_, p) in zip(rms_values, named_trainable)
+                if r > sa_rms_floor and id(p) in pretrained_param_ids
+            ]
+            if not well_cond:
+                well_cond = [r for r in rms_values if r > sa_rms_floor]
+            ref_rms = float(np.median(well_cond)) if well_cond else 1.0e-2
+
+        is_pretrained_flags = [
+            (id(p) in pretrained_param_ids) for _, p in named_trainable
+        ]
+
+        # Per-parameter raw lr-scale.
+        # - Pretrained params: clamp(rms/ref, [min_scale, 1.0]) * pretrained_lr_scale.
+        # - New (refine) params: full LR (1.0); these were init'd from scratch
+        #   and need the configured base LR to actually learn.
+        raw_scales = [
+            (
+                max(min(rms / ref_rms, 1.0), sa_min_scale) * pretrained_lr_scale
+                if is_pre
+                else 1.0
+            )
+            for rms, is_pre in zip(rms_values, is_pretrained_flags)
+        ]
+        # Bucket by (log10(scale) at 0.5-dex, is_pretrained) so we can label
+        # each group clearly in the printout.
+        bucket_keys = [
+            (int(np.floor(np.log10(max(s, 1e-12)) * 2.0)), is_pre)
+            for s, is_pre in zip(raw_scales, is_pretrained_flags)
+        ]
+        unique_buckets = sorted(set(bucket_keys), key=lambda k: (-k[0], k[1]))
+
+        if rank == 0:
+            n_pre = sum(is_pretrained_flags)
+            n_new = len(is_pretrained_flags) - n_pre
+            print(
+                f"[opt] scale-aware LR: ref_rms={ref_rms:.3e}, "
+                f"pretrained_lr_scale={pretrained_lr_scale:.2e}, "
+                f"{len(named_trainable)} params "
+                f"({n_pre} pretrained / {n_new} new) -> {len(unique_buckets)} groups"
+            )
+        param_groups = []
+        for bkt_key in unique_buckets:
+            member_idxs = [i for i, k in enumerate(bucket_keys) if k == bkt_key]
+            scales_in_bucket = [raw_scales[i] for i in member_idxs]
+            lr_scale = float(np.exp(np.mean(np.log(scales_in_bucket))))
+            group_lr = lr * lr_scale
+            tag = "pre" if bkt_key[1] else "NEW"
+            param_groups.append({
+                "params": [named_trainable[i][1] for i in member_idxs],
+                "lr": group_lr,
+                "weight_decay": weight_decay,
+                "name": f"{tag}_bkt[{bkt_key[0]}]",
+            })
+            if rank == 0:
+                bk_rms = [rms_values[i] for i in member_idxs]
+                example = named_trainable[member_idxs[0]][0]
+                print(f"  [{tag}] bucket={bkt_key[0]:>+3d} n={len(member_idxs):>5d} "
+                      f"lr_scale={lr_scale:.3e} lr={group_lr:.2e} "
+                      f"rms[min={min(bk_rms):.2e},max={max(bk_rms):.2e}] "
+                      f"e.g. {example}")
+        opt_target = param_groups
+    else:
+        opt_target = [p for _, p in named_trainable]
 
     if optimizer_name == "adamw":
-        optimizer = torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
+        optimizer = torch.optim.AdamW(opt_target, lr=lr, weight_decay=weight_decay)
     elif optimizer_name == "adam":
-        optimizer = torch.optim.Adam(params, lr=lr, weight_decay=weight_decay)
+        optimizer = torch.optim.Adam(opt_target, lr=lr, weight_decay=weight_decay)
     elif optimizer_name == "sgd":
         optimizer = torch.optim.SGD(
-            params, lr=lr,
+            opt_target, lr=lr,
             momentum=float(train_cfg.get("sgd_momentum", 0.9)),
             weight_decay=weight_decay,
         )
@@ -290,8 +446,24 @@ def _worker(rank: int, world_size: int, local_gpu: int, cfg: dict):
         ckpt = torch.load(str(resume_path), map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model_state_dict"])
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-        if scheduler is not None and "scheduler_state_dict" in ckpt:
+        # `optimizer.load_state_dict` overwrites each param_group's `lr` with
+        # the value saved at checkpoint time. Re-apply the LR (and per-group
+        # scales) computed from the *current* YAML so stage-2 fine-tuning
+        # actually runs at the configured rate.
+        if scale_aware_enabled:
+            for g, src_g in zip(optimizer.param_groups, param_groups):
+                g["lr"] = float(src_g["lr"])
+                g["initial_lr"] = float(src_g["lr"])
+        else:
+            for g in optimizer.param_groups:
+                g["lr"] = lr
+                g["initial_lr"] = lr
+        skip_sched = bool(train_cfg.get("resume_skip_scheduler", False))
+        if scheduler is not None and "scheduler_state_dict" in ckpt and not skip_sched:
             scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        elif skip_sched:
+            _print0(rank, "  resume_skip_scheduler=true -> using fresh scheduler "
+                          f"(t_max={train_cfg.get('scheduler_t_max')})")
         start_epoch = int(ckpt.get("epoch", -1)) + 1
         global_step = int(ckpt.get("global_step", 0))
         best_val_loss = float(ckpt.get("best_val_loss", float("inf")))
@@ -314,6 +486,35 @@ def _worker(rank: int, world_size: int, local_gpu: int, cfg: dict):
     # ---- training loop ----
     for epoch in range(start_epoch, num_epochs):
         model.train()
+
+        # Progressive sampling-steps schedule for the flow-matching head.
+        # Phase 1 (epochs [0, num_epochs/3)): single-step deterministic
+        #   regression — learn the residual mean fast and stably.
+        # Phase 2 (epochs [num_epochs/3, num_epochs)): multi-step stochastic
+        #   refinement — let the head model the conditional residual
+        #   distribution (multi-modal corrections, calibrated spread).
+        # Only affects eval-time sampling; training loss is independent of
+        # `sampling_steps` (loss draws t uniformly in [0,1]).
+        try:
+            from finetune.flow_refine import AuroraFlowRefine as _AFR
+            inner = model.module if hasattr(model, "module") else model
+            if isinstance(inner, _AFR):
+                init_steps = int(model_cfg.get("flow_refine_sampling_steps", 1))
+                late_steps = int(model_cfg.get("flow_refine_sampling_steps_late", 8))
+                phase_frac = float(model_cfg.get("flow_refine_phase_fraction", 1.0 / 3.0))
+                switch_epoch = int(round(num_epochs * phase_frac))
+                desired = late_steps if epoch >= switch_epoch else init_steps
+                if desired != inner.sampling_steps:
+                    if rank == 0:
+                        print(
+                            f"  [flow] epoch {epoch}: sampling_steps "
+                            f"{inner.sampling_steps} -> {desired} "
+                            f"(switch at epoch {switch_epoch})"
+                        )
+                    inner.sampling_steps = desired
+        except Exception:
+            pass
+
         epoch_samples = list(train_samples)
         rng = np.random.default_rng(int(train_cfg.get("seed", 42)) + epoch)
         rng.shuffle(epoch_samples)
@@ -342,11 +543,30 @@ def _worker(rank: int, world_size: int, local_gpu: int, cfg: dict):
         for step_i in pbar:
             sample_batch = rank_samples[step_i : step_i + batch_size]
 
+            # Activate one-shot per-variable loss breakdown on rank 0
+            # for the first batch and the batch right after the first update.
+            diag_on = rank == 0 and global_step in (0, accumulation_steps, accumulation_steps + 1)
+            if diag_on:
+                ft._DIAG_LOSS_BREAKDOWN["active"] = True
+                ft._DIAG_LOSS_BREAKDOWN["rows"] = []
+
             loss, _ = ft.compute_supervised_loss(
                 model=model, ds=train_ds, samples=sample_batch,
                 config=cfg, resolved_specs=resolved_specs, device=device,
                 norm_stats=norm_stats,
             )
+
+            if diag_on:
+                ft._DIAG_LOSS_BREAKDOWN["active"] = False
+                rows = ft._DIAG_LOSS_BREAKDOWN.get("rows", [])
+                print(f"  [diag] loss breakdown @ global_step={global_step}:")
+                for r in rows:
+                    print(
+                        f"    {r['var']:>8s}@{str(r['lead']):>5s} kind={r['kind']:>5s} "
+                        f"|pred|max={r['pred_abs_max']:.3e} |tgt|max={r['tgt_abs_max']:.3e} "
+                        f"|diff|max={r['diff_abs_max']:.3e} loss={r['loss_var']:.4e} "
+                        f"w={r['weight']:.2g}"
+                    )
 
             (loss / accumulation_steps).backward()
 
@@ -355,13 +575,41 @@ def _worker(rank: int, world_size: int, local_gpu: int, cfg: dict):
             )
             if update_now:
                 _allreduce_grads(model, world_size)
-                if grad_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(
-                        [p for p in model.parameters() if p.requires_grad],
-                        max_norm=grad_clip,
+                trainable_params = [p for p in model.parameters() if p.requires_grad]
+                # ---- DIAGNOSTIC: locate top-gradient params on first update ----
+                if global_step <= 1 and rank == 0:
+                    grad_info = []
+                    for n, p in model.named_parameters():
+                        if p.requires_grad and p.grad is not None:
+                            g = p.grad.detach()
+                            grad_info.append((n, float(g.norm().item()), tuple(p.shape)))
+                    grad_info.sort(key=lambda x: -x[1])
+                    print(f"  [diag] top-10 grad-norm params at step {global_step}:")
+                    for n, gn, sh in grad_info[:10]:
+                        print(f"    {gn:.3e}  {n}  {sh}")
+                    total_sq = sum(gn * gn for _, gn, _ in grad_info)
+                    print(f"  [diag] total trainable grad L2 = {total_sq ** 0.5:.4e} "
+                          f"({len(grad_info)} tensors)")
+                # ---- end diagnostic ----
+                pre_clip_norm = torch.nn.utils.clip_grad_norm_(
+                    trainable_params,
+                    max_norm=grad_clip if grad_clip > 0 else float("inf"),
+                )
+                # Skip optimizer step when gradients contain NaN/Inf (bf16 overflow).
+                if not torch.isfinite(pre_clip_norm):
+                    _print0(rank, f"  [step {global_step}] NaN/Inf grad norm — skipping update")
+                    optimizer.zero_grad(set_to_none=True)
+                else:
+                    post_clip = (
+                        min(float(pre_clip_norm), grad_clip) if grad_clip > 0 else float(pre_clip_norm)
                     )
-                optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
+                    _print0(
+                        rank,
+                        f"  [step {global_step}] grad_norm(pre)={float(pre_clip_norm):.4e} "
+                        f"(post≈{post_clip:.4e}), lr={optimizer.param_groups[0]['lr']:.2e}",
+                    )
+                    optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
                 if scheduler is not None:
                     scheduler.step()
 
@@ -414,6 +662,7 @@ def _worker(rank: int, world_size: int, local_gpu: int, cfg: dict):
                     best_ckpt_path, model, optimizer, scheduler,
                     epoch=epoch, global_step=global_step,
                     best_val_loss=best_val_loss, config=cfg,
+                    norm_stats=norm_stats,
                 )
             dist.barrier()
         elif should_validate:
@@ -425,6 +674,7 @@ def _worker(rank: int, world_size: int, local_gpu: int, cfg: dict):
                     last_ckpt_path, model, optimizer, scheduler,
                     epoch=epoch, global_step=global_step,
                     best_val_loss=best_val_loss, config=cfg,
+                    norm_stats=norm_stats,
                 )
             dist.barrier()
 
@@ -556,6 +806,11 @@ def main():
     env["CUDA_VISIBLE_DEVICES"] = visible_devices
     env["_AURORA_GPU_IDS"] = visible_devices
     env["_AURORA_CONFIG"] = str(config_path.resolve())
+    # Mitigate fragmentation in the long, multi-stage rollout fine-tune. The
+    # FM head allocates many small tensors per (lead × level × variable);
+    # the default best-fit allocator fragments enough to OOM on a 22 GB A10G
+    # by epoch ~6. expandable_segments lets the allocator grow contiguously.
+    env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
     import subprocess as _sp
     proc = _sp.run(cmd, env=env)

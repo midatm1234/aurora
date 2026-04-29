@@ -58,6 +58,44 @@ Extra controls:
 
 The notebook prints total/trainable/frozen parameter counts before training.
 
+## Refinement Heads (recommended for bias correction)
+
+Pretrained Aurora is already near-optimal on dates seen during pretraining; nudging its tiny per-level weights with AdamW is a fast way to *destroy* the model. The recommended path is to **freeze the backbone fully** (`training.scale_aware_lr.pretrained_lr_scale: 0.0`) and attach a small refinement head whose only job is to learn the residual `r = y_true − ŷ`.
+
+Two heads are available, mutually exclusive:
+
+| Head | File | Behaviour | Best for |
+|------|------|-----------|----------|
+| `AuroraConvRefine` | `conv_refine.py` | Deterministic per-variable 3-conv stack. ~few-hundred-K params. | Cheapest baseline, single forward pass. |
+| `AuroraFlowRefine` | `flow_refine.py` | Rectified-flow / x₁-prediction UNet (FiLM time-conditioned), zero-init output layer. ~4 M params. | Multi-modal residual structure; principled single-step regression *and* multi-step stochastic refinement from the same weights. |
+
+Enable in YAML:
+
+```yaml
+model:
+  conv_refine_enabled: false
+  flow_refine_enabled: true
+  flow_refine_hidden: 64
+  flow_refine_sampling_steps: 1        # phase-1 eval (deterministic regression)
+  flow_refine_sampling_steps_late: 8   # phase-2 eval (stochastic refinement)
+  flow_refine_phase_fraction: 0.3333   # epoch fraction at which phase 2 begins
+
+training:
+  scale_aware_lr:
+    enabled: true
+    pretrained_lr_scale: 0.0           # fully freeze the Aurora backbone
+```
+
+The flow-matching head is described in detail in `Aurora_air_pollution_finetune.md`. Key properties:
+
+- **Identity-at-init** (zero-init output): `eval()` output before any training equals Aurora's prediction exactly.
+- **Train-loss is residual-MSE at random noise level** in normalised space — *not* directly comparable to a prediction MSE.
+- **Eval uses an iterative sampler** controlled by `sampling_steps`. The trainer ramps it from 1 → `flow_refine_sampling_steps_late` at epoch ≥ `num_epochs × phase_fraction`.
+
+## Case Folders
+
+Set `case_name: <experiment>` at the top of the YAML and all training artifacts land under `outputs/<experiment>/` and `outputs/checkpoints/<experiment>/`. The inference notebook auto-derives `CHECKPOINT_PATH` and `OUTPUT_DIR` from the same `case_name`, so a single config drives both ends. `resume_from: "best"` resolves relative to the case folder, so chained-stage finetunes don't trample each other.
+
 ## Regional Domains
 
 Enable regional training with:

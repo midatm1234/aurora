@@ -51,6 +51,8 @@ __all__ = [
     "write_training_history",
     "write_run_manifest",
     "save_predictions",
+    "maybe_wrap_conv_refine",
+    "maybe_wrap_flow_refine",
 ]
 
 
@@ -61,6 +63,7 @@ class VariableSpec:
     dataset_name: str
     aurora_name: str
     kind: str  # surf | atmos | static
+    loss_levels: tuple[float, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -236,6 +239,19 @@ def load_config(config_path: str | Path, overrides: dict[str, Any] | None = None
 
     output_dir = Path(paths_cfg.get("output_dir", project_root / "outputs"))
     checkpoint_dir = Path(paths_cfg.get("checkpoint_dir", output_dir / "checkpoints"))
+
+    # Optional `case_name` (top-level YAML key) groups all artifacts of a
+    # single experiment under <output_dir>/<case_name>/ and
+    # <checkpoint_dir>/<case_name>/. Idempotent: re-resolving an already
+    # case-suffixed path is a no-op, so calling resolve_paths twice on the
+    # same dict (e.g., notebook + script) doesn't double-nest.
+    case_name = str(config.get("case_name", "")).strip()
+    if case_name:
+        if output_dir.name != case_name:
+            output_dir = output_dir / case_name
+        if checkpoint_dir.name != case_name:
+            checkpoint_dir = checkpoint_dir / case_name
+
     output_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
@@ -445,6 +461,12 @@ def _parse_variable_specs(
                 or default_kind
                 or _guess_kind(ds[dataset_name], time_dim, level_dim)
             )
+            loss_levels_raw = item.get("loss_levels")
+            loss_levels = (
+                tuple(float(x) for x in loss_levels_raw)
+                if loss_levels_raw is not None
+                else None
+            )
         else:
             raise TypeError(f"Unsupported variable spec type: {type(item)}")
 
@@ -452,7 +474,17 @@ def _parse_variable_specs(
         if kind not in {"surf", "atmos", "static"}:
             raise ValueError(f"Variable `{dataset_name}` has unsupported kind `{kind}`.")
 
-        specs.append(VariableSpec(dataset_name=dataset_name, aurora_name=aurora_name, kind=kind))
+        if not isinstance(item, dict):
+            loss_levels = None
+
+        specs.append(
+            VariableSpec(
+                dataset_name=dataset_name,
+                aurora_name=aurora_name,
+                kind=kind,
+                loss_levels=loss_levels,
+            )
+        )
 
     # Preserve order but ensure unique Aurora names.
     seen: set[str] = set()
@@ -1100,43 +1132,77 @@ def compute_target_normalization_stats(
     resolved_specs: ResolvedVariableSpecs,
     config: dict[str, Any],
 ) -> dict[str, dict[str, torch.Tensor]]:
-    """Compute per-variable, per-level mean and std from the training dataset.
+    """Return per-variable normalisation stats for the loss function.
 
-    Returns a dict keyed by Aurora variable name::
+    Returns Aurora's own internal normalisation constants (location & scale
+    from ``aurora.normalisation``), which for pollutants follow the paper's
+    Eq. B8 (centre=0, scale = ½·mean_t(spatial_max), per pressure level).
 
-        {
-            "no2": {"mean": Tensor(n_levels,), "std": Tensor(n_levels,)},
-            "tcno2": {"mean": Tensor(),        "std": Tensor()},
-            ...
-        }
+    Why the model's internal stats and not data-derived ones?  The
+    ``AuroraAirPollution`` model already calls ``batch.normalise(...)`` on
+    inputs and ``pred.unnormalise(...)`` on outputs using these exact
+    constants (see ``aurora/model/aurora.py``).  Predictions are therefore
+    returned in **physical units**, having round-tripped through the
+    paper's centre/scale.  Using these same stats to renormalise pred and
+    target before the MSE puts the loss in O(1) space — matching the
+    space the model was pretrained in — without any double-scaling.
 
-    For atmospheric variables the stats have shape ``(n_levels,)`` so they
-    can broadcast against ``(batch, n_levels, H, W)`` tensors when reshaped
-    to ``(1, n_levels, 1, 1)``.  For surface variables the stats are scalar.
+    Per-level scales are preserved (no flattening) so the natural vertical
+    structure of the variable is respected.
     """
-    time_dim, lat_dim, lon_dim, level_dim = _dim_names(config)
+    from aurora.normalisation import level_to_str, locations, scales
+
+    level_values = config.get("data", {}).get(
+        "pressure_levels",
+        config.get("data", {}).get(
+            "atmos_levels",
+            [50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000],
+        ),
+    )
+    level_values = [float(lv) for lv in level_values]
+
+    # Default 0.0 = no clamp (use Aurora's exact pretrained per-level scales).
+    # Setting min_norm_scale > 0 was previously used as a band-aid for the
+    # runaway-gradient issue at top-of-atmosphere NO2 levels (scales ~1e-9),
+    # but it decouples the loss from Aurora's pretrained loss surface and is
+    # not a correct fix. The proper fix lives in the optimizer (per-parameter
+    # LR scaling by weight magnitude). Leave this knob exposed only for
+    # diagnostic experiments; default keeps Aurora's exact normalisation.
+    min_scale = float(config.get("training", {}).get("min_norm_scale", 0.0))
+
     stats: dict[str, dict[str, torch.Tensor]] = {}
 
     for spec in resolved_specs.targets:
-        da = ds[spec.dataset_name]
+        aurora_name = spec.aurora_name
 
-        if spec.kind == "atmos" and level_dim in da.dims:
-            # Per-level mean and std — reduce over time + spatial dims.
-            reduce_dims = [d for d in da.dims if d != level_dim]
-            mean_np = da.mean(dim=reduce_dims).values.astype(np.float32)
-            std_np = da.std(dim=reduce_dims).values.astype(np.float32)
+        if spec.kind == "atmos":
+            if spec.loss_levels is not None:
+                target_levels = [float(lv) for lv in spec.loss_levels]
+            else:
+                target_levels = level_values
+            mean_list: list[float] = []
+            std_list: list[float] = []
+            for lvl in target_levels:
+                key = f"{aurora_name}_{level_to_str(lvl)}"
+                mean_list.append(float(locations.get(key, 0.0)))
+                std_list.append(float(scales.get(key, 1.0)))
+            std_tensor = torch.tensor(std_list, dtype=torch.float32)
+            if min_scale > 0:
+                std_tensor = torch.clamp(std_tensor, min=min_scale)
+            stats[aurora_name] = {
+                "mean": torch.tensor(mean_list, dtype=torch.float32),
+                "std": std_tensor,
+            }
         else:
-            # Scalar stats for surface variables.
-            mean_np = np.float32(float(da.mean()))
-            std_np = np.float32(float(da.std()))
-
-        # Clamp std to avoid division by zero for near-constant fields.
-        std_np = np.maximum(std_np, np.float32(1e-30))
-
-        stats[spec.aurora_name] = {
-            "mean": torch.from_numpy(np.atleast_1d(mean_np)),
-            "std": torch.from_numpy(np.atleast_1d(std_np)),
-        }
+            loc = float(locations.get(aurora_name, 0.0))
+            sc = float(scales.get(aurora_name, 1.0))
+            std_tensor = torch.tensor([sc], dtype=torch.float32)
+            if min_scale > 0:
+                std_tensor = torch.clamp(std_tensor, min=min_scale)
+            stats[aurora_name] = {
+                "mean": torch.tensor([loc], dtype=torch.float32),
+                "std": std_tensor,
+            }
 
     return stats
 
@@ -1167,7 +1233,11 @@ def _autocast_context(device: torch.device, mixed_precision: str):
     return contextlib.nullcontext()
 
 
-def _advance_batch_with_prediction(batch: Batch, pred: Batch) -> Batch:
+def _advance_batch_with_prediction(
+    batch: Batch,
+    pred: Batch,
+    feedback_vars: set[str] | None = None,
+) -> Batch:
     """Build next autoregressive input from the current batch and prediction.
 
     Handles mismatched keys between predictors (batch) and model outputs (pred):
@@ -1175,6 +1245,11 @@ def _advance_batch_with_prediction(batch: Batch, pred: Batch) -> Batch:
       * Variables only in batch (exogenous predictors): carry forward as-is
         by shifting history and repeating the last available step.
       * Variables only in pred (e.g. modulation heads): dropped.
+
+    When *feedback_vars* is given, only those variables use the model
+    prediction; all others carry forward the last available history step.
+    This prevents unsupervised (exogenous) predictions from corrupting
+    subsequent autoregressive steps during fine-tuned rollouts.
     """
 
     def _merge(
@@ -1184,7 +1259,10 @@ def _advance_batch_with_prediction(batch: Batch, pred: Batch) -> Batch:
         merged: dict[str, torch.Tensor] = {}
         for name in batch_vars:
             history_tail = batch_vars[name][:, 1:]  # drop oldest step
-            if name in pred_vars:
+            use_pred = name in pred_vars and (
+                feedback_vars is None or name in feedback_vars
+            )
+            if use_pred:
                 merged[name] = torch.cat([history_tail, pred_vars[name]], dim=1)
             else:
                 # Exogenous predictor not predicted by the model: repeat last step.
@@ -1196,6 +1274,12 @@ def _advance_batch_with_prediction(batch: Batch, pred: Batch) -> Batch:
         surf_vars=_merge(batch.surf_vars, pred.surf_vars),
         atmos_vars=_merge(batch.atmos_vars, pred.atmos_vars),
     )
+
+
+# Module-level diagnostic state.  When ``active`` is set to True, the loss
+# function appends per-variable breakdown rows to ``rows``.  Caller is
+# responsible for resetting and consuming these.
+_DIAG_LOSS_BREAKDOWN: dict[str, Any] = {"active": False}
 
 
 def compute_supervised_loss(
@@ -1238,13 +1322,67 @@ def compute_supervised_loss(
 
     mixed_precision = str(config.get("model", {}).get("mixed_precision", "none"))
 
+    # Only feed back target variables' predictions; exogenous predictors use ground truth.
+    target_feedback_vars = {spec.aurora_name for spec in resolved_specs.targets}
+    predictor_by_aurora = resolved_specs.predictor_by_aurora
+    spatial_h, spatial_w = batch.spatial_shape
+
     preds_by_lead: dict[int, Batch] = {}
     current_batch = batch
     with _autocast_context(device=device, mixed_precision=mixed_precision):
         for lead in range(1, max_lead + 1):
             pred = model(current_batch)
             preds_by_lead[lead] = pred
-            current_batch = _advance_batch_with_prediction(current_batch, pred)
+
+            # Build next autoregressive input:
+            # - Target variables: use model prediction (autoregressive)
+            # - Exogenous predictors: use ground truth from dataset
+            anchor_idx = sample_list[0]["anchor_index"]
+            next_time_index = anchor_idx + lead
+
+            def _advance_with_gt(
+                batch_vars: dict[str, torch.Tensor],
+                pred_vars: dict[str, torch.Tensor],
+                var_kind: str,
+            ) -> dict[str, torch.Tensor]:
+                merged: dict[str, torch.Tensor] = {}
+                for name in batch_vars:
+                    history_tail = batch_vars[name][:, 1:]
+                    if name in target_feedback_vars and name in pred_vars:
+                        merged[name] = torch.cat([history_tail, pred_vars[name]], dim=1)
+                    else:
+                        # Use ground truth from dataset for exogenous predictors.
+                        spec = predictor_by_aurora.get(name)
+                        if (
+                            spec is not None
+                            and spec.kind == var_kind
+                            and next_time_index < ds.sizes[_dim_names(config)[0]]
+                        ):
+                            gt_frame = _dataset_frame_for_predictor(
+                                ds, spec,
+                                time_index=next_time_index,
+                                batch_size=batch_vars[name].shape[0],
+                                config=config,
+                                device=device,
+                            )
+                            # Crop to match batch spatial shape.
+                            gt_frame = gt_frame[..., :spatial_h, :spatial_w]
+                            merged[name] = torch.cat([history_tail, gt_frame], dim=1)
+                        else:
+                            merged[name] = torch.cat(
+                                [history_tail, batch_vars[name][:, -1:]], dim=1,
+                            )
+                return merged
+
+            current_batch = dataclasses.replace(
+                pred,
+                surf_vars=_advance_with_gt(
+                    current_batch.surf_vars, pred.surf_vars, "surf",
+                ),
+                atmos_vars=_advance_with_gt(
+                    current_batch.atmos_vars, pred.atmos_vars, "atmos",
+                ),
+            )
 
     total_loss = torch.zeros((), device=device)
     total_weight = 0.0
@@ -1265,13 +1403,36 @@ def compute_supervised_loss(
 
             target_tensor = target_map[aurora_name].to(device=device, dtype=pred_tensor.dtype)
 
+            # Optionally restrict atmospheric loss to a subset of pressure
+            # levels (e.g. drop levels where Aurora's internal scale is
+            # numerically degenerate, causing 1/std to blow up).
+            if target_spec.kind == "atmos" and target_spec.loss_levels is not None:
+                full_levels = config.get("data", {}).get(
+                    "atmos_levels",
+                    config.get("data", {}).get("pressure_levels", []),
+                )
+                full_levels = [float(lv) for lv in full_levels]
+                wanted = [float(lv) for lv in target_spec.loss_levels]
+                level_idx = [full_levels.index(lv) for lv in wanted]
+                idx_tensor = torch.tensor(level_idx, dtype=torch.long, device=pred_tensor.device)
+                pred_tensor = pred_tensor.index_select(1, idx_tensor)
+                if target_tensor.shape[1] == len(full_levels):
+                    target_tensor = target_tensor.index_select(
+                        1, idx_tensor.to(target_tensor.device)
+                    )
+
+            # Upcast to fp32 for numerically stable loss computation.
+            # bf16 gradients through 1/std (up to ~1e10) cause overflow.
+            pred_tensor = pred_tensor.float()
+            target_tensor = target_tensor.float()
+
             # Normalize pred and target to ~O(1) so that MSE gradients are
             # meaningful even for variables with tiny physical magnitudes
             # (e.g. NO2 ~1e-10 kg/kg).
             if norm_stats is not None and aurora_name in norm_stats:
                 _ns = norm_stats[aurora_name]
-                _mean = _ns["mean"].to(device=device, dtype=pred_tensor.dtype)
-                _std = _ns["std"].to(device=device, dtype=pred_tensor.dtype)
+                _mean = _ns["mean"].to(device=device, dtype=torch.float32)
+                _std = _ns["std"].to(device=device, dtype=torch.float32)
                 if target_spec.kind == "atmos" and _mean.numel() > 1:
                     # Reshape (n_levels,) → (1, n_levels, 1, 1) for broadcasting.
                     _mean = _mean.view(1, -1, 1, 1)
@@ -1286,14 +1447,37 @@ def compute_supervised_loss(
                     missing_masks.append(maybe_mask)
             missing_mask = torch.stack(missing_masks, dim=0).to(device) if missing_masks else None
 
-            elementwise = _loss_tensor(pred_tensor, target_tensor, loss_name=loss_name)
-            masked = _apply_loss_mask(
-                loss_tensor=elementwise,
-                pred_tensor=pred_tensor,
-                target_tensor=target_tensor,
-                spatial_mask=spatial_mask,
-                missing_mask=missing_mask,
+            # If the model is a flow-matching refine wrapper AND we're in
+            # training mode, replace the deterministic MSE with the
+            # rectified-flow velocity-MSE. This gives a unit-normal-scale
+            # loss surface (no 1/std blowup) and lets a small UNet learn
+            # the conditional residual distribution p(r | ŷ).
+            base_for_fm = model.module if hasattr(model, "module") else model
+            try:
+                from finetune.flow_refine import AuroraFlowRefine as _AFR
+            except Exception:
+                _AFR = None
+            use_flow_loss = (
+                _AFR is not None
+                and isinstance(base_for_fm, _AFR)
+                and base_for_fm.training
             )
+            if use_flow_loss:
+                masked = base_for_fm.flow_loss(
+                    pred_norm=pred_tensor,
+                    target_norm=target_tensor,
+                    var_name=aurora_name,
+                    kind=target_spec.kind,
+                )
+            else:
+                elementwise = _loss_tensor(pred_tensor, target_tensor, loss_name=loss_name)
+                masked = _apply_loss_mask(
+                    loss_tensor=elementwise,
+                    pred_tensor=pred_tensor,
+                    target_tensor=target_tensor,
+                    spatial_mask=spatial_mask,
+                    missing_mask=missing_mask,
+                )
 
             key_step = f"{aurora_name}@{lead}"
             weight = float(
@@ -1308,6 +1492,21 @@ def compute_supervised_loss(
             total_loss = total_loss + weight * masked
             total_weight += weight
 
+            # ---- DIAGNOSTIC (one-shot, rank 0) ----
+            if _DIAG_LOSS_BREAKDOWN.get("active", False):
+                with torch.no_grad():
+                    _DIAG_LOSS_BREAKDOWN.setdefault("rows", []).append({
+                        "var": aurora_name,
+                        "lead": lead,
+                        "kind": target_spec.kind,
+                        "pred_abs_max": float(pred_tensor.detach().abs().max().item()),
+                        "tgt_abs_max": float(target_tensor.detach().abs().max().item()),
+                        "diff_abs_max": float((pred_tensor - target_tensor).detach().abs().max().item()),
+                        "loss_var": float(masked.detach().item()),
+                        "weight": weight,
+                    })
+            # ---- end diagnostic ----
+
     if total_weight <= 0:
         raise ValueError("Total loss weight evaluated to <= 0. Check multi_target_loss_weights.")
 
@@ -1321,6 +1520,83 @@ def compute_supervised_loss(
     return total_loss, metrics
 
 
+def maybe_wrap_conv_refine(
+    model: torch.nn.Module,
+    config: dict[str, Any],
+    resolved_specs: ResolvedVariableSpecs,
+) -> torch.nn.Module:
+    """Optionally wrap *model* with convolutional refinement heads.
+
+    Returns the original model unchanged if ``model.conv_refine_enabled`` is
+    false in the config. If ``flow_refine.enabled`` is true, this helper
+    skips conv-refine in favor of :func:`maybe_wrap_flow_refine` (the two
+    wrappers are mutually exclusive).
+    """
+    model_cfg = config.get("model", {})
+    if bool(model_cfg.get("flow_refine_enabled", False)):
+        return model  # flow refine takes precedence
+    if not bool(model_cfg.get("conv_refine_enabled", False)):
+        return model
+
+    from finetune.conv_refine import AuroraConvRefine
+
+    target_surf = tuple(
+        spec.aurora_name for spec in resolved_specs.targets if spec.kind == "surf"
+    )
+    target_atmos = tuple(
+        spec.aurora_name for spec in resolved_specs.targets if spec.kind == "atmos"
+    )
+    hidden = int(model_cfg.get("conv_refine_hidden", 32))
+
+    wrapper = AuroraConvRefine(
+        base=model,
+        target_surf_vars=target_surf,
+        target_atmos_vars=target_atmos,
+        hidden=hidden,
+    )
+    return wrapper
+
+
+def maybe_wrap_flow_refine(
+    model: torch.nn.Module,
+    config: dict[str, Any],
+    resolved_specs: ResolvedVariableSpecs,
+) -> torch.nn.Module:
+    """Optionally wrap *model* with rectified-flow residual refine heads.
+
+    Enabled via ``model.flow_refine_enabled = true`` in config. Mutually
+    exclusive with :func:`maybe_wrap_conv_refine`. Norm stats must be
+    attached after construction by the training driver (call
+    ``model.set_norm_stats(...)`` once stats have been computed) so the
+    wrapper can de-normalise sampled residuals at inference time.
+    """
+    model_cfg = config.get("model", {})
+    if not bool(model_cfg.get("flow_refine_enabled", False)):
+        return model
+
+    from finetune.flow_refine import AuroraFlowRefine
+
+    target_surf = tuple(
+        spec.aurora_name for spec in resolved_specs.targets if spec.kind == "surf"
+    )
+    target_atmos = tuple(
+        spec.aurora_name for spec in resolved_specs.targets if spec.kind == "atmos"
+    )
+    hidden = int(model_cfg.get("flow_refine_hidden", 64))
+    time_dim = int(model_cfg.get("flow_refine_time_dim", 128))
+    sampling_steps = int(model_cfg.get("flow_refine_sampling_steps", 8))
+
+    wrapper = AuroraFlowRefine(
+        base=model,
+        target_surf_vars=target_surf,
+        target_atmos_vars=target_atmos,
+        hidden=hidden,
+        time_dim=time_dim,
+        sampling_steps=sampling_steps,
+    )
+    return wrapper
+
+
 def configure_trainable_parameters(
     model: torch.nn.Module,
     config: dict[str, Any],
@@ -1328,7 +1604,20 @@ def configure_trainable_parameters(
     """Apply freeze/unfreeze config and return parameter summary."""
     model_cfg = config.get("model", {})
 
-    for param in model.parameters():
+    # When using a refine wrapper, apply freeze logic to the base model.
+    from finetune.conv_refine import AuroraConvRefine
+    try:
+        from finetune.flow_refine import AuroraFlowRefine
+    except Exception:
+        AuroraFlowRefine = None  # type: ignore[assignment]
+
+    is_conv_refine = isinstance(model, AuroraConvRefine)
+    is_flow_refine = (
+        AuroraFlowRefine is not None and isinstance(model, AuroraFlowRefine)
+    )
+    base = model.base if (is_conv_refine or is_flow_refine) else model
+
+    for param in base.parameters():
         param.requires_grad = True
 
     backbone_freeze = bool(model_cfg.get("backbone_freeze", False))
@@ -1337,28 +1626,31 @@ def configure_trainable_parameters(
     freeze_decoder = bool(model_cfg.get("freeze_decoder", False))
     trainable_head_only = bool(model_cfg.get("trainable_head_only", False))
 
-    if backbone_freeze and hasattr(model, "backbone"):
-        for param in model.backbone.parameters():
+    if backbone_freeze and hasattr(base, "backbone"):
+        for param in base.backbone.parameters():
             param.requires_grad = False
 
-    if freeze_encoder and hasattr(model, "encoder"):
-        for param in model.encoder.parameters():
+    if freeze_encoder and hasattr(base, "encoder"):
+        for param in base.encoder.parameters():
             param.requires_grad = False
 
-    if freeze_decoder and hasattr(model, "decoder"):
-        for param in model.decoder.parameters():
+    if freeze_decoder and hasattr(base, "decoder"):
+        for param in base.decoder.parameters():
             param.requires_grad = False
 
     if freeze_embeddings:
-        for name, param in model.named_parameters():
+        for name, param in base.named_parameters():
             if "token_embeds" in name or "levels_embed" in name or "patch_embedding" in name:
+                # Don't freeze decoder embeddings when the decoder is being trained.
+                if not freeze_decoder and name.startswith("decoder."):
+                    continue
                 param.requires_grad = False
 
     if trainable_head_only:
-        for param in model.parameters():
+        for param in base.parameters():
             param.requires_grad = False
 
-        for name, param in model.named_parameters():
+        for name, param in base.named_parameters():
             if (
                 "decoder.surf_heads" in name
                 or "decoder.atmos_heads" in name
@@ -1367,6 +1659,20 @@ def configure_trainable_parameters(
                 or "atmos_feature_combiner" in name
             ):
                 param.requires_grad = True
+
+    # Conv refinement heads are always trainable.
+    if is_conv_refine:
+        for param in model.surf_refine.parameters():
+            param.requires_grad = True
+        for param in model.atmos_refine.parameters():
+            param.requires_grad = True
+
+    # Flow-matching refinement heads are always trainable.
+    if is_flow_refine:
+        for param in model.surf_flow.parameters():
+            param.requires_grad = True
+        for param in model.atmos_flow.parameters():
+            param.requires_grad = True
 
     total = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -1417,6 +1723,19 @@ def create_scheduler(
         t_max = int(training_cfg.get("scheduler_t_max", max(1, num_training_steps)))
         eta_min = float(training_cfg.get("scheduler_eta_min", 0.0))
         return torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=t_max, eta_min=eta_min)
+
+    if scheduler_name == "cosine_warmup":
+        warmup_steps = int(training_cfg.get("scheduler_warmup_steps", 10))
+        t_max = int(training_cfg.get("scheduler_t_max", max(1, num_training_steps)))
+        eta_min = float(training_cfg.get("scheduler_eta_min", 0.0))
+
+        def _lr_lambda(step: int) -> float:
+            if step < warmup_steps:
+                return (step + 1) / warmup_steps
+            progress = (step - warmup_steps) / max(1, t_max - warmup_steps)
+            return eta_min + 0.5 * (1.0 - eta_min) * (1.0 + math.cos(math.pi * progress))
+
+        return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=_lr_lambda)
 
     if scheduler_name == "step":
         step_size = int(training_cfg.get("scheduler_step_size", max(1, num_training_steps // 5)))
@@ -1498,13 +1817,23 @@ def run_rollout(
     rollout_cfg = config.get("rollout", {})
     steps = int(rollout_cfg.get("rollout_num_steps", 0))
     if steps <= 0:
+        # Fall back to max(target_lead_times) from the data config.
+        lead_times = config.get("data", {}).get("target_lead_times", [])
+        if lead_times:
+            steps = max(int(x) for x in lead_times)
+    if steps <= 0:
         return []
 
     autoregressive = bool(rollout_cfg.get("autoregressive_inputs", True))
     feedback_fields_cfg = rollout_cfg.get("predicted_fields_get_fed_back") or rollout_cfg.get(
         "predicted_fields_feedback"
     )
-    feedback_fields = set(str(x) for x in feedback_fields_cfg) if feedback_fields_cfg else None
+    if feedback_fields_cfg:
+        feedback_fields = set(str(x) for x in feedback_fields_cfg)
+    else:
+        # Default: only feed back target variable predictions to prevent
+        # unsupervised variables from corrupting the autoregressive rollout.
+        feedback_fields = {spec.aurora_name for spec in resolved_specs.targets}
 
     keep_exogenous_mode = str(
         rollout_cfg.get("keep_exogenous_predictors", "fixed")
@@ -1523,6 +1852,7 @@ def run_rollout(
 
     predictor_by_aurora = resolved_specs.predictor_by_aurora
     anchor_idx = int(start_sample["anchor_index"])
+    spatial_h, spatial_w = current.spatial_shape
 
     predictions: list[Batch] = []
     with torch.inference_mode():
@@ -1568,6 +1898,7 @@ def run_rollout(
                             config=config,
                             device=device,
                         )
+                        new_frame = new_frame[..., :spatial_h, :spatial_w]
                     else:
                         new_frame = old[:, -1:]
                 else:
@@ -1593,6 +1924,7 @@ def run_rollout(
                             config=config,
                             device=device,
                         )
+                        new_frame = new_frame[..., :spatial_h, :spatial_w]
                     else:
                         new_frame = old[:, -1:]
                 else:
@@ -1620,6 +1952,7 @@ def save_checkpoint(
     global_step: int,
     best_val_loss: float,
     config: dict[str, Any],
+    norm_stats: dict[str, dict[str, torch.Tensor]] | None = None,
 ) -> None:
     """Save training checkpoint."""
     path = Path(path)
@@ -1634,6 +1967,11 @@ def save_checkpoint(
         "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
         "config": config,
     }
+    if norm_stats is not None:
+        payload["norm_stats"] = {
+            k: {kk: vv.detach().cpu().clone() for kk, vv in v.items()}
+            for k, v in norm_stats.items()
+        }
     torch.save(payload, str(path))
 
 
@@ -1718,12 +2056,61 @@ def write_run_manifest(
     return str(path.resolve())
 
 
+def _smooth_patch_artifacts(arr: np.ndarray, sigma: float, patch_size: int) -> np.ndarray:
+    """Apply Gaussian smoothing to remove patch-boundary artifacts.
+
+    Works on 2-D (H, W) or higher-dimensional arrays by smoothing the last
+    two spatial dimensions independently per slice.  Uses
+    ``scipy.ndimage.gaussian_filter`` when available, otherwise falls back to a
+    simple uniform box filter that is almost as effective for small sigma.
+
+    The smoothing preserves the overall magnitude and spatial structure while
+    blending the sharp patch-boundary discontinuities produced by the ViT
+    decoder's ``unpatchify`` operation.
+    """
+    if sigma <= 0:
+        return arr
+
+    try:
+        from scipy.ndimage import gaussian_filter  # type: ignore[import-untyped]
+
+        # Smooth only the last two (lat, lon) dimensions.
+        axes = tuple(range(arr.ndim - 2, arr.ndim))  # e.g. (-2, -1)
+        return gaussian_filter(arr.astype(np.float64), sigma=sigma, axes=axes).astype(arr.dtype)
+    except ImportError:
+        pass
+
+    # Fallback: uniform box filter with kernel_size ~ 2*sigma+1
+    kernel_size = max(3, int(2 * sigma + 1))
+    if kernel_size % 2 == 0:
+        kernel_size += 1
+    pad = kernel_size // 2
+
+    def _smooth_2d(img: np.ndarray) -> np.ndarray:
+        padded = np.pad(img, pad, mode="reflect")
+        kernel = np.ones((kernel_size, kernel_size), dtype=np.float64) / (kernel_size**2)
+        from numpy.lib.stride_tricks import sliding_window_view  # type: ignore[attr-defined]
+
+        windows = sliding_window_view(padded, (kernel_size, kernel_size))
+        return (windows * kernel).sum(axis=(-2, -1)).astype(img.dtype)
+
+    result = np.empty_like(arr)
+    it = np.nditer(arr[..., 0, 0], flags=["multi_index"])
+    while not it.finished:
+        idx = it.multi_index
+        result[idx] = _smooth_2d(arr[idx])
+        it.iternext()
+    return result
+
+
 def save_predictions(
     predictions: Sequence[Batch],
     output_path: str | Path,
     *,
     save_netcdf: bool = True,
     resolved_specs: "ResolvedVariableSpecs | None" = None,
+    smooth_sigma: float = 0.0,
+    patch_size: int = 3,
 ) -> xr.Dataset:
     """Save rollout predictions to NetCDF using original dataset variable names.
 
@@ -1738,6 +2125,10 @@ def save_predictions(
     Variable names match the dataset names from *resolved_specs*
     (e.g. ``t2m``, ``no2``).  When *resolved_specs* is not provided the Aurora
     internal names are used as a fallback (e.g. ``2t``, ``no2``).
+
+    When *smooth_sigma* > 0, a Gaussian filter with this sigma (in grid cells)
+    is applied to the spatial dimensions to remove patch-boundary artifacts
+    from the ViT decoder.
     """
     if not predictions:
         raise ValueError("No predictions were provided to save_predictions.")
@@ -1746,15 +2137,15 @@ def save_predictions(
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Build aurora_name -> dataset_name reverse mappings from resolved_specs.
+    # Only save target variables — exogenous predictor outputs are unsupervised
+    # and produce meaningless blocky artifacts.
     surf_name_map: dict[str, str] = {}
     atmos_name_map: dict[str, str] = {}
+    target_aurora_names: set[str] | None = None
     if resolved_specs is not None:
-        for spec in resolved_specs.predictors:
-            if spec.kind == "surf":
-                surf_name_map[spec.aurora_name] = spec.dataset_name
-            elif spec.kind == "atmos":
-                atmos_name_map[spec.aurora_name] = spec.dataset_name
+        target_aurora_names = set()
         for spec in resolved_specs.targets:
+            target_aurora_names.add(spec.aurora_name)
             if spec.kind == "surf":
                 surf_name_map[spec.aurora_name] = spec.dataset_name
             elif spec.kind == "atmos":
@@ -1775,19 +2166,27 @@ def save_predictions(
     data_vars: dict[str, tuple[tuple[str, ...], np.ndarray]] = {}
 
     for var_name in first.surf_vars:
+        if target_aurora_names is not None and var_name not in target_aurora_names:
+            continue
         # pred.surf_vars[name] shape: (batch, 1, H, W) — take batch=0, history=0
         arr = np.stack(
-            [pred.surf_vars[var_name][0, 0].detach().cpu().numpy() for pred in predictions],
+            [pred.surf_vars[var_name][0, 0].detach().cpu().float().numpy() for pred in predictions],
             axis=0,
         )  # (time, lat, lon)
+        if smooth_sigma > 0:
+            arr = _smooth_patch_artifacts(arr, sigma=smooth_sigma, patch_size=patch_size)
         out_name = surf_name_map.get(var_name, var_name)
         data_vars[out_name] = (("time", "latitude", "longitude"), arr)
 
     for var_name in first.atmos_vars:
+        if target_aurora_names is not None and var_name not in target_aurora_names:
+            continue
         arr = np.stack(
-            [pred.atmos_vars[var_name][0, 0].detach().cpu().numpy() for pred in predictions],
+            [pred.atmos_vars[var_name][0, 0].detach().cpu().float().numpy() for pred in predictions],
             axis=0,
         )  # (time, level, lat, lon)
+        if smooth_sigma > 0:
+            arr = _smooth_patch_artifacts(arr, sigma=smooth_sigma, patch_size=patch_size)
         out_name = atmos_name_map.get(var_name, var_name)
         data_vars[out_name] = (("time", "level", "latitude", "longitude"), arr)
 

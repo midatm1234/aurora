@@ -35,3 +35,11 @@ checkpoints/
 mlflow_tmp/
 aurora_mlflow_pyfunc/
 mlruns/
+
+# Local-only artifacts
+.env
+.vscode/
+data/
+output.png
+finetune/outputs/
+finetune/*.pdf
