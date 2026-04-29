@@ -186,8 +186,23 @@ class Batch:
         return self._fmap(lambda x: x.to(device))
 
     def type(self, t: type) -> "Batch":
-        """Convert everything to type `t`."""
-        return self._fmap(lambda x: x.type(t))
+        """Convert everything to type `t`.
+
+        Note: Metadata lat/lon are kept in their original dtype to preserve
+        coordinate precision for validation checks and downstream use.
+        """
+        return Batch(
+            surf_vars={k: v.type(t) for k, v in self.surf_vars.items()},
+            static_vars={k: v.type(t) for k, v in self.static_vars.items()},
+            atmos_vars={k: v.type(t) for k, v in self.atmos_vars.items()},
+            metadata=Metadata(
+                lat=self.metadata.lat,
+                lon=self.metadata.lon,
+                atmos_levels=self.metadata.atmos_levels,
+                time=self.metadata.time,
+                rollout_step=self.metadata.rollout_step,
+            ),
+        )
 
     def regrid(self, res: float) -> "Batch":
         """Regrid the batch to a `res` degrees resolution.

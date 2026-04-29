@@ -44,6 +44,8 @@ CONFIG = {
         "/mnt/data3/cams/2026-03-01_to_2026-03-15-cams-range-lead0-surface-level.nc",
         "/mnt/data3/cams/2026-03-16_to_2026-03-16-cams-range-lead0-surface-level.nc",
         "/mnt/data3/cams/2026-03-17_to_2026-03-31-cams-range-lead0-surface-level.nc",
+        "/mnt/data3/cams/2026-04-01_to_2026-04-03-cams-range-lead0-surface-level.nc",
+        "/mnt/data3/cams/2026-04-04_to_2026-04-04-cams-range-lead0-surface-level.nc"
     ],
     "atmos_files": [
         "/mnt/data3/cams/2026-02-01_to_2026-02-14-cams-range-lead0-atmospheric.nc",
@@ -51,6 +53,8 @@ CONFIG = {
         "/mnt/data3/cams/2026-03-01_to_2026-03-15-cams-range-lead0-atmospheric.nc",
         "/mnt/data3/cams/2026-03-16_to_2026-03-16-cams-range-lead0-atmospheric.nc",
         "/mnt/data3/cams/2026-03-17_to_2026-03-31-cams-range-lead0-atmospheric.nc",
+        "/mnt/data3/cams/2026-04-01_to_2026-04-03-cams-range-lead0-atmospheric.nc",
+        "/mnt/data3/cams/2026-04-04_to_2026-04-04-cams-range-lead0-atmospheric.nc"
     ],
 
     # Output NetCDF files
@@ -63,7 +67,7 @@ CONFIG = {
     # val_start_time <= times < test_start_time -> validation
     # times >= test_start_time -> test
     "val_start_time": None,  # e.g., "2026-03-14T00:00:00"
-    "test_start_time": "2026-03-29T00:00:00",  # Required if using date-based split
+    "test_start_time": "2026-04-01T00:00:00",  # Required if using date-based split
 
     # Fallback: fraction-based split (used only if test_start_time is None)
     "test_fraction": 0.2,
