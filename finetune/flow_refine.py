@@ -432,35 +432,34 @@ class AuroraFlowRefine(nn.Module):
             x = torch.randn_like(x)
         return r_hat
 
-    # --- Forward -----------------------------------------------------------
+    # --- Refinement (usable in both train and eval) --------------------------
 
-    def forward(self, batch: Batch) -> Batch:
-        pred = self.base(batch)
+    @torch.no_grad()
+    def refine(self, pred: Batch) -> Batch:
+        """Apply FM refinement heads to a prediction, regardless of training mode.
 
-        # Training: return Aurora's prediction unchanged. The FM head is
-        # only exercised via :meth:`flow_loss` from the supervised loss
-        # code path. This keeps the gradient through the (frozen) backbone
-        # decoupled from the FM head's gradient, which is desirable.
-        if self.training:
-            return pred
+        This is the core bias-correction step: for each target variable, run
+        the FM ODE sampler to estimate the residual and add it back in
+        physical space.
 
-        # Eval / inference: integrate the FM ODE and add the sampled
-        # residual to Aurora's prediction in physical space.
+        Unlike :meth:`forward`, this does NOT run the Aurora backbone — it
+        takes an already-computed prediction batch and only applies the FM
+        heads.  Used during training's autoregressive advance so the next
+        step sees the same refined distribution it would at inference,
+        eliminating the train/eval exposure bias.
+        """
         new_surf: dict[str, torch.Tensor] = dict(pred.surf_vars)
         for name, head in self.surf_flow.items():
             if name not in pred.surf_vars:
                 continue
             tensor = pred.surf_vars[name]  # (B, T, H, W) or (B, H, W)
-            # Aurora surf vars are (B, T, H, W). We refine each time slice.
             orig_shape = tensor.shape
-            t_dim = 1 if tensor.dim() == 4 else 0
             if tensor.dim() == 4:
                 B, T, H, W = tensor.shape
                 flat = tensor.reshape(B * T, H, W)
             else:
                 flat = tensor  # (B, H, W)
                 B, H, W = flat.shape
-                T = 1
             mean, std = self._norm_for(name, flat, kind="surf")
             cond = ((flat - mean) / std).unsqueeze(1)  # (N, 1, H, W)
             r = self._sample_residual(cond, head).squeeze(1)
@@ -478,11 +477,9 @@ class AuroraFlowRefine(nn.Module):
                 flat = tensor.reshape(B * T, L, H, W)
             else:
                 B, L, H, W = tensor.shape
-                T = 1
                 flat = tensor
             mean, std = self._norm_for(name, flat, kind="atmos")
             cond_norm = (flat - mean) / std  # (N, L, H, W)
-            # Per-level independent sampling: collapse L into batch.
             N = cond_norm.shape[0]
             cond_in = cond_norm.reshape(N * L, 1, H, W)
             r = self._sample_residual(cond_in, head).reshape(N, L, H, W)
@@ -490,6 +487,21 @@ class AuroraFlowRefine(nn.Module):
             new_atmos[name] = refined.reshape(orig_shape)
 
         return dataclasses.replace(pred, surf_vars=new_surf, atmos_vars=new_atmos)
+
+    # --- Forward -----------------------------------------------------------
+
+    def forward(self, batch: Batch) -> Batch:
+        pred = self.base(batch)
+
+        # Training: return Aurora's prediction unchanged. The FM head is
+        # only exercised via :meth:`flow_loss` from the supervised loss
+        # code path. This keeps the gradient through the (frozen) backbone
+        # decoupled from the FM head's gradient, which is desirable.
+        if self.training:
+            return pred
+
+        # Eval / inference: apply FM refinement to Aurora's raw prediction.
+        return self.refine(pred)
 
     # --- Convenience --------------------------------------------------------
 

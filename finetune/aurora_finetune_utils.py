@@ -1327,6 +1327,15 @@ def compute_supervised_loss(
     predictor_by_aurora = resolved_specs.predictor_by_aurora
     spatial_h, spatial_w = batch.spatial_shape
 
+    # Detect flow-refine wrapper so we can apply refinement during the
+    # autoregressive advance (matching inference-time distribution).
+    try:
+        from finetune.flow_refine import AuroraFlowRefine as _AFR
+    except Exception:
+        _AFR = None
+    _unwrapped = model.module if hasattr(model, "module") else model
+    _is_flow_refine = _AFR is not None and isinstance(_unwrapped, _AFR)
+
     preds_by_lead: dict[int, Batch] = {}
     current_batch = batch
     with _autocast_context(device=device, mixed_precision=mixed_precision):
@@ -1334,8 +1343,18 @@ def compute_supervised_loss(
             pred = model(current_batch)
             preds_by_lead[lead] = pred
 
+            # For the autoregressive advance, use the FM-refined prediction
+            # (matching what inference produces) so the FM head learns to
+            # correct Aurora's output when conditioned on previously-refined
+            # inputs.  This eliminates the train/eval exposure bias that
+            # causes multi-step rollout degradation.
+            if _is_flow_refine and _unwrapped.training:
+                advance_pred = _unwrapped.refine(pred)
+            else:
+                advance_pred = pred
+
             # Build next autoregressive input:
-            # - Target variables: use model prediction (autoregressive)
+            # - Target variables: use refined prediction (autoregressive)
             # - Exogenous predictors: use ground truth from dataset
             anchor_idx = sample_list[0]["anchor_index"]
             next_time_index = anchor_idx + lead
@@ -1377,10 +1396,10 @@ def compute_supervised_loss(
             current_batch = dataclasses.replace(
                 pred,
                 surf_vars=_advance_with_gt(
-                    current_batch.surf_vars, pred.surf_vars, "surf",
+                    current_batch.surf_vars, advance_pred.surf_vars, "surf",
                 ),
                 atmos_vars=_advance_with_gt(
-                    current_batch.atmos_vars, pred.atmos_vars, "atmos",
+                    current_batch.atmos_vars, advance_pred.atmos_vars, "atmos",
                 ),
             )
 
@@ -1452,18 +1471,9 @@ def compute_supervised_loss(
             # rectified-flow velocity-MSE. This gives a unit-normal-scale
             # loss surface (no 1/std blowup) and lets a small UNet learn
             # the conditional residual distribution p(r | ŷ).
-            base_for_fm = model.module if hasattr(model, "module") else model
-            try:
-                from finetune.flow_refine import AuroraFlowRefine as _AFR
-            except Exception:
-                _AFR = None
-            use_flow_loss = (
-                _AFR is not None
-                and isinstance(base_for_fm, _AFR)
-                and base_for_fm.training
-            )
+            use_flow_loss = _is_flow_refine and _unwrapped.training
             if use_flow_loss:
-                masked = base_for_fm.flow_loss(
+                masked = _unwrapped.flow_loss(
                     pred_norm=pred_tensor,
                     target_norm=target_tensor,
                     var_name=aurora_name,
