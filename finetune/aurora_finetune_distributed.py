@@ -127,12 +127,24 @@ def _distributed_validation(
 
     per_rank = math.ceil(len(val_samples) / world_size)
     my_samples = val_samples[rank * per_rank : min((rank + 1) * per_rank, len(val_samples))]
+    n_val_batches = math.ceil(len(my_samples) / batch_size)
 
     loss_sum = torch.zeros(1)
     count = torch.zeros(1)
 
+    val_pbar = tqdm(
+        range(0, len(my_samples), batch_size),
+        desc="Validation",
+        disable=(rank != 0),
+        unit="batch",
+        total=n_val_batches,
+        colour="green",
+        dynamic_ncols=True,
+        leave=False,
+        position=1,
+    )
     with torch.inference_mode():
-        for i in range(0, len(my_samples), batch_size):
+        for i in val_pbar:
             sample_batch = my_samples[i : i + batch_size]
             loss, _ = ft.compute_supervised_loss(
                 model=model, ds=ds_val, samples=sample_batch,
@@ -141,6 +153,7 @@ def _distributed_validation(
             )
             loss_sum += loss.detach().cpu()
             count += 1
+            val_pbar.set_postfix(loss=loss_sum.item() / count.item())
 
     dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
     dist.all_reduce(count, op=dist.ReduceOp.SUM)
@@ -535,10 +548,14 @@ def _worker(rank: int, world_size: int, local_gpu: int, cfg: dict):
         n_batches = math.ceil(len(rank_samples) / batch_size)
         pbar = tqdm(
             range(0, len(rank_samples), batch_size),
-            desc=f"Epoch {epoch}/{num_epochs}",
+            desc=f"Training Epoch {epoch}/{num_epochs}",
             disable=(rank != 0),
             unit="batch",
             total=n_batches,
+            colour="blue",
+            dynamic_ncols=True,
+            leave=True,
+            position=0,
         )
         for step_i in pbar:
             sample_batch = rank_samples[step_i : step_i + batch_size]
@@ -616,7 +633,7 @@ def _worker(rank: int, world_size: int, local_gpu: int, cfg: dict):
             epoch_loss_sum += float(loss.detach().cpu().item())
             epoch_batches += 1
             global_step += 1
-            pbar.set_postfix(loss=f"{epoch_loss_sum / epoch_batches:.4e}")
+            pbar.set_postfix(loss=epoch_loss_sum / epoch_batches, lr=optimizer.param_groups[0]["lr"])
 
         # All-reduce train loss for logging (CPU tensors for gloo)
         train_loss_t = torch.tensor([epoch_loss_sum, float(epoch_batches)])
@@ -643,7 +660,7 @@ def _worker(rank: int, world_size: int, local_gpu: int, cfg: dict):
         }
         history.append(row)
         pbar.set_postfix(
-            train=f"{train_loss:.4e}", val=f"{val_loss:.4e}",
+            train=train_loss, val=val_loss,
             mem=f"{torch.cuda.memory_allocated(device)/1e9:.1f}GB",
             refresh=True,
         )

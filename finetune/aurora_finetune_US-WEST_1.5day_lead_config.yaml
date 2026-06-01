@@ -16,7 +16,7 @@ paths:
 #   <output_dir>/<case_name>/  and  <checkpoint_dir>/<case_name>/
 # resume_from="best"/"last" resolves relative to the case folder, so
 # stages chain naturally when you keep case_name fixed across runs.
-case_name: two-day_lead
+case_name: US-WEST_2day_lead
 
 data:
   predictor_variables:

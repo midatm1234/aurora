@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 from collections import OrderedDict
+from glob import glob as _glob
 from pathlib import Path
 from typing import Any
 
@@ -37,21 +38,8 @@ CONFIG = {
     # Path to finetune config YAML
     "config": "aurora_finetune_rollout_config.yaml",
 
-    # Input NetCDF files (can be lists of paths)
-    "surface_files": [
-        "/mnt/data3/cams/2026-02-01_to_2026-02-14-cams-range-lead0-surface-level.nc",
-        "/mnt/data3/cams/2026-02-15_to_2026-02-28-cams-range-lead0-surface-level.nc",
-        "/mnt/data3/cams/2026-03-01_to_2026-03-15-cams-range-lead0-surface-level.nc",
-        "/mnt/data3/cams/2026-03-16_to_2026-03-16-cams-range-lead0-surface-level.nc",
-        "/mnt/data3/cams/2026-03-17_to_2026-03-31-cams-range-lead0-surface-level.nc",
-    ],
-    "atmos_files": [
-        "/mnt/data3/cams/2026-02-01_to_2026-02-14-cams-range-lead0-atmospheric.nc",
-        "/mnt/data3/cams/2026-02-15_to_2026-02-28-cams-range-lead0-atmospheric.nc",
-        "/mnt/data3/cams/2026-03-01_to_2026-03-15-cams-range-lead0-atmospheric.nc",
-        "/mnt/data3/cams/2026-03-16_to_2026-03-16-cams-range-lead0-atmospheric.nc",
-        "/mnt/data3/cams/2026-03-17_to_2026-03-31-cams-range-lead0-atmospheric.nc",
-    ],
+    # Folder containing input NetCDF files (searched with glob patterns)
+    "data_folder": "/mnt/data3/cams",
 
     # Output NetCDF files
     "train_out": "/mnt/data3/aurora/data/train.nc",
@@ -59,15 +47,16 @@ CONFIG = {
     "test_out": "/mnt/data3/aurora/data/test.nc",
 
     # Date-based split (ISO format: YYYY-MM-DDTHH:MM:SS)
-    # Times < val_start_time -> train
-    # val_start_time <= times < test_start_time -> validation
-    # times >= test_start_time -> test
-    "val_start_time": None,  # e.g., "2026-03-14T00:00:00"
-    "test_start_time": "2026-03-29T00:00:00",  # Required if using date-based split
+    "train_start_time": "2025-04-01T00:00:00",
+    "train_end_time": "2025-12-31T12:00:00",
+    "test_start_time": "2026-04-01T00:00:00",
+    "test_end_time": "2026-04-04T23:59:59",
 
-    # Fallback: fraction-based split (used only if test_start_time is None)
-    "test_fraction": 0.2,
-    "val_fraction": 0.1,  # Taken from remaining data after test split
+    # Spatial domain subset (set to None to disable)
+    "lat_min": 31.0,
+    "lat_max": 52.0,
+    "lon_min": -128.0,
+    "lon_max": -100.0,
 
     # NetCDF compression level (0-9)
     "compression_level": 1,
@@ -94,18 +83,10 @@ def _parse_args() -> argparse.Namespace:
         help=f"Path to finetune config YAML (default: {CONFIG['config']}).",
     )
     parser.add_argument(
-        "--surface-files",
-        type=str,
-        nargs="+",
-        default=None,
-        help="Surface NetCDF file paths (space-separated). Overrides CONFIG['surface_files'].",
-    )
-    parser.add_argument(
-        "--atmos-files",
-        type=str,
-        nargs="+",
-        default=None,
-        help="Atmospheric NetCDF file paths (space-separated). Overrides CONFIG['atmos_files'].",
+        "--data-folder",
+        type=Path,
+        default=CONFIG["data_folder"],
+        help=f"Folder to search for surface/atmospheric NetCDF files (default: {CONFIG['data_folder']}).",
     )
     parser.add_argument(
         "--train-out",
@@ -126,28 +107,44 @@ def _parse_args() -> argparse.Namespace:
         help=f"Output test.nc path (default: {CONFIG['test_out']}).",
     )
     parser.add_argument(
-        "--val-start-time",
+        "--train-start-time",
         type=str,
-        default=CONFIG["val_start_time"],
-        help="ISO timestamp; times >= this go to validation (if val_out is set).",
+        default=CONFIG["train_start_time"],
+        help="ISO timestamp; train set starts at this time.",
+    )
+    parser.add_argument(
+        "--train-end-time",
+        type=str,
+        default=CONFIG["train_end_time"],
+        help="ISO timestamp; train set ends at this time (inclusive).",
     )
     parser.add_argument(
         "--test-start-time",
         type=str,
         default=CONFIG["test_start_time"],
-        help="ISO timestamp; times >= this go to test set.",
+        help="ISO timestamp; test set starts at this time.",
     )
     parser.add_argument(
-        "--test-fraction",
-        type=float,
-        default=CONFIG["test_fraction"],
-        help=f"Test fraction if not using date-based split (default: {CONFIG['test_fraction']}).",
+        "--test-end-time",
+        type=str,
+        default=CONFIG["test_end_time"],
+        help="ISO timestamp; test set ends at this time (inclusive).",
     )
     parser.add_argument(
-        "--val-fraction",
-        type=float,
-        default=CONFIG["val_fraction"],
-        help=f"Validation fraction if not using date-based split (default: {CONFIG['val_fraction']}).",
+        "--lat-min", type=float, default=CONFIG["lat_min"],
+        help=f"Min latitude for spatial subset (default: {CONFIG['lat_min']}). Set to None to disable.",
+    )
+    parser.add_argument(
+        "--lat-max", type=float, default=CONFIG["lat_max"],
+        help=f"Max latitude for spatial subset (default: {CONFIG['lat_max']}).",
+    )
+    parser.add_argument(
+        "--lon-min", type=float, default=CONFIG["lon_min"],
+        help=f"Min longitude for spatial subset (default: {CONFIG['lon_min']}).",
+    )
+    parser.add_argument(
+        "--lon-max", type=float, default=CONFIG["lon_max"],
+        help=f"Max longitude for spatial subset (default: {CONFIG['lon_max']}).",
     )
     parser.add_argument(
         "--compression-level",
@@ -457,10 +454,10 @@ def _split_train_val_test(
     ds: xr.Dataset,
     *,
     time_dim: str,
-    val_start_time: str | None,
-    test_start_time: str | None,
-    test_fraction: float,
-    val_fraction: float,
+    train_start_time: str,
+    train_end_time: str,
+    test_start_time: str,
+    test_end_time: str,
     create_val: bool,
 ) -> tuple[xr.Dataset, xr.Dataset | None, xr.Dataset]:
     """Split dataset into train, validation (optional), and test sets.
@@ -473,86 +470,64 @@ def _split_train_val_test(
 
     time_vals = np.asarray(ds[time_dim].values)
 
-    # Date-based split
-    if test_start_time:
-        test_time = np.datetime64(test_start_time)
-        is_test = time_vals >= test_time
+    train_start = np.datetime64(train_start_time)
+    train_end = np.datetime64(train_end_time)
+    test_start = np.datetime64(test_start_time)
+    test_end = np.datetime64(test_end_time)
 
-        if create_val and val_start_time:
-            val_time = np.datetime64(val_start_time)
-            is_val = (time_vals >= val_time) & (time_vals < test_time)
-            is_train = time_vals < val_time
+    is_train = (time_vals >= train_start) & (time_vals <= train_end)
+    is_test = (time_vals >= test_start) & (time_vals <= test_end)
 
-            n_train, n_val, n_test = int(is_train.sum()), int(is_val.sum()), int(is_test.sum())
-            if n_train == 0 or n_val == 0 or n_test == 0:
-                raise ValueError(
-                    f"Invalid date split: train={n_train}, val={n_val}, test={n_test}. "
-                    f"Check --val-start-time and --test-start-time."
-                )
+    n_train, n_test = int(is_train.sum()), int(is_test.sum())
+    if n_train == 0 or n_test == 0:
+        raise ValueError(
+            f"Invalid date split: train={n_train}, test={n_test}. "
+            f"Check train/test start/end times."
+        )
 
-            train_ds = ds.isel({time_dim: np.where(is_train)[0]})
-            val_ds = ds.isel({time_dim: np.where(is_val)[0]})
-            test_ds = ds.isel({time_dim: np.where(is_test)[0]})
-            return train_ds, val_ds, test_ds
-        else:
-            is_train = ~is_test
-            n_train, n_test = int(is_train.sum()), int(is_test.sum())
-            if n_train == 0 or n_test == 0:
-                raise ValueError(
-                    f"Invalid test split: train={n_train}, test={n_test}. "
-                    f"Check --test-start-time."
-                )
-
-            train_ds = ds.isel({time_dim: np.where(is_train)[0]})
-            test_ds = ds.isel({time_dim: np.where(is_test)[0]})
-            return train_ds, None, test_ds
-
-    # Fraction-based split
-    if not 0.0 < test_fraction < 1.0:
-        raise ValueError("test_fraction must be in (0, 1).")
-
-    n_test = max(1, int(round(n_time * test_fraction)))
-    n_test = min(n_test, n_time - 1)
-    test_start_idx = n_time - n_test
+    train_ds = ds.isel({time_dim: np.where(is_train)[0]})
+    test_ds = ds.isel({time_dim: np.where(is_test)[0]})
 
     if create_val:
-        if not 0.0 < val_fraction < 1.0:
-            raise ValueError("val_fraction must be in (0, 1) when creating validation set.")
-
-        n_remaining = test_start_idx
-        n_val = max(1, int(round(n_remaining * val_fraction)))
-        n_val = min(n_val, n_remaining - 1)
-        val_start_idx = n_remaining - n_val
-
-        train_ds = ds.isel({time_dim: slice(0, val_start_idx)})
-        val_ds = ds.isel({time_dim: slice(val_start_idx, test_start_idx)})
-        test_ds = ds.isel({time_dim: slice(test_start_idx, None)})
+        # Validation = timestamps between train_end and test_start
+        is_val = (time_vals > train_end) & (time_vals < test_start)
+        n_val = int(is_val.sum())
+        if n_val == 0:
+            raise ValueError(
+                "No validation timestamps found between train_end_time and test_start_time."
+            )
+        val_ds = ds.isel({time_dim: np.where(is_val)[0]})
         return train_ds, val_ds, test_ds
-    else:
-        train_ds = ds.isel({time_dim: slice(0, test_start_idx)})
-        test_ds = ds.isel({time_dim: slice(test_start_idx, None)})
-        return train_ds, None, test_ds
+
+    return train_ds, None, test_ds
 
 
-def _apply_domain_subset(ds: xr.Dataset, cfg: dict[str, Any]) -> xr.Dataset:
-    """Subset dataset to the regional domain defined in config, if domain_type is 'regional'."""
+def _apply_domain_subset(
+    ds: xr.Dataset,
+    cfg: dict[str, Any],
+    *,
+    lat_min: float | None = None,
+    lat_max: float | None = None,
+    lon_min: float | None = None,
+    lon_max: float | None = None,
+) -> xr.Dataset:
+    """Subset dataset to a regional domain.
+
+    Explicit lat/lon bounds take priority over values in the YAML config.
+    If no bounds are provided (neither explicit nor in config), returns ds unchanged.
+    """
     data_cfg = cfg.get("data", {})
-    domain_type = str(data_cfg.get("domain_type", "global")).lower()
-    if domain_type != "regional":
-        return ds
-
     lat_dim = str(data_cfg.get("lat_dim", "latitude"))
     lon_dim = str(data_cfg.get("lon_dim", "longitude"))
 
-    lat_min = data_cfg.get("lat_min")
-    lat_max = data_cfg.get("lat_max")
-    lon_min = data_cfg.get("lon_min")
-    lon_max = data_cfg.get("lon_max")
+    # Resolve bounds: explicit args > YAML config > None (no subset)
+    lat_min = lat_min if lat_min is not None else data_cfg.get("lat_min")
+    lat_max = lat_max if lat_max is not None else data_cfg.get("lat_max")
+    lon_min = lon_min if lon_min is not None else data_cfg.get("lon_min")
+    lon_max = lon_max if lon_max is not None else data_cfg.get("lon_max")
+
     if None in {lat_min, lat_max, lon_min, lon_max}:
-        raise ValueError(
-            "domain_type is 'regional' but one or more of lat_min, lat_max, lon_min, lon_max "
-            "are not set in the config."
-        )
+        return ds
 
     lat_hi = float(max(lat_min, lat_max))
     lat_lo = float(min(lat_min, lat_max))
@@ -606,14 +581,15 @@ def main() -> None:
     if not requested:
         raise ValueError("No variables found in data.predictor_variables/target_variables.")
 
-    # Get file lists from args or CONFIG
-    surface_files = args.surface_files if args.surface_files else CONFIG["surface_files"]
-    atmos_files = args.atmos_files if args.atmos_files else CONFIG["atmos_files"]
+    # Discover files via glob in data_folder
+    data_folder = str(args.data_folder)
+    surface_files = sorted(_glob(f"{data_folder}/*lead0-surface-level.nc"))
+    atmos_files = sorted(_glob(f"{data_folder}/*lead0-atmospheric.nc"))
 
-    if isinstance(surface_files, str):
-        surface_files = [surface_files]
-    if isinstance(atmos_files, str):
-        atmos_files = [atmos_files]
+    if not surface_files:
+        raise FileNotFoundError(f"No *lead0-surface-level.nc files found in {data_folder}")
+    if not atmos_files:
+        raise FileNotFoundError(f"No *lead0-atmospheric.nc files found in {data_folder}")
 
     data_cfg = cfg.get("data", {})
     time_dim = str(data_cfg.get("time_dim", "time"))
@@ -626,16 +602,20 @@ def main() -> None:
         requested=requested,
     )
 
-    merged = _apply_domain_subset(merged, cfg)
+    merged = _apply_domain_subset(
+        merged, cfg,
+        lat_min=args.lat_min, lat_max=args.lat_max,
+        lon_min=args.lon_min, lon_max=args.lon_max,
+    )
 
     create_val = args.val_out is not None
     train_ds, val_ds, test_ds = _split_train_val_test(
         merged,
         time_dim=time_dim,
-        val_start_time=args.val_start_time,
+        train_start_time=args.train_start_time,
+        train_end_time=args.train_end_time,
         test_start_time=args.test_start_time,
-        test_fraction=float(args.test_fraction),
-        val_fraction=float(args.val_fraction),
+        test_end_time=args.test_end_time,
         create_val=create_val,
     )
 

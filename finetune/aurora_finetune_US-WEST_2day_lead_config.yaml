@@ -16,7 +16,7 @@ paths:
 #   <output_dir>/<case_name>/  and  <checkpoint_dir>/<case_name>/
 # resume_from="best"/"last" resolves relative to the case folder, so
 # stages chain naturally when you keep case_name fixed across runs.
-case_name: two-day_lead
+case_name: US-WEST_2day_lead
 
 data:
   predictor_variables:
@@ -104,7 +104,7 @@ data:
 
   atmos_levels: [50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000]
   input_time_steps: 2
-  target_lead_times: [1,2,3]  # Paper §D.3: "CAMS 0.4°: train with single-step prediction".
+  target_lead_times: [1,2,3,4]  # Paper §D.3: "CAMS 0.4°: train with single-step prediction".
   target_type: rollout  # next-step | multi-step | rollout
 
   domain_type: regional  # global | regional
@@ -194,7 +194,7 @@ model:
 training:
   seed: 42
   batch_size: 1  # 4 leads × 14 atmos levels × FM head OOMs at bs=2 on 22 GB A10G; effective batch = 1 × 4 GPUs × 8 accum = 32
-  num_epochs: 25  # fresh finetune at target_lead_times=[1,2,3] from a clean random init of the FM head
+  num_epochs: 25  # fresh finetune at target_lead_times=[1,2,3,4] from a clean random init of the FM head
   # Fresh stage-1 fine-tune at lead_times=[1,2,3,4]. The previous run was
   # warmstarted from a head trained only at leads=[1,2]; extending to lead 3
   # introduced a large distribution shift that the resumed head couldn't
