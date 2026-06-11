@@ -42,4 +42,5 @@ mlruns/
 data/
 output.png
 finetune/outputs/
+examples/outputs/
 finetune/*.pdf

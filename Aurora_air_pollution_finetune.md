@@ -93,6 +93,40 @@ Equivalent to velocity-prediction but with two practical wins:
 
 `compute_supervised_loss` auto-detects an `AuroraFlowRefine` wrapper and, in training mode, calls `flow_loss(pred_norm, target_norm, var, kind)` — replacing the standard MSE on Aurora's prediction with the FM regression on the *residual*. The displayed train-loss number is therefore residual-MSE at random `t`, NOT directly comparable to a baseline MSE on the prediction.
 
+### Structural auxiliary losses (`training.flow_aux_loss` block)
+
+The base flow loss is a **per-pixel / per-level residual MSE**. That objective is blind to spatial structure, extremes, distribution, vertical shape, and the column↔profile relationship — exactly the coherent biases left in the rollout-vs-test difference maps (e.g. `rollout_vs_test_gtco3.gif`). To close that gap, `flow_loss` layers weighted structural terms on top, all computed on the head's **clean residual estimate** `refined = ŷ + r̂` versus the target (so they penalise the *structured* error `r̂ − r`, not just its magnitude):
+
+| Term | Weight key | What it penalises |
+|------|------------|-------------------|
+| Extreme-event | `extreme_weight`, `peak_weight` | Quantile-weighted squared error on tail cells (`extreme_quantile`, `extreme_intensity`) + spatial peak (max/min) magnitude mismatch — corrects under-predicted plumes. |
+| Spatial-pattern | `spatial_grad_weight`, `spatial_acc_weight` | Finite-difference gradient-field MSE + `1 − anomaly-correlation (ACC)` — fixes displaced fronts/gradients. |
+| Distributional | `dist_var_weight`, `dist_wasserstein_weight` | Spatial-std mismatch + sorted-value (1-D Wasserstein-2) distance — matches the value distribution. |
+| Vertical-profile | `vertical_weight` | Level-to-level finite-difference MSE on the atmospheric profile — enforces a coherent vertical shape (the head is otherwise per-level independent). |
+| Column/profile coherence | `coherence_weight` | Ties the column var (`gtco3`) to the pressure-weighted vertical integral of the profile var (`go3`): `MSE(D(refined), D(truth))` with `D = col − Σ_l w_l · prof_l`. Computed cross-variable in `compute_supervised_loss`. |
+
+All weights default to `0.0` (pure residual MSE → backward compatible), and a single `enabled` flag toggles the whole feature on/off without re-zeroing weights. The block is exposed in every flow-refine config (`enabled: true` in the O3 example, `enabled: false` in the NO2 configs). Example block:
+
+```yaml
+training:
+  flow_aux_loss:
+    enabled: true                 # master on/off switch (single line)
+    extreme_weight: 0.5
+    extreme_quantile: 0.95
+    extreme_intensity: 4.0
+    peak_weight: 0.25
+    spatial_grad_weight: 0.5
+    spatial_acc_weight: 0.25
+    dist_var_weight: 0.25
+    dist_wasserstein_weight: 0.25
+    vertical_weight: 0.5
+    coherence_weight: 0.25
+    coherence_column_var: gtco3   # empty => auto-detect first surf target
+    coherence_profile_var: go3    # empty => auto-detect first atmos target
+```
+
+When `enabled: false` (or the block is absent), `flow_loss` is exactly the original residual MSE regardless of the individual weights.
+
 ### Configuration knobs (`model:` block)
 
 ```yaml

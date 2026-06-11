@@ -31,6 +31,28 @@ import torch
 import torch.distributed as dist
 from tqdm import tqdm
 
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+
+# This workload is launch-bound on a small spatial grid: thousands of tiny CUDA
+# kernels per step mean the bottleneck is CPU-side kernel dispatch, not GPU math.
+# Letting OpenMP/torch spawn one thread per core (48 on this box) oversubscribes
+# the CPU and slows dispatch. Cap intra-op threads to keep dispatch fast.
+os.environ.setdefault("OMP_NUM_THREADS", "8")
+os.environ.setdefault("MKL_NUM_THREADS", "8")
+try:
+    torch.set_num_threads(8)
+except Exception:
+    pass
+
+
+def _progress_bars_disabled() -> bool:
+    value = (
+        os.environ.get("AURORA_DISABLE_PROGRESS_BARS")
+        or os.environ.get("TQDM_DISABLE")
+        or ""
+    )
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
 # ---------------------------------------------------------------------------
 # Project path setup
 # ---------------------------------------------------------------------------
@@ -120,31 +142,19 @@ def _allreduce_grads(model: torch.nn.Module, world_size: int):
 
 def _distributed_validation(
     model, ds_val, val_samples, cfg, resolved_specs, device, rank, world_size,
-    norm_stats=None,
+    norm_stats=None, pbar=None,
 ):
     batch_size = int(cfg.get("training", {}).get("batch_size", 1))
     model.eval()
 
     per_rank = math.ceil(len(val_samples) / world_size)
     my_samples = val_samples[rank * per_rank : min((rank + 1) * per_rank, len(val_samples))]
-    n_val_batches = math.ceil(len(my_samples) / batch_size)
 
     loss_sum = torch.zeros(1)
     count = torch.zeros(1)
 
-    val_pbar = tqdm(
-        range(0, len(my_samples), batch_size),
-        desc="Validation",
-        disable=(rank != 0),
-        unit="batch",
-        total=n_val_batches,
-        colour="green",
-        dynamic_ncols=True,
-        leave=False,
-        position=1,
-    )
     with torch.inference_mode():
-        for i in val_pbar:
+        for i in range(0, len(my_samples), batch_size):
             sample_batch = my_samples[i : i + batch_size]
             loss, _ = ft.compute_supervised_loss(
                 model=model, ds=ds_val, samples=sample_batch,
@@ -153,7 +163,13 @@ def _distributed_validation(
             )
             loss_sum += loss.detach().cpu()
             count += 1
-            val_pbar.set_postfix(loss=loss_sum.item() / count.item())
+            if pbar is not None and rank == 0:
+                pbar.update(1)
+                pbar.set_postfix(
+                    phase="val",
+                    val_loss=loss_sum.item() / max(count.item(), 1.0),
+                    refresh=True,
+                )
 
     dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
     dist.all_reduce(count, op=dist.ReduceOp.SUM)
@@ -426,6 +442,7 @@ def _worker(rank: int, world_size: int, local_gpu: int, cfg: dict):
     validation_frequency = max(1, int(train_cfg.get("validation_frequency", 1)))
     save_best_only = bool(train_cfg.get("save_best_only", True))
     save_last = bool(train_cfg.get("save_last", True))
+    diagnostics_enabled = bool(train_cfg.get("diagnostics_enabled", False))
 
     updates_per_epoch = max(1, int(np.ceil(len(train_samples) / max(1, batch_size))))
     scheduler = ft.create_scheduler(
@@ -545,13 +562,23 @@ def _worker(rank: int, world_size: int, local_gpu: int, cfg: dict):
         epoch_batches = 0
         optimizer.zero_grad(set_to_none=True)
 
-        n_batches = math.ceil(len(rank_samples) / batch_size)
+        n_train_batches = math.ceil(len(rank_samples) / batch_size)
+        should_validate = ((epoch + 1) % validation_frequency == 0) or (epoch == num_epochs - 1)
+        if should_validate:
+            val_per_rank = math.ceil(len(val_samples) / world_size)
+            my_val_count = len(
+                val_samples[rank * val_per_rank : min((rank + 1) * val_per_rank, len(val_samples))]
+            )
+            n_val_batches = math.ceil(my_val_count / batch_size)
+        else:
+            n_val_batches = 0
+
         pbar = tqdm(
             range(0, len(rank_samples), batch_size),
-            desc=f"Training Epoch {epoch}/{num_epochs}",
-            disable=(rank != 0),
+            desc=f"Epoch {epoch + 1}/{num_epochs}",
+            disable=(rank != 0 or _progress_bars_disabled()),
             unit="batch",
-            total=n_batches,
+            total=n_train_batches + n_val_batches,
             colour="blue",
             dynamic_ncols=True,
             leave=True,
@@ -562,7 +589,11 @@ def _worker(rank: int, world_size: int, local_gpu: int, cfg: dict):
 
             # Activate one-shot per-variable loss breakdown on rank 0
             # for the first batch and the batch right after the first update.
-            diag_on = rank == 0 and global_step in (0, accumulation_steps, accumulation_steps + 1)
+            diag_on = (
+                diagnostics_enabled
+                and rank == 0
+                and global_step in (0, accumulation_steps, accumulation_steps + 1)
+            )
             if diag_on:
                 ft._DIAG_LOSS_BREAKDOWN["active"] = True
                 ft._DIAG_LOSS_BREAKDOWN["rows"] = []
@@ -594,7 +625,7 @@ def _worker(rank: int, world_size: int, local_gpu: int, cfg: dict):
                 _allreduce_grads(model, world_size)
                 trainable_params = [p for p in model.parameters() if p.requires_grad]
                 # ---- DIAGNOSTIC: locate top-gradient params on first update ----
-                if global_step <= 1 and rank == 0:
+                if diagnostics_enabled and global_step <= 1 and rank == 0:
                     grad_info = []
                     for n, p in model.named_parameters():
                         if p.requires_grad and p.grad is not None:
@@ -614,26 +645,41 @@ def _worker(rank: int, world_size: int, local_gpu: int, cfg: dict):
                 )
                 # Skip optimizer step when gradients contain NaN/Inf (bf16 overflow).
                 if not torch.isfinite(pre_clip_norm):
-                    _print0(rank, f"  [step {global_step}] NaN/Inf grad norm — skipping update")
+                    if rank == 0:
+                        pbar.set_postfix(
+                            phase="train",
+                            loss=epoch_loss_sum / max(epoch_batches, 1),
+                            lr=optimizer.param_groups[0]["lr"],
+                            grad="nan/inf skip",
+                            refresh=True,
+                        )
                     optimizer.zero_grad(set_to_none=True)
                 else:
                     post_clip = (
                         min(float(pre_clip_norm), grad_clip) if grad_clip > 0 else float(pre_clip_norm)
                     )
-                    _print0(
-                        rank,
-                        f"  [step {global_step}] grad_norm(pre)={float(pre_clip_norm):.4e} "
-                        f"(post≈{post_clip:.4e}), lr={optimizer.param_groups[0]['lr']:.2e}",
-                    )
                     optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
+                    if rank == 0:
+                        pbar.set_postfix(
+                            phase="train",
+                            loss=epoch_loss_sum / max(epoch_batches, 1),
+                            lr=optimizer.param_groups[0]["lr"],
+                            grad=f"{float(pre_clip_norm):.2e}",
+                            clip=f"{post_clip:.2e}",
+                            refresh=True,
+                        )
                 if scheduler is not None:
                     scheduler.step()
 
             epoch_loss_sum += float(loss.detach().cpu().item())
             epoch_batches += 1
             global_step += 1
-            pbar.set_postfix(loss=epoch_loss_sum / epoch_batches, lr=optimizer.param_groups[0]["lr"])
+            pbar.set_postfix(
+                phase="train",
+                loss=epoch_loss_sum / epoch_batches,
+                lr=optimizer.param_groups[0]["lr"],
+            )
 
         # All-reduce train loss for logging (CPU tensors for gloo)
         train_loss_t = torch.tensor([epoch_loss_sum, float(epoch_batches)])
@@ -641,12 +687,12 @@ def _worker(rank: int, world_size: int, local_gpu: int, cfg: dict):
         train_loss = (train_loss_t[0] / train_loss_t[1]).item() if train_loss_t[1] > 0 else math.nan
 
         # ---- validation ----
-        should_validate = ((epoch + 1) % validation_frequency == 0) or (epoch == num_epochs - 1)
         val_loss = float("nan")
         if should_validate:
+            pbar.set_description(f"Epoch {epoch + 1}/{num_epochs} val")
             val_metrics = _distributed_validation(
                 model, val_ds, val_samples, cfg, resolved_specs, device, rank, world_size,
-                norm_stats=norm_stats,
+                norm_stats=norm_stats, pbar=pbar,
             )
             val_loss = float(val_metrics["val_loss"])
             model.train()
@@ -664,9 +710,7 @@ def _worker(rank: int, world_size: int, local_gpu: int, cfg: dict):
             mem=f"{torch.cuda.memory_allocated(device)/1e9:.1f}GB",
             refresh=True,
         )
-        _print0(rank, f"  Epoch {epoch}: train_loss={train_loss:.4e} val_loss={val_loss:.4e} "
-                       f"lr={float(optimizer.param_groups[0]['lr']):.2e} "
-                       f"mem={torch.cuda.memory_allocated(device)/1e9:.1f}GB")
+        pbar.close()
 
         improved = should_validate and np.isfinite(val_loss) and (val_loss < (best_val_loss - min_delta))
         if improved:
@@ -705,8 +749,8 @@ def _worker(rank: int, world_size: int, local_gpu: int, cfg: dict):
 
         rollout_cfg = cfg.get("rollout", {})
         if bool(rollout_cfg.get("run_rollout_after_training", True)):
-            if best_ckpt_path.exists():
-                state = torch.load(str(best_ckpt_path), map_location=device, weights_only=False)
+            if last_ckpt_path.exists():
+                state = torch.load(str(last_ckpt_path), map_location=device, weights_only=False)
                 model.load_state_dict(state["model_state_dict"])
 
             input_steps = int(cfg["data"].get("input_time_steps", 2))

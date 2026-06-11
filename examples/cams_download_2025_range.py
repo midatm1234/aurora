@@ -12,7 +12,7 @@ from pathlib import Path
 
 import cdsapi
 
-OUTPUT_DIR = Path("/mnt/data3/cams")
+OUTPUT_DIR = Path("/data/cams")
 TIMES_UTC = ["00:00", "12:00"]
 OVERWRITE = False
 REMOVE_ZIP_AFTER_EXTRACTION = True

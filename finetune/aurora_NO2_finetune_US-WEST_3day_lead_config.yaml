@@ -16,7 +16,7 @@ paths:
 #   <output_dir>/<case_name>/  and  <checkpoint_dir>/<case_name>/
 # resume_from="best"/"last" resolves relative to the case folder, so
 # stages chain naturally when you keep case_name fixed across runs.
-case_name: two-day_lead
+case_name: NO2_US-WEST_3day_lead
 
 data:
   predictor_variables:
@@ -58,11 +58,12 @@ data:
     - dataset_name: no2
       aurora_name: no2
       kind: atmos
-      # Use ALL 13 pressure levels. The per-level normalisation scales for
-      # top-of-atmosphere NO2 collapse to ~1e-9, but those vertical gradients
-      # carry real physical signal — dropping levels here was wrong. The
-      # numerical pathology this used to mask is fixed in the optimizer
-      # (per-parameter LR scaling by weight magnitude in the training loop).
+      # Compute target loss AND apply flow-refine bias correction only at
+      # these pressure levels. Levels not listed here pass through from
+      # the backbone without post-processing. The full atmospheric level
+      # grid remains in data.atmos_levels so Aurora's encoder/decoder and
+      # checkpoint shapes stay compatible.
+      loss_levels: [1000, 925, 850]
     - dataset_name: tcno2
       aurora_name: tcno2
       kind: surf
@@ -104,7 +105,7 @@ data:
 
   atmos_levels: [50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000]
   input_time_steps: 2
-  target_lead_times: [1,2,3]  # Paper §D.3: "CAMS 0.4°: train with single-step prediction".
+  target_lead_times: [1,2,3,4,5,6]  # Paper §D.3: "CAMS 0.4°: train with single-step prediction".
   target_type: rollout  # next-step | multi-step | rollout
 
   domain_type: regional  # global | regional
@@ -166,7 +167,7 @@ model:
   freeze_encoder: true
   freeze_decoder: false
   trainable_head_only: false
-  gradient_checkpointing: true
+  gradient_checkpointing: false  # backbone is frozen (backbone_freeze/freeze_encoder: true) and GPU is far from full (~7/95 GiB used), so activation checkpointing only wastes compute by recomputing the frozen forward during backward. Disable for a large speedup on this small grid.
   mixed_precision: bf16  # none | bf16 | fp16
   device: cuda
   compile_model: false
@@ -193,8 +194,8 @@ model:
 
 training:
   seed: 42
-  batch_size: 1  # 4 leads × 14 atmos levels × FM head OOMs at bs=2 on 22 GB A10G; effective batch = 1 × 4 GPUs × 8 accum = 32
-  num_epochs: 25  # fresh finetune at target_lead_times=[1,2,3] from a clean random init of the FM head
+  batch_size: 1  # 4 leads × 13 atmos levels × FM head OOMs at bs=2 on 22 GB A10G; effective batch = 1 × 4 GPUs × 8 accum = 32
+  num_epochs: 100  # fresh O3 finetune at target_lead_times=[1,2,3,4] from a clean random init of the FM head
   # Fresh stage-1 fine-tune at lead_times=[1,2,3,4]. The previous run was
   # warmstarted from a head trained only at leads=[1,2]; extending to lead 3
   # introduced a large distribution shift that the resumed head couldn't
@@ -214,11 +215,8 @@ training:
   gradient_clip_val: 1.0
   accumulation_steps: 8
   # Per-parameter LR scaling by weight RMS. AdamW takes ~unit-magnitude steps
-  # in normalised weight units regardless of the parameter's actual scale; for
-  # Aurora's per-level NO2 head/embed weights (which are themselves O(1e-9) at
-  # the top of atmosphere), one un-scaled AdamW step shifts them by ~10^3×
-  # their natural size and destroys the pretrained mapping. Setting this
-  # enables the trust-ratio-style per-tensor scaling in
+  # in normalised weight units regardless of the parameter's actual scale.
+  # Setting this enables the trust-ratio-style per-tensor scaling in
   # aurora_finetune_distributed.py.
   scale_aware_lr:
     enabled: true
@@ -245,10 +243,10 @@ training:
     enabled: false
     patience: 3
     min_delta: 1.0e-5
-  validation_frequency: 1
+  validation_frequency: 5  # validation runs the full multi-lead rollout over the whole val set; doing it every epoch (=1) roughly doubles per-epoch cost. Validate every 5 epochs.
   save_best_only: true
   save_last: true
-  resume_training: true
+  resume_training: false
   resume_from: "last"  # "best", "last", or a path to a .ckpt file. Empty = no resume.
   resume_skip_scheduler: true  # only relevant when resume_training=true
   # MSE for warmup-stage fine-tuning: gradient ∝ (pred-tgt)/std² shrinks as
@@ -262,13 +260,16 @@ training:
   #
   # The base flow loss is a per-pixel / per-level residual MSE, which has no
   # notion of spatial pattern, extremes, distribution, vertical shape, or the
-  # column<->profile relationship. These weighted terms (computed on the head's
-  # clean residual estimate refined = y_hat + r_hat vs the target) add those
-  # objectives. Toggle the whole feature with `enabled`; set any weight to 0 to
-  # disable an individual term.
+  # column<->profile relationship — exactly the structures left uncorrected in
+  # the rollout-vs-test difference maps. These weighted terms (computed on the
+  # head's clean residual estimate refined = ŷ + r̂ vs the target) add those
+  # objectives. Set any weight to 0 to disable that term; all-zero reproduces
+  # the original pure residual-MSE behaviour.
   flow_aux_loss:
-    enabled: false              # master on/off switch (single line)
-    # Extreme-event performance: tail-cell weighting + spatial peak match.
+    # Master on/off switch for all structural terms below (single-line toggle).
+    enabled: true
+    # Extreme-event performance: up-weight squared error on tail cells
+    # (|z| above the per-sample quantile) + match spatial peak magnitude.
     extreme_weight: 0.5
     extreme_quantile: 0.95
     extreme_intensity: 4.0
@@ -279,13 +280,14 @@ training:
     # Distributional errors: spatial-std match + sorted-value Wasserstein.
     dist_var_weight: 0.25
     dist_wasserstein_weight: 0.25
-    # Vertical-profile consistency (atmospheric no2): level-difference MSE.
+    # Vertical-profile consistency (atmospheric go3): level-difference MSE.
     vertical_weight: 0.5
-    # Column/profile coherence: tie tcno2 (column) to the pressure-weighted
-    # vertical integral of no2 (profile). Empty var names => auto-detect.
+    # Column/profile coherence: tie gtco3 (column) to the pressure-weighted
+    # vertical integral of go3 (profile). Empty var names => auto-detect the
+    # first surf target as column and first atmos target as profile.
     coherence_weight: 0.25
-    coherence_column_var: tcno2
-    coherence_profile_var: no2
+    coherence_column_var: gtco3
+    coherence_profile_var: go3
 
 rollout:
   run_rollout_after_training: true
@@ -301,6 +303,6 @@ rollout:
 notebook:
   quicklook_sample_index: 0
   plot_variables:
-    - no2
-    - tcno2
+    - go3
+    - gtco3
   verbosity: 1

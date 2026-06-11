@@ -215,6 +215,13 @@ def load_config(config_path: str | Path, overrides: dict[str, Any] | None = None
     if overrides:
         config = _deep_merge(config, overrides)
 
+    case_name = str(config.get("case_name", "")).strip()
+    if not case_name:
+        raise ValueError(
+            f"Config at {config_path} must define a non-empty top-level `case_name`. "
+            "This value is used to locate case-specific train/test data."
+        )
+
     paths_cfg = config.setdefault("paths", {})
     project_root = Path(paths_cfg.get("project_root", config_path.parent)).expanduser()
     if not project_root.is_absolute():
@@ -237,6 +244,26 @@ def load_config(config_path: str | Path, overrides: dict[str, Any] | None = None
             continue
         paths_cfg[key] = _resolve_path(str(value), project_root)
 
+    data_dir = Path(paths_cfg.get("data_dir", project_root / "data"))
+    case_data_dir = data_dir if data_dir.name == case_name else data_dir / case_name
+    paths_cfg["data_dir"] = str(data_dir.resolve())
+    paths_cfg["case_data_dir"] = str(case_data_dir.resolve())
+    paths_cfg["train_data_path"] = str((case_data_dir / "train.nc").resolve())
+    paths_cfg["val_data_path"] = str((case_data_dir / "test.nc").resolve())
+    paths_cfg["test_data_path"] = str((case_data_dir / "test.nc").resolve())
+
+    required_data_paths = [
+        Path(paths_cfg["train_data_path"]),
+        Path(paths_cfg["test_data_path"]),
+    ]
+    missing_data_paths = [path for path in required_data_paths if not path.exists()]
+    if missing_data_paths:
+        missing = ", ".join(str(path) for path in missing_data_paths)
+        raise FileNotFoundError(
+            f"Required case-specific prepared dataset file(s) are missing: {missing}. "
+            "Run finetune/prepare_train_test_from_netcdf.py with the same YAML config first."
+        )
+
     output_dir = Path(paths_cfg.get("output_dir", project_root / "outputs"))
     checkpoint_dir = Path(paths_cfg.get("checkpoint_dir", output_dir / "checkpoints"))
 
@@ -245,12 +272,10 @@ def load_config(config_path: str | Path, overrides: dict[str, Any] | None = None
     # <checkpoint_dir>/<case_name>/. Idempotent: re-resolving an already
     # case-suffixed path is a no-op, so calling resolve_paths twice on the
     # same dict (e.g., notebook + script) doesn't double-nest.
-    case_name = str(config.get("case_name", "")).strip()
-    if case_name:
-        if output_dir.name != case_name:
-            output_dir = output_dir / case_name
-        if checkpoint_dir.name != case_name:
-            checkpoint_dir = checkpoint_dir / case_name
+    if output_dir.name != case_name:
+        output_dir = output_dir / case_name
+    if checkpoint_dir.name != case_name:
+        checkpoint_dir = checkpoint_dir / case_name
 
     output_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -274,6 +299,16 @@ def open_dataset(path: str | Path, config: dict[str, Any]) -> xr.Dataset:
     """Open an xarray dataset and apply Aurora-compatible coordinate/domain handling."""
     path = Path(path).expanduser().resolve()
     if not path.exists():
+        expected = {
+            Path(config.get("paths", {}).get("train_data_path", "")).expanduser().resolve(),
+            Path(config.get("paths", {}).get("val_data_path", "")).expanduser().resolve(),
+            Path(config.get("paths", {}).get("test_data_path", "")).expanduser().resolve(),
+        }
+        if path in expected:
+            raise FileNotFoundError(
+                f"Required prepared dataset is missing: {path}. "
+                "Run finetune/prepare_train_test_from_netcdf.py with the same YAML config first."
+            )
         raise FileNotFoundError(f"Dataset file not found: {path}")
 
     data_cfg = config.get("data", {})
@@ -1176,6 +1211,8 @@ def compute_target_normalization_stats(
         aurora_name = spec.aurora_name
 
         if spec.kind == "atmos":
+            # Compute stats only for loss_levels if specified; the flow-refine
+            # head only operates on these levels at inference.
             if spec.loss_levels is not None:
                 target_levels = [float(lv) for lv in spec.loss_levels]
             else:
@@ -1282,6 +1319,27 @@ def _advance_batch_with_prediction(
 _DIAG_LOSS_BREAKDOWN: dict[str, Any] = {"active": False}
 
 
+def _resolve_coherence_pair(
+    coh_cache: dict[str, dict[str, Any]],
+    column_var: str,
+    profile_var: str,
+) -> tuple[str | None, str | None]:
+    """Pick the (column=surf, profile=atmos) variable pair for coherence.
+
+    Honours explicit ``column_var``/``profile_var`` from config when both are
+    present in the cache; otherwise auto-detects the first cached surf var as
+    the column and the first cached atmos var as the profile.
+    """
+    if column_var and profile_var:
+        if column_var in coh_cache and profile_var in coh_cache:
+            return column_var, profile_var
+        return None, None
+
+    col = next((n for n, v in coh_cache.items() if v["kind"] == "surf"), None)
+    prof = next((n for n, v in coh_cache.items() if v["kind"] == "atmos"), None)
+    return col, prof
+
+
 def compute_supervised_loss(
     model: torch.nn.Module,
     ds: xr.Dataset,
@@ -1297,6 +1355,16 @@ def compute_supervised_loss(
     training_cfg = config.get("training", {})
     loss_name = str(training_cfg.get("loss_function", "mse")).lower()
     weights_cfg = training_cfg.get("multi_target_loss_weights", {})
+
+    # Column/profile coherence (cross-variable structural term). Active only
+    # for a flow-refine wrapper in training mode; see end of the lead loop.
+    aux_cfg = training_cfg.get("flow_aux_loss", {})
+    aux_enabled = bool(aux_cfg.get("enabled", True))
+    coherence_weight = (
+        float(aux_cfg.get("coherence_weight", 0.0)) if aux_enabled else 0.0
+    )
+    coherence_col_var = str(aux_cfg.get("coherence_column_var", "") or "")
+    coherence_prof_var = str(aux_cfg.get("coherence_profile_var", "") or "")
 
     batch = build_aurora_batch(ds, sample_list, config, resolved_specs=resolved_specs)
     batch = batch.to(device)
@@ -1391,6 +1459,11 @@ def compute_supervised_loss(
         pred = preds_by_lead[lead]
         target_map = targets[lead]
 
+        # Per-lead cache of normalised (pred, target) tensors keyed by aurora
+        # name, used to compute the cross-variable column/profile coherence
+        # term after all per-variable losses for this lead are accumulated.
+        coh_cache: dict[str, dict[str, Any]] = {}
+
         for target_spec in resolved_specs.targets:
             aurora_name = target_spec.aurora_name
             if aurora_name not in target_map:
@@ -1402,6 +1475,10 @@ def compute_supervised_loss(
                 pred_tensor = pred.atmos_vars[aurora_name][:, 0]
 
             target_tensor = target_map[aurora_name].to(device=device, dtype=pred_tensor.dtype)
+
+            # Pressure levels aligned to ``pred_tensor``'s level axis (used by
+            # the column/profile coherence term). ``None`` for surface vars.
+            var_levels: list[float] | None = None
 
             # Optionally restrict atmospheric loss to a subset of pressure
             # levels (e.g. drop levels where Aurora's internal scale is
@@ -1420,6 +1497,15 @@ def compute_supervised_loss(
                     target_tensor = target_tensor.index_select(
                         1, idx_tensor.to(target_tensor.device)
                     )
+                var_levels = wanted
+            elif target_spec.kind == "atmos":
+                var_levels = [
+                    float(lv)
+                    for lv in config.get("data", {}).get(
+                        "atmos_levels",
+                        config.get("data", {}).get("pressure_levels", []),
+                    )
+                ]
 
             # Upcast to fp32 for numerically stable loss computation.
             # bf16 gradients through 1/std (up to ~1e10) cause overflow.
@@ -1434,6 +1520,9 @@ def compute_supervised_loss(
                 _mean = _ns["mean"].to(device=device, dtype=torch.float32)
                 _std = _ns["std"].to(device=device, dtype=torch.float32)
                 if target_spec.kind == "atmos" and _mean.numel() > 1:
+                    # norm_stats are computed for loss_levels only (when
+                    # specified), so they already align with pred_tensor after
+                    # the loss_levels index_select above.
                     # Reshape (n_levels,) → (1, n_levels, 1, 1) for broadcasting.
                     _mean = _mean.view(1, -1, 1, 1)
                     _std = _std.view(1, -1, 1, 1)
@@ -1469,6 +1558,15 @@ def compute_supervised_loss(
                     var_name=aurora_name,
                     kind=target_spec.kind,
                 )
+                # Cache normalised tensors for the coherence term (computed
+                # once per lead after this inner loop).
+                if coherence_weight > 0.0:
+                    coh_cache[aurora_name] = {
+                        "pred": pred_tensor,
+                        "target": target_tensor,
+                        "kind": target_spec.kind,
+                        "levels": var_levels,
+                    }
             else:
                 elementwise = _loss_tensor(pred_tensor, target_tensor, loss_name=loss_name)
                 masked = _apply_loss_mask(
@@ -1506,6 +1604,26 @@ def compute_supervised_loss(
                         "weight": weight,
                     })
             # ---- end diagnostic ----
+
+        # ---- Column / profile coherence (cross-variable, per lead) ----
+        if coherence_weight > 0.0 and len(coh_cache) >= 2:
+            col_name, prof_name = _resolve_coherence_pair(
+                coh_cache, coherence_col_var, coherence_prof_var,
+            )
+            if col_name is not None and prof_name is not None:
+                col = coh_cache[col_name]
+                prof = coh_cache[prof_name]
+                coh = base_for_fm.coherence_loss(
+                    profile_pred_norm=prof["pred"],
+                    profile_tgt_norm=prof["target"],
+                    column_pred_norm=col["pred"],
+                    column_tgt_norm=col["target"],
+                    level_pressures=prof["levels"] or [],
+                    profile_var=prof_name,
+                    column_var=col_name,
+                )
+                total_loss = total_loss + coherence_weight * coh
+                total_weight += coherence_weight
 
     if total_weight <= 0:
         raise ValueError("Total loss weight evaluated to <= 0. Check multi_target_loss_weights.")
@@ -1586,6 +1704,19 @@ def maybe_wrap_flow_refine(
     time_dim = int(model_cfg.get("flow_refine_time_dim", 128))
     sampling_steps = int(model_cfg.get("flow_refine_sampling_steps", 8))
 
+    # Build per-variable loss_levels → level-index mapping so the wrapper
+    # only applies bias correction to the configured levels at inference.
+    data_cfg = config.get("data", {})
+    full_levels = [
+        float(lv)
+        for lv in data_cfg.get("atmos_levels", data_cfg.get("pressure_levels", []))
+    ]
+    atmos_loss_levels: dict[str, list[int]] = {}
+    for spec in resolved_specs.targets:
+        if spec.kind == "atmos" and spec.loss_levels is not None:
+            idx = [full_levels.index(float(lv)) for lv in spec.loss_levels]
+            atmos_loss_levels[spec.aurora_name] = idx
+
     wrapper = AuroraFlowRefine(
         base=model,
         target_surf_vars=target_surf,
@@ -1593,7 +1724,14 @@ def maybe_wrap_flow_refine(
         hidden=hidden,
         time_dim=time_dim,
         sampling_steps=sampling_steps,
+        atmos_loss_levels=atmos_loss_levels if atmos_loss_levels else None,
     )
+
+    # Structural auxiliary-loss weights (extreme-event, spatial-pattern,
+    # distributional, vertical-profile, column/profile coherence). Read from
+    # the training.flow_aux_loss block; absent → all zero → pure residual MSE.
+    aux_cfg = config.get("training", {}).get("flow_aux_loss", {})
+    wrapper.set_aux_loss_config(aux_cfg)
     return wrapper
 
 
@@ -1958,6 +2096,17 @@ def save_checkpoint(
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
+    # Persist flow-refine sampling_steps so inference uses the same phase
+    # (1-step deterministic vs multi-step stochastic) that training settled on.
+    _inner = model.module if hasattr(model, "module") else model
+    flow_sampling_steps: int | None = None
+    try:
+        from finetune.flow_refine import AuroraFlowRefine as _AFR  # noqa: PLC0415
+        if isinstance(_inner, _AFR):
+            flow_sampling_steps = int(_inner.sampling_steps)
+    except Exception:
+        pass
+
     payload = {
         "epoch": int(epoch),
         "global_step": int(global_step),
@@ -1967,6 +2116,8 @@ def save_checkpoint(
         "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
         "config": config,
     }
+    if flow_sampling_steps is not None:
+        payload["flow_sampling_steps"] = flow_sampling_steps
     if norm_stats is not None:
         payload["norm_stats"] = {
             k: {kk: vv.detach().cpu().clone() for kk, vv in v.items()}

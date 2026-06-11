@@ -7,7 +7,7 @@ paths:
   output_dir: ./outputs
   checkpoint_dir: ./outputs/checkpoints
   pretrained_checkpoint: ""  # Optional local checkpoint path. Empty uses model default HF checkpoint.
-  static_data_path: /mnt/data3/cams/aurora-0.4-air-pollution-static.pickle  # Pickle with lsm, z, slt (from HuggingFace)
+  static_data_path: /data/cams/aurora-0.4-air-pollution-static.pickle  # Pickle with lsm, z, slt (from HuggingFace)
   optional_resume_checkpoint: ""
 
 # Sub-folder under output_dir / checkpoint_dir for this experiment.
@@ -256,6 +256,36 @@ training:
   # and bf16 autocast. Switch to "mae" only for late-stage rollout fine-tune.
   loss_function: mse
   multi_target_loss_weights: {}
+
+  # ---------------------------------------------------------------------
+  # Structural auxiliary losses for the flow-matching refine head.
+  #
+  # The base flow loss is a per-pixel / per-level residual MSE, which has no
+  # notion of spatial pattern, extremes, distribution, vertical shape, or the
+  # column<->profile relationship. These weighted terms (computed on the head's
+  # clean residual estimate refined = y_hat + r_hat vs the target) add those
+  # objectives. Toggle the whole feature with `enabled`; set any weight to 0 to
+  # disable an individual term.
+  flow_aux_loss:
+    enabled: false              # master on/off switch (single line)
+    # Extreme-event performance: tail-cell weighting + spatial peak match.
+    extreme_weight: 0.5
+    extreme_quantile: 0.95
+    extreme_intensity: 4.0
+    peak_weight: 0.25
+    # Spatial-pattern agreement: gradient-field MSE + anomaly correlation.
+    spatial_grad_weight: 0.5
+    spatial_acc_weight: 0.25
+    # Distributional errors: spatial-std match + sorted-value Wasserstein.
+    dist_var_weight: 0.25
+    dist_wasserstein_weight: 0.25
+    # Vertical-profile consistency (atmospheric no2): level-difference MSE.
+    vertical_weight: 0.5
+    # Column/profile coherence: tie tcno2 (column) to the pressure-weighted
+    # vertical integral of no2 (profile). Empty var names => auto-detect.
+    coherence_weight: 0.25
+    coherence_column_var: tcno2
+    coherence_profile_var: no2
 
 rollout:
   run_rollout_after_training: true
