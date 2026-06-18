@@ -73,6 +73,7 @@ import math
 from typing import Any, Mapping, Sequence
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -108,6 +109,12 @@ DEFAULT_AUX_LOSS_CONFIG: dict = {
     # Distributional errors: variance matching + sorted-value Wasserstein.
     "dist_var_weight": 0.0,
     "dist_wasserstein_weight": 0.0,
+    # First-moment / conservation: match the per-sample spatial mean. The
+    # ACC term removes the mean and the variance/Wasserstein terms are weak
+    # at a single deterministic sampling step, so none of the other terms
+    # constrains the field's *mean*. This term directly penalises a
+    # systematic domain-wide offset (e.g. the column-O3 low bias).
+    "bias_weight": 0.0,
     # Vertical-profile consistency (atmospheric vars only): level-to-level
     # finite-difference MSE.
     "vertical_weight": 0.0,
@@ -198,6 +205,20 @@ def _variance_match_loss(refined: torch.Tensor, target: torch.Tensor) -> torch.T
     return F.mse_loss(sr, st).to(refined.dtype)
 
 
+def _mean_bias_loss(refined: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Match the per-sample spatial mean (first moment / conservation).
+
+    Penalises a domain-wide systematic offset between the refined field and
+    the target. Unlike the ACC term (which subtracts the spatial mean) and
+    the variance/Wasserstein terms (which constrain spread/shape), this term
+    is the only one that pins the absolute level of the field, so it directly
+    counters a global bias such as the column-O3 low bias.
+    """
+    mr = refined.reshape(refined.shape[0], -1).float().mean(dim=1)
+    mt = target.reshape(target.shape[0], -1).float().mean(dim=1)
+    return F.mse_loss(mr, mt).to(refined.dtype)
+
+
 def _sorted_wasserstein_loss(refined: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     """Squared 1-D Wasserstein-2 distance via sorted values, per sample.
 
@@ -246,6 +267,17 @@ def _pressure_thickness_weights(
     weights[order] = thick_sorted
     weights = weights / weights.sum().clamp_min(1e-12)
     return weights.to(device=device, dtype=dtype)
+
+
+def _doy_fraction_embed(doy: torch.Tensor) -> torch.Tensor:
+    """Seasonal embedding from a fractional day-of-year in [0, 1).
+
+    Returns a (N, 2) [sin, cos] encoding of the annual cycle, so the head can
+    condition its residual on season (ozone has a strong seasonal cycle that a
+    single shared head would otherwise average over).
+    """
+    ang = 2.0 * math.pi * doy.float().reshape(-1, 1)
+    return torch.cat([torch.sin(ang), torch.cos(ang)], dim=-1)
 
 
 def _sinusoidal_time_embed(t: torch.Tensor, dim: int) -> torch.Tensor:
@@ -349,14 +381,27 @@ class ResidualFlowUNet(nn.Module):
     only learns *how the residual deviates from zero given ŷ*.
     """
 
-    def __init__(self, hidden: int = 64, time_dim: int = 128) -> None:
+    def __init__(self, hidden: int = 64, time_dim: int = 128, doy_cond: bool = False) -> None:
         super().__init__()
         self.time_dim = time_dim
+        self.doy_cond = bool(doy_cond)
         self.time_mlp = nn.Sequential(
             nn.Linear(time_dim, time_dim),
             nn.SiLU(),
             nn.Linear(time_dim, time_dim),
         )
+        # Optional seasonal (day-of-year) conditioning. Maps a [sin, cos]
+        # annual-cycle encoding into the time-embedding space and is added to
+        # the flow-time embedding before FiLM. The final layer is zero-init so
+        # it contributes nothing at construction (identity-at-init preserved).
+        if self.doy_cond:
+            self.doy_mlp = nn.Sequential(
+                nn.Linear(2, time_dim),
+                nn.SiLU(),
+                nn.Linear(time_dim, time_dim),
+            )
+            nn.init.zeros_(self.doy_mlp[-1].weight)
+            nn.init.zeros_(self.doy_mlp[-1].bias)
         # 3-level UNet operating at full / 1/2 / 1/4 resolution.
         self.down1 = _ConvBlock(2, hidden, time_dim)
         self.down2 = _ConvBlock(hidden, hidden * 2, time_dim)
@@ -378,6 +423,7 @@ class ResidualFlowUNet(nn.Module):
         x_t: torch.Tensor,
         t: torch.Tensor,
         cond: torch.Tensor,
+        doy: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Predict the FM velocity field.
 
@@ -385,11 +431,19 @@ class ResidualFlowUNet(nn.Module):
           x_t:  (N, 1, H, W)  — interpolated noisy residual.
           t:    (N,)          — flow time in [0, 1].
           cond: (N, 1, H, W)  — Aurora's normalised prediction.
+          doy:  (N,) or None  — fractional day-of-year in [0, 1) for seasonal
+                conditioning (used only when the head was built with
+                ``doy_cond=True``).
 
         Returns:
           (N, 1, H, W) velocity prediction.
         """
         t_emb = self.time_mlp(_sinusoidal_time_embed(t, self.time_dim))
+        if self.doy_cond and doy is not None:
+            doy_embed = _doy_fraction_embed(doy).to(
+                device=t_emb.device, dtype=t_emb.dtype
+            )
+            t_emb = t_emb + self.doy_mlp(doy_embed)
 
         h0 = torch.cat([cond, x_t], dim=1)
         d1 = self.down1(h0, t_emb)
@@ -408,6 +462,16 @@ class ResidualFlowUNet(nn.Module):
 # ---------------------------------------------------------------------------
 # Wrapper
 # ---------------------------------------------------------------------------
+
+
+def _sanitize_buffer_name(name: str) -> str:
+    """Map a variable name to a valid ``register_buffer`` key.
+
+    Buffer names must not contain ``"."``; we replace any non-alphanumeric
+    character with ``"_"`` so names like ``"10u"`` or ``"specific_humidity"``
+    register cleanly.
+    """
+    return "".join(c if c.isalnum() else "_" for c in name)
 
 
 class AuroraFlowRefine(nn.Module):
@@ -442,6 +506,15 @@ class AuroraFlowRefine(nn.Module):
         sampling_steps: int = 8,
         sigma_min: float = 1e-3,
         atmos_loss_levels: Mapping[str, Sequence[int]] | None = None,
+        doy_cond: bool = False,
+        residual_zscore: bool = False,
+        res_std_momentum: float = 0.99,
+        temporal_enabled: bool = False,
+        temporal_channels: int = 16,
+        temporal_state: int = 8,
+        temporal_layers: int = 2,
+        temporal_conv: int = 3,
+        temporal_expand: int = 2,
     ) -> None:
         super().__init__()
         self.base = base
@@ -450,6 +523,18 @@ class AuroraFlowRefine(nn.Module):
         self.hidden = hidden
         self.sampling_steps = int(sampling_steps)
         self.sigma_min = float(sigma_min)
+        self.doy_cond = bool(doy_cond)
+
+        # Flow-matching z-score: standardise the FM *target* residual by a
+        # per-variable running std σ_r so the flow's two endpoints (unit-variance
+        # noise x₀ and the target) are scale-matched. Because Aurora's residual
+        # r = target − pred has std ≪ 1 in climatology-normalised space, the
+        # default unit-variance noise dominates x_t and the informative signal
+        # lives in a thin shell; standardising restores a meaningful SNR across
+        # all t and balances the cross-variable loss weighting. Default off →
+        # behaviour is identical to the plain residual-MSE flow loss.
+        self.residual_zscore = bool(residual_zscore)
+        self.res_std_momentum = float(res_std_momentum)
 
         # Per-variable mapping from atmos var name → list of level indices
         # (into the full L-dim) that should receive bias correction. Levels
@@ -467,16 +552,51 @@ class AuroraFlowRefine(nn.Module):
         self.aux_loss_cfg = dict(DEFAULT_AUX_LOSS_CONFIG)
 
         self.surf_flow = nn.ModuleDict(
-            {n: ResidualFlowUNet(hidden, time_dim) for n in target_surf_vars}
+            {n: ResidualFlowUNet(hidden, time_dim, doy_cond=self.doy_cond) for n in target_surf_vars}
         )
         self.atmos_flow = nn.ModuleDict(
-            {n: ResidualFlowUNet(hidden, time_dim) for n in target_atmos_vars}
+            {n: ResidualFlowUNet(hidden, time_dim, doy_cond=self.doy_cond) for n in target_atmos_vars}
         )
+
+        # Per-variable running residual-std buffers used by the FM z-score
+        # (see ``residual_zscore``). Registered as buffers so they are saved in
+        # the checkpoint, moved with ``.to(device)`` and (best-effort) synced by
+        # DDP. Initialised to 0.0 = "uninitialised": the first training update
+        # seeds the buffer directly with the batch std, thereafter it tracks an
+        # EMA. A value ≤ 0 at eval time falls back to σ_r = 1 (identity).
+        self._res_std_keys: dict[tuple[str, str], str] = {}
+        for kind, names in (("surf", self.target_surf_vars), ("atmos", self.target_atmos_vars)):
+            for n in names:
+                bufname = f"_res_std__{kind}__{_sanitize_buffer_name(n)}"
+                self.register_buffer(bufname, torch.zeros(()))
+                self._res_std_keys[(kind, n)] = bufname
 
         # Norm stats (physical-space mean/std per variable). For atmos the
         # std/mean are per-level tensors of shape (L,); for surf they're
         # scalars (or 1-tensors).  Set via :meth:`set_norm_stats`.
         self._norm_stats: dict[str, dict[str, torch.Tensor]] = {}
+
+        # --- Mamba temporal module (optional) ------------------------------
+        # Learns how the flow-corrected field (and Aurora's error in it) evolves
+        # across a rollout sequence, correcting the temporally-correlated drift
+        # that a per-step spatial model cannot see. Default off → no new
+        # parameters and behaviour identical to flow-matching-only. The decoder
+        # is zero-init (identity-at-init), so even when enabled the module is a
+        # no-op until trained, keeping existing checkpoints numerically stable.
+        self.temporal_enabled = bool(temporal_enabled)
+        self.temporal: nn.Module | None = None
+        if self.temporal_enabled:
+            from finetune.mamba_temporal import MambaTemporalModule
+
+            self.temporal = MambaTemporalModule(
+                surf_vars=self.target_surf_vars,
+                atmos_vars=self.target_atmos_vars,
+                channels=int(temporal_channels),
+                d_state=int(temporal_state),
+                n_layers=int(temporal_layers),
+                d_conv=int(temporal_conv),
+                expand=int(temporal_expand),
+            )
 
     # --- Delegate Aurora interface -----------------------------------------
 
@@ -542,6 +662,55 @@ class AuroraFlowRefine(nn.Module):
             std = std.view(1, -1, 1, 1)
         return mean, std
 
+    # --- Flow-matching z-score (residual standardisation) ------------------
+
+    def _residual_std(
+        self, kind: str, var_name: str, ref: torch.Tensor,
+    ) -> torch.Tensor:
+        """Per-variable residual std σ_r used to standardise the FM target.
+
+        Returns a scalar tensor (on ``ref``'s device/dtype). When
+        :attr:`residual_zscore` is off, or the variable has no buffer, returns
+        ``1.0`` so the flow operates on the raw residual (legacy behaviour).
+
+        During training the running EMA buffer is updated in-place from the
+        batch residual std (``ref`` is the detached residual ``r``); the first
+        update seeds the buffer directly. During eval the buffer is read
+        read-only, falling back to ``1.0`` if never initialised.
+        """
+        one = torch.ones((), device=ref.device, dtype=ref.dtype)
+        if not self.residual_zscore:
+            return one
+        bufname = self._res_std_keys.get((kind, var_name))
+        if bufname is None:
+            return one
+        buf = getattr(self, bufname)
+
+        if self.training:
+            with torch.no_grad():
+                cur = ref.detach().float().std(unbiased=False).clamp_min(self.sigma_min)
+                # Under DDP each rank sees a different shard, so average the
+                # batch std across ranks before the EMA update. This keeps the
+                # σ_r buffer identical on every rank (strict cross-rank
+                # consistency); without it ranks would drift apart. The reduce
+                # runs on the buffer's device — gloo (CPU) in this project.
+                if dist.is_available() and dist.is_initialized():
+                    world = dist.get_world_size()
+                    if world > 1:
+                        cur = cur.clone()
+                        dist.all_reduce(cur, op=dist.ReduceOp.SUM)
+                        cur = cur / world
+                if float(buf) <= 0.0:
+                    buf.copy_(cur)
+                else:
+                    m = self.res_std_momentum
+                    buf.copy_(m * buf + (1.0 - m) * cur)
+
+        sigma = float(buf)
+        if sigma <= 0.0:
+            return one
+        return buf.to(device=ref.device, dtype=ref.dtype).clamp_min(self.sigma_min)
+
     # --- Flow-matching loss (called by supervised-loss code) ---------------
 
     def flow_loss(
@@ -550,6 +719,7 @@ class AuroraFlowRefine(nn.Module):
         target_norm: torch.Tensor,
         var_name: str,
         kind: str,
+        doy: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Conditional residual regression at a sampled noise level.
 
@@ -602,7 +772,22 @@ class AuroraFlowRefine(nn.Module):
         device = cond.device
         dtype = cond.dtype
 
+        # Per-sample seasonal conditioning. ``doy`` arrives per-batch-element
+        # (length B); for atmos it must be expanded to the (B*L) flattened axis.
+        doy_n: torch.Tensor | None = None
+        if self.doy_cond and doy is not None:
+            doy = doy.to(device=device)
+            if kind == "atmos":
+                doy_n = doy.repeat_interleave(L)
+            else:
+                doy_n = doy
+
         x0 = torch.randn(N, 1, H, W, device=device, dtype=dtype)
+        # FM z-score: standardise the target residual so it is ~unit-variance,
+        # scale-matched to the unit-variance noise x0. σ_r = 1 when the feature
+        # is disabled, recovering the original residual-MSE objective exactly.
+        sigma_r = self._residual_std(kind, var_name, r)
+        r_std = r / sigma_r
         # Log-normal t sampling: concentrates training on informative
         # mid-noise levels (t ≈ 0.3–0.7) rather than near-pure-noise (t ≈ 0,
         # uninformative) or near-clean (t ≈ 1, tiny gradients). This
@@ -612,19 +797,19 @@ class AuroraFlowRefine(nn.Module):
         t = torch.sigmoid(log_t).clamp(self.sigma_min, 1.0 - self.sigma_min)
         t_b = t.view(N, 1, 1, 1).to(dtype)
 
-        x_t = (1.0 - t_b) * x0 + t_b * r
-        r_pred = head(x_t, t, cond)
-        base_loss = F.mse_loss(r_pred, r)
+        x_t = (1.0 - t_b) * x0 + t_b * r_std
+        r_pred = head(x_t, t, cond, doy=doy_n)
+        base_loss = F.mse_loss(r_pred, r_std)
 
         # --- Structural auxiliary losses ------------------------------------
-        # The head's x₁-prediction r_pred is its clean-residual estimate at the
-        # sampled noise level. The corresponding bias-corrected field is
-        #   refined = cond + r_pred,   target = cond + r
-        # so the structural terms below (spatial pattern, extremes,
-        # distribution, vertical shape) penalise the *structured* error
-        # (r_pred − r) rather than only its per-pixel magnitude.
+        # The head's x₁-prediction r_pred is its clean *standardised* residual
+        # estimate; the corresponding bias-corrected field is
+        #   refined = cond + r_pred·σ_r,   target = cond + r
+        # i.e. the structural terms operate in the real normalised-field space
+        # (un-standardised), so they penalise the *structured* error
+        # (r_pred·σ_r − r) rather than only its per-pixel magnitude.
         aux = self._aux_structural_loss(
-            refined_flat=cond + r_pred,
+            refined_flat=cond + r_pred * sigma_r,
             target_flat=cond + r,
             kind=kind,
             group=(B, L) if kind == "atmos" else (B, 1),
@@ -666,6 +851,7 @@ class AuroraFlowRefine(nn.Module):
         w_acc = float(cfg.get("spatial_acc_weight", 0.0))
         w_var = float(cfg.get("dist_var_weight", 0.0))
         w_wass = float(cfg.get("dist_wasserstein_weight", 0.0))
+        w_bias = float(cfg.get("bias_weight", 0.0))
         w_vert = float(cfg.get("vertical_weight", 0.0))
 
         if w_extreme > 0.0:
@@ -684,6 +870,8 @@ class AuroraFlowRefine(nn.Module):
             total = total + w_var * _variance_match_loss(refined_flat, target_flat)
         if w_wass > 0.0:
             total = total + w_wass * _sorted_wasserstein_loss(refined_flat, target_flat)
+        if w_bias > 0.0:
+            total = total + w_bias * _mean_bias_loss(refined_flat, target_flat)
         if w_vert > 0.0 and kind == "atmos":
             B, C = group
             if C > 1:
@@ -722,8 +910,131 @@ class AuroraFlowRefine(nn.Module):
         x_t = torch.zeros(N, 1, H, W, device=cond.device, dtype=cond.dtype)
         t = torch.ones(N, device=cond.device, dtype=torch.float32)
         r_hat = head(x_t, t, cond)
-        refined = (cond + r_hat).reshape(pred_norm.shape)
+        # Un-standardise the predicted residual (σ_r = 1 when z-score is off).
+        sigma_r = self._residual_std(kind, var_name, cond)
+        refined = (cond + r_hat * sigma_r).reshape(pred_norm.shape)
         return refined
+
+    # --- Mamba temporal correction -----------------------------------------
+
+    @property
+    def has_temporal(self) -> bool:
+        """True when the Mamba temporal module is active for this wrapper."""
+        return self.temporal_enabled and self.temporal is not None
+
+    def temporal_residual(
+        self, seq_norm: torch.Tensor, var_name: str, kind: str,
+    ) -> torch.Tensor:
+        """Mamba temporal correction for a normalised flow-corrected sequence.
+
+        Args:
+          seq_norm: ``(B, S, H, W)`` (surf) or ``(B, S, L, H, W)`` (atmos) —
+            a rollout sequence of flow-corrected fields in normalised space.
+          var_name: aurora variable name.
+          kind: ``"surf"`` or ``"atmos"``.
+
+        Returns:
+          Correction tensor, same shape as ``seq_norm``. Zeros when the module
+          is disabled or the variable has no temporal head (so callers can add
+          it unconditionally). The correction is *causal* along ``S``: step
+          ``s`` depends only on steps ``≤ s``.
+        """
+        if not self.has_temporal or seq_norm.shape[1] < 1:
+            return torch.zeros_like(seq_norm)
+        if not self.temporal.has_var(var_name, kind):  # type: ignore[union-attr]
+            return torch.zeros_like(seq_norm)
+        return self.temporal.temporal_residual(seq_norm, var_name, kind)  # type: ignore[union-attr]
+
+    def temporal_correct_causal(
+        self, history_norm: torch.Tensor, var_name: str, kind: str,
+    ) -> torch.Tensor:
+        """Causally corrected *last* frame of a normalised history sequence.
+
+        Used during autoregressive rollout: pass the growing history of
+        flow-corrected normalised frames and receive the temporally-corrected
+        current (last) frame. Because the underlying SSM scan is causal, this
+        equals the online recurrence applied step by step.
+
+        Args:
+          history_norm: ``(B, S, H, W)`` or ``(B, S, L, H, W)`` — flow-corrected
+            frames up to and including the current step (last along ``S``).
+
+        Returns:
+          The corrected current frame, shape ``(B, 1, H, W)`` (surf) or
+          ``(B, 1, L, H, W)`` (atmos), matching a single rollout step.
+        """
+        corr = self.temporal_residual(history_norm, var_name, kind)
+        last_corr = corr[:, -1:]              # keep the time axis (length 1)
+        last_frame = history_norm[:, -1:]
+        return last_frame + last_corr
+
+    def apply_temporal_rollout(
+        self,
+        pred: "Batch",
+        history: dict[tuple[str, str], list[torch.Tensor]],
+    ) -> "Batch":
+        """Apply causal Mamba temporal correction to a rollout prediction.
+
+        Given the model's (already flow-corrected, physical-space) single-step
+        prediction ``pred`` and a mutable ``history`` of per-variable
+        flow-corrected *normalised* frames, this:
+
+          1. normalises each refined target frame into the same space the
+             temporal module was trained in (mirroring the flow head's
+             level-subset handling for atmospheric variables),
+          2. appends it to that variable's history,
+          3. runs the causal temporal correction over the accumulated history,
+          4. de-normalises the corrected current frame back to physical units
+             and writes it into a new :class:`Batch`.
+
+        Only the wrapper's target variables (the keys of ``surf_flow`` /
+        ``atmos_flow``) are touched; all other fields pass through unchanged.
+        Returns ``pred`` unchanged when the temporal module is disabled.
+        """
+        if not self.has_temporal:
+            return pred
+
+        new_surf = dict(pred.surf_vars)
+        for name in self.surf_flow:
+            if name not in pred.surf_vars:
+                continue
+            frame = pred.surf_vars[name]                 # (B, 1, H, W)
+            mean, std = self._norm_for(name, frame, kind="surf")
+            norm = (frame[:, 0] - mean) / std            # (B, H, W)
+            hist = history.setdefault(("surf", name), [])
+            hist.append(norm)
+            seq = torch.stack(hist, dim=1)               # (B, S, H, W)
+            corrected = self.temporal_correct_causal(seq, name, "surf")  # (B,1,H,W)
+            new_surf[name] = corrected * std + mean
+
+        new_atmos = dict(pred.atmos_vars)
+        for name in self.atmos_flow:
+            if name not in pred.atmos_vars:
+                continue
+            frame = pred.atmos_vars[name]                # (B, 1, L, H, W)
+            full = frame[:, 0]                           # (B, L, H, W)
+            level_idx = self._atmos_loss_level_indices.get(name)
+            if level_idx is not None and len(level_idx) < full.shape[1]:
+                idx_t = torch.tensor(level_idx, dtype=torch.long, device=full.device)
+                sub = full.index_select(1, idx_t)        # (B, Lsub, H, W)
+            else:
+                idx_t = None
+                sub = full
+            mean, std = self._norm_for(name, sub, kind="atmos")
+            norm = (sub - mean) / std                    # (B, Lsub, H, W)
+            hist = history.setdefault(("atmos", name), [])
+            hist.append(norm)
+            seq = torch.stack(hist, dim=1)               # (B, S, Lsub, H, W)
+            corrected = self.temporal_correct_causal(seq, name, "atmos")  # (B,1,Lsub,H,W)
+            corrected_phys = corrected[:, 0] * std + mean  # (B, Lsub, H, W)
+            if idx_t is not None:
+                out = full.clone()
+                out[:, level_idx] = corrected_phys
+            else:
+                out = corrected_phys
+            new_atmos[name] = out.unsqueeze(1)           # (B, 1, L, H, W)
+
+        return dataclasses.replace(pred, surf_vars=new_surf, atmos_vars=new_atmos)
 
     def coherence_loss(
         self,
@@ -772,6 +1083,7 @@ class AuroraFlowRefine(nn.Module):
         self,
         cond_norm: torch.Tensor,
         head: ResidualFlowUNet,
+        doy: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Iterative refinement of the residual prediction.
 
@@ -802,7 +1114,7 @@ class AuroraFlowRefine(nn.Module):
             # x_t = 0, t = 1 → head predicts residual from conditioning alone.
             x_t = torch.zeros(N, 1, H, W, device=device, dtype=dtype)
             t = torch.ones(N, device=device, dtype=torch.float32)
-            return head(x_t, t, cond_norm)
+            return head(x_t, t, cond_norm, doy=doy)
 
         # Multi-step DDIM-style Euler ODE from t=0 (pure noise) toward t=1
         # (clean residual) using the x₁-prediction parameterisation.
@@ -823,7 +1135,7 @@ class AuroraFlowRefine(nn.Module):
             t_curr = float(t_schedule[i].item())
             t_next = float(t_schedule[i + 1].item())
             t = torch.full((N,), t_curr, device=device, dtype=torch.float32)
-            r_hat = head(x, t, cond_norm)
+            r_hat = head(x, t, cond_norm, doy=doy)
             if t_curr > 0.0:
                 # Estimate x₀ from x_t and r̂, then interpolate to t_next.
                 x0_est = (x - t_curr * r_hat) / (1.0 - t_curr)
@@ -847,6 +1159,10 @@ class AuroraFlowRefine(nn.Module):
 
         # Eval / inference: integrate the FM ODE and add the sampled
         # residual to Aurora's prediction in physical space.
+        # Per-batch-element seasonal phase (fractional day-of-year), derived
+        # from the prediction's valid-time metadata. ``None`` disables it.
+        base_doy = self._doy_from_metadata(pred) if self.doy_cond else None
+
         new_surf: dict[str, torch.Tensor] = dict(pred.surf_vars)
         for name, head in self.surf_flow.items():
             if name not in pred.surf_vars:
@@ -864,8 +1180,10 @@ class AuroraFlowRefine(nn.Module):
                 T = 1
             mean, std = self._norm_for(name, flat, kind="surf")
             cond = ((flat - mean) / std).unsqueeze(1)  # (N, 1, H, W)
-            r = self._sample_residual(cond, head).squeeze(1)
-            refined = flat + r * std  # de-normalise residual
+            doy_n = base_doy.repeat_interleave(T) if base_doy is not None else None
+            r = self._sample_residual(cond, head, doy=doy_n).squeeze(1)
+            sigma_r = self._residual_std("surf", name, flat)
+            refined = flat + r * sigma_r * std  # un-standardise + de-normalise
             new_surf[name] = refined.reshape(orig_shape)
 
         new_atmos: dict[str, torch.Tensor] = dict(pred.atmos_vars)
@@ -881,6 +1199,7 @@ class AuroraFlowRefine(nn.Module):
                 B, L, H, W = tensor.shape
                 T = 1
                 flat = tensor
+            doy_bt = base_doy.repeat_interleave(T) if base_doy is not None else None
 
             # Only refine loss_levels (if specified); other levels pass through.
             level_idx = self._atmos_loss_level_indices.get(name)
@@ -891,8 +1210,10 @@ class AuroraFlowRefine(nn.Module):
                 cond_norm = (flat_subset - mean) / std
                 N, Lsub = cond_norm.shape[0], cond_norm.shape[1]
                 cond_in = cond_norm.reshape(N * Lsub, 1, H, W)
-                r = self._sample_residual(cond_in, head).reshape(N, Lsub, H, W)
-                refined_subset = flat_subset + r * std
+                doy_in = doy_bt.repeat_interleave(Lsub) if doy_bt is not None else None
+                r = self._sample_residual(cond_in, head, doy=doy_in).reshape(N, Lsub, H, W)
+                sigma_r = self._residual_std("atmos", name, flat_subset)
+                refined_subset = flat_subset + r * sigma_r * std
                 # Scatter refined levels back; unrefined levels stay as-is.
                 result = flat.clone()
                 result[:, level_idx] = refined_subset
@@ -902,11 +1223,32 @@ class AuroraFlowRefine(nn.Module):
                 cond_norm = (flat - mean) / std  # (N, L, H, W)
                 N = cond_norm.shape[0]
                 cond_in = cond_norm.reshape(N * L, 1, H, W)
-                r = self._sample_residual(cond_in, head).reshape(N, L, H, W)
-                refined = flat + r * std
+                doy_in = doy_bt.repeat_interleave(L) if doy_bt is not None else None
+                r = self._sample_residual(cond_in, head, doy=doy_in).reshape(N, L, H, W)
+                sigma_r = self._residual_std("atmos", name, flat)
+                refined = flat + r * sigma_r * std
                 new_atmos[name] = refined.reshape(orig_shape)
 
         return dataclasses.replace(pred, surf_vars=new_surf, atmos_vars=new_atmos)
+
+    @staticmethod
+    def _doy_from_metadata(pred: Batch) -> torch.Tensor | None:
+        """Fractional day-of-year per batch element from ``pred.metadata.time``.
+
+        Returns a (B,) float tensor in [0, 1), or ``None`` when the valid-time
+        metadata is unavailable (so seasonal conditioning is silently skipped).
+        """
+        times = getattr(getattr(pred, "metadata", None), "time", None)
+        if not times:
+            return None
+        fracs: list[float] = []
+        for tm in times:
+            try:
+                doy = tm.timetuple().tm_yday  # 1..366
+                fracs.append(((doy - 1) % 366) / 366.0)
+            except Exception:
+                return None
+        return torch.tensor(fracs, dtype=torch.float32)
 
     # --- Convenience --------------------------------------------------------
 
@@ -915,9 +1257,18 @@ class AuroraFlowRefine(nn.Module):
             p.requires_grad = False
 
     def refine_parameter_count(self) -> int:
-        return sum(
+        n = sum(
             p.numel()
             for heads in (self.surf_flow, self.atmos_flow)
             for head in heads.values()
             for p in head.parameters()
         )
+        if self.temporal is not None:
+            n += sum(p.numel() for p in self.temporal.parameters())
+        return n
+
+    def temporal_parameter_count(self) -> int:
+        """Number of trainable parameters in the Mamba temporal module."""
+        if self.temporal is None:
+            return 0
+        return sum(p.numel() for p in self.temporal.parameters())

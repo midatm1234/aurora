@@ -6,6 +6,7 @@ import contextlib
 import csv
 import dataclasses
 import json
+import logging
 import math
 import pickle
 import random
@@ -25,6 +26,9 @@ try:
     import yaml
 except ImportError:  # pragma: no cover - dependency check is runtime-facing.
     yaml = None
+
+
+logger = logging.getLogger("aurora.finetune")
 
 
 __all__ = [
@@ -1366,6 +1370,10 @@ def compute_supervised_loss(
     coherence_col_var = str(aux_cfg.get("coherence_column_var", "") or "")
     coherence_prof_var = str(aux_cfg.get("coherence_profile_var", "") or "")
 
+    # Mamba temporal loss weight. Active only when the flow-refine wrapper has
+    # the temporal module enabled (see end of this function). 0 → disabled.
+    temporal_weight = float(training_cfg.get("mamba_temporal_weight", 1.0))
+
     batch = build_aurora_batch(ds, sample_list, config, resolved_specs=resolved_specs)
     batch = batch.to(device)
 
@@ -1397,6 +1405,10 @@ def compute_supervised_loss(
 
     preds_by_lead: dict[int, Batch] = {}
     current_batch = batch
+    # Per-variable normalised sequences (ordered by lead) for the Mamba
+    # temporal loss. Populated inside the lead loop only when a flow-refine
+    # wrapper with the temporal module enabled is in training mode.
+    temporal_seq: dict[str, dict[str, Any]] = {}
     with _autocast_context(device=device, mixed_precision=mixed_precision):
         for lead in range(1, max_lead + 1):
             pred = model(current_batch)
@@ -1552,11 +1564,17 @@ def compute_supervised_loss(
                 and base_for_fm.training
             )
             if use_flow_loss:
+                flow_doy = None
+                if getattr(base_for_fm, "doy_cond", False):
+                    flow_doy = _AFR._doy_from_metadata(pred)
+                    if flow_doy is not None:
+                        flow_doy = flow_doy.to(device)
                 masked = base_for_fm.flow_loss(
                     pred_norm=pred_tensor,
                     target_norm=target_tensor,
                     var_name=aurora_name,
                     kind=target_spec.kind,
+                    doy=flow_doy,
                 )
                 # Cache normalised tensors for the coherence term (computed
                 # once per lead after this inner loop).
@@ -1567,6 +1585,16 @@ def compute_supervised_loss(
                         "kind": target_spec.kind,
                         "levels": var_levels,
                     }
+                # Collect the per-lead normalised (base) prediction and target
+                # so the Mamba temporal module can be trained on the ordered
+                # rollout sequence after the lead loop.
+                if temporal_weight > 0.0 and getattr(base_for_fm, "has_temporal", False):
+                    slot = temporal_seq.setdefault(
+                        aurora_name,
+                        {"kind": target_spec.kind, "preds": [], "targets": []},
+                    )
+                    slot["preds"].append(pred_tensor)
+                    slot["targets"].append(target_tensor)
             else:
                 elementwise = _loss_tensor(pred_tensor, target_tensor, loss_name=loss_name)
                 masked = _apply_loss_mask(
@@ -1625,6 +1653,37 @@ def compute_supervised_loss(
                 total_loss = total_loss + coherence_weight * coh
                 total_weight += coherence_weight
 
+    # ---- Mamba temporal loss (sequential, cross-lead) ----
+    # Trains the temporal module on the ordered rollout sequence so it learns
+    # how the flow-corrected field and Aurora's residual evolve through time,
+    # rather than treating each lead independently. The flow-corrected frames
+    # are detached, so this term updates *only* the Mamba parameters and leaves
+    # the trained flow head / backbone untouched.
+    temporal_metrics: dict[str, float] = {}
+    if temporal_weight > 0.0 and temporal_seq:
+        base_for_fm = model.module if hasattr(model, "module") else model
+        if getattr(base_for_fm, "has_temporal", False):
+            for aurora_name, slot in temporal_seq.items():
+                preds = slot["preds"]
+                tgts = slot["targets"]
+                kind = slot["kind"]
+                if len(preds) < 2:
+                    # A temporal model needs at least two ordered steps.
+                    continue
+                with torch.no_grad():
+                    flow_frames = [
+                        base_for_fm.refine_norm_deterministic(p, aurora_name, kind).detach()
+                        for p in preds
+                    ]
+                seq = torch.stack(flow_frames, dim=1)             # (B,S,[L,]H,W)
+                tgt_seq = torch.stack([t.detach() for t in tgts], dim=1)
+                corr = base_for_fm.temporal_residual(seq, aurora_name, kind)
+                temporal_pred = seq + corr
+                t_loss = torch.nn.functional.mse_loss(temporal_pred, tgt_seq)
+                total_loss = total_loss + temporal_weight * t_loss
+                total_weight += temporal_weight
+                temporal_metrics[f"temporal_loss/{aurora_name}"] = float(t_loss.detach())
+
     if total_weight <= 0:
         raise ValueError("Total loss weight evaluated to <= 0. Check multi_target_loss_weights.")
 
@@ -1635,6 +1694,8 @@ def compute_supervised_loss(
         "lead_times": lead_times,
         "spatial_shape": batch.spatial_shape,
     }
+    if temporal_metrics:
+        metrics["temporal"] = temporal_metrics
     return total_loss, metrics
 
 
@@ -1703,6 +1764,17 @@ def maybe_wrap_flow_refine(
     hidden = int(model_cfg.get("flow_refine_hidden", 64))
     time_dim = int(model_cfg.get("flow_refine_time_dim", 128))
     sampling_steps = int(model_cfg.get("flow_refine_sampling_steps", 8))
+    doy_cond = bool(model_cfg.get("flow_refine_doy_cond", False))
+    residual_zscore = bool(model_cfg.get("flow_refine_residual_zscore", False))
+    res_std_momentum = float(model_cfg.get("flow_refine_res_std_momentum", 0.99))
+
+    # Mamba temporal module (optional; default off → backward compatible).
+    temporal_enabled = bool(model_cfg.get("mamba_temporal_enabled", False))
+    temporal_channels = int(model_cfg.get("mamba_temporal_channels", 16))
+    temporal_state = int(model_cfg.get("mamba_temporal_state", 8))
+    temporal_layers = int(model_cfg.get("mamba_temporal_layers", 2))
+    temporal_conv = int(model_cfg.get("mamba_temporal_conv", 3))
+    temporal_expand = int(model_cfg.get("mamba_temporal_expand", 2))
 
     # Build per-variable loss_levels → level-index mapping so the wrapper
     # only applies bias correction to the configured levels at inference.
@@ -1725,6 +1797,15 @@ def maybe_wrap_flow_refine(
         time_dim=time_dim,
         sampling_steps=sampling_steps,
         atmos_loss_levels=atmos_loss_levels if atmos_loss_levels else None,
+        doy_cond=doy_cond,
+        residual_zscore=residual_zscore,
+        res_std_momentum=res_std_momentum,
+        temporal_enabled=temporal_enabled,
+        temporal_channels=temporal_channels,
+        temporal_state=temporal_state,
+        temporal_layers=temporal_layers,
+        temporal_conv=temporal_conv,
+        temporal_expand=temporal_expand,
     )
 
     # Structural auxiliary-loss weights (extreme-event, spatial-pattern,
@@ -1811,6 +1892,10 @@ def configure_trainable_parameters(
             param.requires_grad = True
         for param in model.atmos_flow.parameters():
             param.requires_grad = True
+        # Mamba temporal module (when enabled) is always trainable.
+        if getattr(model, "temporal", None) is not None:
+            for param in model.temporal.parameters():
+                param.requires_grad = True
 
     total = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -1981,6 +2066,35 @@ def run_rollout(
     device = torch.device(device)
     model.eval()
 
+    # Target variables that are bias-corrected. These must be advanced by the
+    # MODEL's prediction during rollout and must NEVER be overwritten with
+    # future CAMS truth (that would leak the answer). Everything else is
+    # context/exogenous and is refreshed from CAMS when available.
+    target_var_names = {spec.aurora_name for spec in resolved_specs.targets}
+
+    # Safeguard: the feedback set (model-advanced vars) must contain every
+    # bias-corrected target, otherwise a target would be pulled from CAMS.
+    missing_fb = target_var_names - feedback_fields
+    assert not missing_fb, (
+        "Rollout misconfiguration: bias-corrected target variable(s) "
+        f"{sorted(missing_fb)} are not in the feedback set {sorted(feedback_fields)}; "
+        "they would be overwritten by CAMS truth during rollout."
+    )
+
+    # Optional Mamba temporal correction during rollout.
+    base_for_fm = model.module if hasattr(model, "module") else model
+    try:
+        from finetune.flow_refine import AuroraFlowRefine as _AFR
+    except Exception:
+        _AFR = None
+    temporal_active = (
+        _AFR is not None
+        and isinstance(base_for_fm, _AFR)
+        and getattr(base_for_fm, "has_temporal", False)
+    )
+    temporal_history: dict[tuple[str, str], list[torch.Tensor]] = {}
+    verbose_provenance = bool(rollout_cfg.get("verbose_provenance", True))
+
     current = build_aurora_batch(
         ds,
         start_sample,
@@ -1996,6 +2110,11 @@ def run_rollout(
     with torch.inference_mode():
         for step in range(1, steps + 1):
             pred = model(current)
+
+            # Mamba temporal correction (causal): refine the flow-corrected
+            # target fields using their evolution across the rollout so far.
+            if temporal_active:
+                pred = base_for_fm.apply_temporal_rollout(pred, temporal_history)
             predictions.append(pred.to("cpu"))
 
             if not autoregressive:
@@ -2018,6 +2137,11 @@ def run_rollout(
 
             next_time_index = anchor_idx + step
 
+            # Provenance tracking (items: verify CAMS vs model per variable).
+            prov_model: list[str] = []   # advanced by model prediction
+            prov_cams: list[str] = []    # refreshed from CAMS dataset
+            prov_carry: list[str] = []   # carried forward (last step repeated)
+
             surf_next: dict[str, torch.Tensor] = {}
             for name, old in current.surf_vars.items():
                 use_prediction = (feedback_fields is None and name in pred.surf_vars) or (
@@ -2025,6 +2149,7 @@ def run_rollout(
                 )
                 if use_prediction:
                     new_frame = pred.surf_vars[name]
+                    prov_model.append(name)
                 elif refresh_exogenous and next_time_index < ds.sizes[_dim_names(config)[0]]:
                     predictor_spec = predictor_by_aurora.get(name)
                     if predictor_spec is not None and predictor_spec.kind == "surf":
@@ -2037,10 +2162,13 @@ def run_rollout(
                             device=device,
                         )
                         new_frame = new_frame[..., :spatial_h, :spatial_w]
+                        prov_cams.append(name)
                     else:
                         new_frame = old[:, -1:]
+                        prov_carry.append(name)
                 else:
                     new_frame = old[:, -1:]
+                    prov_carry.append(name)
 
                 surf_next[name] = torch.cat([old[:, 1:], new_frame], dim=1)
 
@@ -2051,6 +2179,7 @@ def run_rollout(
                 )
                 if use_prediction:
                     new_frame = pred.atmos_vars[name]
+                    prov_model.append(name)
                 elif refresh_exogenous and next_time_index < ds.sizes[_dim_names(config)[0]]:
                     predictor_spec = predictor_by_aurora.get(name)
                     if predictor_spec is not None and predictor_spec.kind == "atmos":
@@ -2063,12 +2192,35 @@ def run_rollout(
                             device=device,
                         )
                         new_frame = new_frame[..., :spatial_h, :spatial_w]
+                        prov_cams.append(name)
                     else:
                         new_frame = old[:, -1:]
+                        prov_carry.append(name)
                 else:
                     new_frame = old[:, -1:]
+                    prov_carry.append(name)
 
                 atmos_next[name] = torch.cat([old[:, 1:], new_frame], dim=1)
+
+            # ---- Safeguards (items 6–8): verify the CAMS/model split ----
+            # 1) No bias-corrected target may be sourced from CAMS truth.
+            leaked = target_var_names & set(prov_cams)
+            assert not leaked, (
+                f"[rollout step {step}] target variable(s) {sorted(leaked)} were "
+                "refreshed from CAMS truth — they must use model predictions only."
+            )
+            # 2) Every bias-corrected target must be advanced by the model.
+            not_modeled = target_var_names - set(prov_model)
+            assert not not_modeled, (
+                f"[rollout step {step}] target variable(s) {sorted(not_modeled)} were "
+                "not advanced by the model prediction during rollout."
+            )
+            if verbose_provenance:
+                logger.info(
+                    "[rollout step %d → t=%d] model/bias-corrected=%s | CAMS=%s | carried=%s",
+                    step, next_time_index,
+                    sorted(prov_model), sorted(prov_cams), sorted(prov_carry),
+                )
 
             current = Batch(
                 surf_vars=surf_next,

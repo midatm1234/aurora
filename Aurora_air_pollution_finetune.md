@@ -103,9 +103,10 @@ The base flow loss is a **per-pixel / per-level residual MSE**. That objective i
 | Spatial-pattern | `spatial_grad_weight`, `spatial_acc_weight` | Finite-difference gradient-field MSE + `1 − anomaly-correlation (ACC)` — fixes displaced fronts/gradients. |
 | Distributional | `dist_var_weight`, `dist_wasserstein_weight` | Spatial-std mismatch + sorted-value (1-D Wasserstein-2) distance — matches the value distribution. |
 | Vertical-profile | `vertical_weight` | Level-to-level finite-difference MSE on the atmospheric profile — enforces a coherent vertical shape (the head is otherwise per-level independent). |
-| Column/profile coherence | `coherence_weight` | Ties the column var (`gtco3`) to the pressure-weighted vertical integral of the profile var (`go3`): `MSE(D(refined), D(truth))` with `D = col − Σ_l w_l · prof_l`. Computed cross-variable in `compute_supervised_loss`. |
+| First-moment / bias | `bias_weight` | Per-sample spatial-**mean** match `MSE(mean(refined), mean(target))`. The *only* term that pins the field's absolute level — ACC subtracts the mean and the variance/Wasserstein terms constrain only spread/shape, so without this nothing penalises a domain-wide offset (e.g. the systematic column-O₃ low bias). |
+| Column/profile coherence | `coherence_weight` | Ties the column var (`gtco3`) to the pressure-weighted vertical integral of the profile var (`go3`): `MSE(D(refined), D(truth))` with `D = col − Σ_l w_l · prof_l`. Computed cross-variable in `compute_supervised_loss`. **Caveat:** total-column O₃ is stratosphere-dominated (~10–50 hPa), *above* the `loss_levels` used here, so the integral is a poor proxy and can drag `gtco3` toward a low bias — disable it (`coherence_weight: 0.0`) for the column-O₃ fine-tune. Note it is inert for the NO₂ case anyway (its hard-coded `gtco3`/`go3` pair never resolves against `no2`/`tcno2` targets). |
 
-All weights default to `0.0` (pure residual MSE → backward compatible), and a single `enabled` flag toggles the whole feature on/off without re-zeroing weights. The block is exposed in every flow-refine config (`enabled: true` in the O3 example, `enabled: false` in the NO2 configs). Example block:
+All weights default to `0.0` (pure residual MSE → backward compatible), and a single `enabled` flag toggles the whole feature on/off without re-zeroing weights. The block is exposed in every flow-refine config. Example block:
 
 ```yaml
 training:
@@ -119,6 +120,7 @@ training:
     spatial_acc_weight: 0.25
     dist_var_weight: 0.25
     dist_wasserstein_weight: 0.25
+    bias_weight: 0.5              # spatial-mean match — counters systematic bias
     vertical_weight: 0.5
     coherence_weight: 0.25
     coherence_column_var: gtco3   # empty => auto-detect first surf target
@@ -136,9 +138,40 @@ model:
   flow_refine_sampling_steps: 1        # phase-1 (eval) sampling steps
   flow_refine_sampling_steps_late: 8   # phase-2 (eval) sampling steps
   flow_refine_phase_fraction: 0.3333   # epoch fraction at which phase 2 begins
+  flow_refine_doy_cond: false          # seasonal (day-of-year) conditioning
 ```
 
 Mutually exclusive with `conv_refine_enabled: true` (the deterministic conv-refine head in `conv_refine.py`); the wrappers in `aurora_finetune_utils.maybe_wrap_*` self-gate on these flags.
+
+### Seasonal (day-of-year) conditioning (`flow_refine_doy_cond`)
+
+When `true`, each `ResidualFlowUNet` head gains a small `doy_mlp` that maps a
+sin/cos encoding of the **fractional day-of-year** into the FM time-embedding
+space and adds it to the flow-time embedding before FiLM modulation. The
+day-of-year is read from `pred.metadata.time` (per batch element) at both train
+and eval time, so one shared head can specialise its residual by season instead
+of averaging, e.g., a summer-low ozone correction against a spring-high one. The
+final `doy_mlp` layer is **zero-init**, so the feature preserves the
+identity-at-init guarantee and is a no-op until trained. Default `false` keeps
+the head's behaviour and checkpoint shape unchanged (backward compatible).
+
+### Choosing the column-O₃ vs NO₂ recipe
+
+The aux block and sampling schedule that work for sparse, multi-modal surface
+NO₂ plumes are **not** optimal for the smooth, large-scale `gtco3` column field.
+For a column-O₃ fine-tune, prefer:
+
+* `flow_refine_sampling_steps_late: 1` — the x₁ parameterisation already returns
+  the residual mean `E[r|ŷ]` in one step; extra steps only inject stochastic
+  spread (observed as +18 % std inflation and a spurious low-ozone blob).
+* `coherence_weight: 0.0` — the column↔profile integral is a poor proxy for
+  stratosphere-dominated total-column O₃ (see the loss table caveat).
+* `bias_weight > 0` — pin the absolute level to counter the systematic low bias.
+* `flow_refine_doy_cond: true` — absorb the strong ozone seasonal cycle.
+
+See `finetune/aurora_O3_finetune_US-WEST_3day_lead_config_v2.yaml` (subtraction:
+drop coherence + multi-step) and `..._config_v3.yaml` (v2 + `bias_weight` +
+seasonal conditioning).
 
 ### Checkpoints
 
@@ -150,8 +183,8 @@ Set `case_name: my_experiment` at the top of the YAML and all artifacts (checkpo
 
 ## Data
 
-- **Training**: CAMS forecast, Feb 1 – Mar 31 2026, 112 timesteps (`data/train.nc`)
-- **Test**: 6 timesteps (`data/test.nc`)
+- **Training**: CAMS forecast, full year 2023-07-01 → 2024-06-30, 732 timesteps at 12 h spacing (per-case `data/<case>/train.nc`)
+- **Test**: 2024-07-01 → 2024-09-30, ~184 timesteps (per-case `data/<case>/test.nc`); the July evaluation date is seasonally in-distribution
 - **Static fields**: From HuggingFace pickle (`aurora-0.4-air-pollution-static.pickle`)
 
 ## Usage

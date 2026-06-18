@@ -16,10 +16,18 @@ paths:
 #   <output_dir>/<case_name>/  and  <checkpoint_dir>/<case_name>/
 # resume_from="best"/"last" resolves relative to the case folder, so
 # stages chain naturally when you keep case_name fixed across runs.
-case_name: two-day_lead
+case_name: O3_US-WEST_3day_lead_v4
 
 data:
+  # v4 uses ALL predictor variables available in CAMS (and supported by the
+  # AuroraAirPollution variant). O3 chemistry is coupled to other species
+  # (NOx titration/production, CO, SO2, aerosols), so feeding the full set of
+  # co-located chemical + meteorological fields gives the model the context it
+  # needs to correct the O3 forecast. This is the complete surf + atmos var set
+  # of AuroraAirPollution; the bias-correction targets stay identical to v2
+  # (go3 at the four loss levels + gtco3 surface column).
   predictor_variables:
+    # --- Surface meteorology ---
     - dataset_name: t2m
       aurora_name: 2t
       kind: surf
@@ -32,9 +40,32 @@ data:
     - dataset_name: msl
       aurora_name: msl
       kind: surf
+    # --- Surface aerosols / total columns ---
+    - dataset_name: pm1
+      aurora_name: pm1
+      kind: surf
+    - dataset_name: pm2p5
+      aurora_name: pm2p5
+      kind: surf
+    - dataset_name: pm10
+      aurora_name: pm10
+      kind: surf
+    - dataset_name: tcco
+      aurora_name: tcco
+      kind: surf
+    - dataset_name: tc_no
+      aurora_name: tc_no
+      kind: surf
     - dataset_name: tcno2
       aurora_name: tcno2
       kind: surf
+    - dataset_name: gtco3
+      aurora_name: gtco3
+      kind: surf
+    - dataset_name: tcso2
+      aurora_name: tcso2
+      kind: surf
+    # --- Atmospheric meteorology ---
     - dataset_name: z
       aurora_name: z
       kind: atmos
@@ -50,21 +81,33 @@ data:
     - dataset_name: q
       aurora_name: q
       kind: atmos
+    # --- Atmospheric chemical species ---
+    - dataset_name: co
+      aurora_name: co
+      kind: atmos
+    - dataset_name: "no"
+      aurora_name: "no"
+      kind: atmos
     - dataset_name: no2
       aurora_name: no2
+      kind: atmos
+    - dataset_name: go3
+      aurora_name: go3
+      kind: atmos
+    - dataset_name: so2
+      aurora_name: so2
       kind: atmos
 
   target_variables:
-    - dataset_name: no2
-      aurora_name: no2
+    - dataset_name: go3
+      aurora_name: go3
       kind: atmos
-      # Use ALL 13 pressure levels. The per-level normalisation scales for
-      # top-of-atmosphere NO2 collapse to ~1e-9, but those vertical gradients
-      # carry real physical signal — dropping levels here was wrong. The
-      # numerical pathology this used to mask is fixed in the optimizer
-      # (per-parameter LR scaling by weight magnitude in the training loop).
-    - dataset_name: tcno2
-      aurora_name: tcno2
+      # Compute target loss only at these pressure levels. The full
+      # atmospheric level grid remains in data.atmos_levels so Aurora's
+      # encoder/decoder and checkpoint shapes stay compatible.
+      loss_levels: [1000, 500, 100, 50]
+    - dataset_name: gtco3
+      aurora_name: gtco3
       kind: surf
 
   static_variables:
@@ -104,7 +147,7 @@ data:
 
   atmos_levels: [50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000]
   input_time_steps: 2
-  target_lead_times: [1,2,3]  # Paper §D.3: "CAMS 0.4°: train with single-step prediction".
+  target_lead_times: [1,2,3,4,5,6]  # Paper §D.3: "CAMS 0.4°: train with single-step prediction".
   target_type: rollout  # next-step | multi-step | rollout
 
   domain_type: regional  # global | regional
@@ -187,29 +230,20 @@ model:
   # head express multi-modal residuals. Training loss is independent of
   # this knob (t is sampled uniformly in [0,1]); it only affects
   # validation/rollout.
-  flow_refine_sampling_steps_late: 8
+  # gtco3 is a smooth, large-scale column field, NOT a sparse multi-modal
+  # plume like surface NO2. With the x1 (data) parameterisation, 1 step
+  # already yields the residual mean E[r|y_hat]; extra steps only inject
+  # stochastic spread, which is exactly the +18% std inflation and the
+  # spurious low-ozone blob seen in the v1 fine-tuned rollout. Keep the
+  # eval sampler deterministic (1 step) for the column field.
+  flow_refine_sampling_steps_late: 1
   flow_refine_phase_fraction: 0.3333
-  # --- Mamba temporal module (optional) --------------------------------
-  # Adds a selective state-space (Mamba) corrector on top of the
-  # flow-matching output. It learns how the bias-corrected field and
-  # Aurora's residual evolve across a rollout sequence, targeting the
-  # accumulated drift that degrades 2–3 day forecasts relative to 6 h.
-  # Default disabled → flow-matching-only behaviour is unchanged. The
-  # temporal decoder is zero-init (identity-at-init), so enabling it does
-  # nothing until trained. Trained on the ordered multi-lead sequence
-  # (see training.mamba_temporal_weight) and applied causally at rollout.
-  mamba_temporal_enabled: false
-  mamba_temporal_channels: 16   # per-pixel feature width of the encoder/SSM
-  mamba_temporal_state: 8       # SSM hidden state dimension (N)
-  mamba_temporal_layers: 2      # stacked Mamba blocks
-  mamba_temporal_conv: 3        # causal temporal conv kernel
-  mamba_temporal_expand: 2      # SSM inner expansion factor
   model_kwargs: {}
 
 training:
   seed: 42
-  batch_size: 1  # 4 leads × 14 atmos levels × FM head OOMs at bs=2 on 22 GB A10G; effective batch = 1 × 4 GPUs × 8 accum = 32
-  num_epochs: 25  # fresh finetune at target_lead_times=[1,2,3] from a clean random init of the FM head
+  batch_size: 4  # 4 leads × 13 atmos levels × FM head OOMs at bs=2 on 22 GB A10G; effective batch = 1 × 4 GPUs × 8 accum = 32
+  num_epochs: 100  # fresh O3 finetune at target_lead_times=[1,2,3,4] from a clean random init of the FM head
   # Fresh stage-1 fine-tune at lead_times=[1,2,3,4]. The previous run was
   # warmstarted from a head trained only at leads=[1,2]; extending to lead 3
   # introduced a large distribution shift that the resumed head couldn't
@@ -229,11 +263,8 @@ training:
   gradient_clip_val: 1.0
   accumulation_steps: 8
   # Per-parameter LR scaling by weight RMS. AdamW takes ~unit-magnitude steps
-  # in normalised weight units regardless of the parameter's actual scale; for
-  # Aurora's per-level NO2 head/embed weights (which are themselves O(1e-9) at
-  # the top of atmosphere), one un-scaled AdamW step shifts them by ~10^3×
-  # their natural size and destroys the pretrained mapping. Setting this
-  # enables the trust-ratio-style per-tensor scaling in
+  # in normalised weight units regardless of the parameter's actual scale.
+  # Setting this enables the trust-ratio-style per-tensor scaling in
   # aurora_finetune_distributed.py.
   scale_aware_lr:
     enabled: true
@@ -263,7 +294,7 @@ training:
   validation_frequency: 1
   save_best_only: true
   save_last: true
-  resume_training: true
+  resume_training: false
   resume_from: "last"  # "best", "last", or a path to a .ckpt file. Empty = no resume.
   resume_skip_scheduler: true  # only relevant when resume_training=true
   # MSE for warmup-stage fine-tuning: gradient ∝ (pred-tgt)/std² shrinks as
@@ -271,23 +302,22 @@ training:
   # and bf16 autocast. Switch to "mae" only for late-stage rollout fine-tune.
   loss_function: mse
   multi_target_loss_weights: {}
-  # Weight of the Mamba temporal loss (trained on the ordered multi-lead
-  # rollout sequence). Only active when model.mamba_temporal_enabled=true and
-  # there are >= 2 target lead times. 0 disables the temporal loss term.
-  mamba_temporal_weight: 1.0
 
   # ---------------------------------------------------------------------
   # Structural auxiliary losses for the flow-matching refine head.
   #
   # The base flow loss is a per-pixel / per-level residual MSE, which has no
   # notion of spatial pattern, extremes, distribution, vertical shape, or the
-  # column<->profile relationship. These weighted terms (computed on the head's
-  # clean residual estimate refined = y_hat + r_hat vs the target) add those
-  # objectives. Toggle the whole feature with `enabled`; set any weight to 0 to
-  # disable an individual term.
+  # column<->profile relationship — exactly the structures left uncorrected in
+  # the rollout-vs-test difference maps. These weighted terms (computed on the
+  # head's clean residual estimate refined = ŷ + r̂ vs the target) add those
+  # objectives. Set any weight to 0 to disable that term; all-zero reproduces
+  # the original pure residual-MSE behaviour.
   flow_aux_loss:
-    enabled: false              # master on/off switch (single line)
-    # Extreme-event performance: tail-cell weighting + spatial peak match.
+    # Master on/off switch for all structural terms below (single-line toggle).
+    enabled: true
+    # Extreme-event performance: up-weight squared error on tail cells
+    # (|z| above the per-sample quantile) + match spatial peak magnitude.
     extreme_weight: 0.5
     extreme_quantile: 0.95
     extreme_intensity: 4.0
@@ -298,23 +328,28 @@ training:
     # Distributional errors: spatial-std match + sorted-value Wasserstein.
     dist_var_weight: 0.25
     dist_wasserstein_weight: 0.25
-    # Vertical-profile consistency (atmospheric no2): level-difference MSE.
+    # Vertical-profile consistency (atmospheric go3): level-difference MSE.
     vertical_weight: 0.5
-    # Column/profile coherence: tie tcno2 (column) to the pressure-weighted
-    # vertical integral of no2 (profile). Empty var names => auto-detect.
-    coherence_weight: 0.25
-    coherence_column_var: tcno2
-    coherence_profile_var: no2
+    # Column/profile coherence: DISABLED for the column-ozone fine-tune.
+    # gtco3 (total-column O3) is stratosphere-dominated (~10-50 hPa), which
+    # sits ABOVE the loss_levels [1000,500,100,50] hPa used here, so the
+    # Dp-weighted integral of go3 over those levels is a physically wrong
+    # proxy for the column and drags gtco3 toward a systematic low bias
+    # (the -4% mean error in the v1 rollout). NOTE: this term was already
+    # INERT for the NO2 case (its targets are no2/tcno2, so the hard-coded
+    # gtco3/go3 pair never resolves) -- so zeroing it here makes the O3
+    # recipe match the working NO2 recipe. The distribution (dist_var,
+    # dist_wasserstein) and spatial-pattern (spatial_grad, spatial_acc)
+    # terms stay ON, as in NO2.
+    coherence_weight: 0.0
+    coherence_column_var: gtco3
+    coherence_profile_var: go3
 
 rollout:
   run_rollout_after_training: true
   rollout_num_steps: 0  # 0 = use max(target_lead_times) from data config
   rollout_step_hours: 12
   autoregressive_inputs: true
-  # Log, at every rollout step, which variables come from CAMS truth vs the
-  # model's bias-corrected prediction (plus assertions that no bias-corrected
-  # target is ever overwritten by CAMS). Set false to silence the per-step log.
-  verbose_provenance: true
   predicted_fields_get_fed_back: []  # Empty => all model-predicted vars are fed back.
   keep_exogenous_predictors: refresh_from_dataset  # fixed | refresh_from_dataset
   save_predictions_to_netcdf: true
@@ -324,6 +359,6 @@ rollout:
 notebook:
   quicklook_sample_index: 0
   plot_variables:
-    - no2
-    - tcno2
+    - go3
+    - gtco3
   verbosity: 1

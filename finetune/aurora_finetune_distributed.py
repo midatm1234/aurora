@@ -166,7 +166,6 @@ def _distributed_validation(
             if pbar is not None and rank == 0:
                 pbar.update(1)
                 pbar.set_postfix(
-                    phase="val",
                     val_loss=loss_sum.item() / max(count.item(), 1.0),
                     refresh=True,
                 )
@@ -259,6 +258,14 @@ def _worker(rank: int, world_size: int, local_gpu: int, cfg: dict):
                 f"Flow-refine head active: {model.refine_parameter_count():,} "
                 f"trainable refine params, sampling_steps={model.sampling_steps}",
             )
+            if getattr(model, "has_temporal", False):
+                _print0(
+                    rank,
+                    f"Mamba temporal module active: "
+                    f"{model.temporal_parameter_count():,} params "
+                    f"(surf={list(model.target_surf_vars)}, "
+                    f"atmos={list(model.target_atmos_vars)})",
+                )
     except Exception:
         pass
 
@@ -474,7 +481,20 @@ def _worker(rank: int, world_size: int, local_gpu: int, cfg: dict):
     if resume_path and resume_path.exists():
         _print0(rank, f"Resuming from checkpoint: {resume_path}")
         ckpt = torch.load(str(resume_path), map_location=device, weights_only=False)
-        model.load_state_dict(ckpt["model_state_dict"])
+        # Tolerant load so checkpoints from flow-matching-only runs (which lack
+        # the Mamba temporal parameters) resume cleanly into a temporal-enabled
+        # model, and vice-versa. Missing keys keep their fresh init; unexpected
+        # keys (e.g. a disabled temporal module) are ignored. Any *other*
+        # mismatch would still surface here for inspection.
+        load_result = model.load_state_dict(ckpt["model_state_dict"], strict=False)
+        missing = [k for k in load_result.missing_keys]
+        unexpected = [k for k in load_result.unexpected_keys]
+        if missing:
+            _print0(rank, f"  checkpoint missing {len(missing)} key(s) "
+                          f"(kept fresh init), e.g. {missing[:3]}")
+        if unexpected:
+            _print0(rank, f"  checkpoint has {len(unexpected)} unexpected key(s) "
+                          f"(ignored), e.g. {unexpected[:3]}")
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         # `optimizer.load_state_dict` overwrites each param_group's `lr` with
         # the value saved at checkpoint time. Re-apply the LR (and per-group
@@ -575,13 +595,13 @@ def _worker(rank: int, world_size: int, local_gpu: int, cfg: dict):
 
         pbar = tqdm(
             range(0, len(rank_samples), batch_size),
-            desc=f"Epoch {epoch + 1}/{num_epochs}",
+            desc=f"Epoch {epoch + 1}/{num_epochs} [train]",
             disable=(rank != 0 or _progress_bars_disabled()),
             unit="batch",
-            total=n_train_batches + n_val_batches,
+            total=n_train_batches,
             colour="blue",
             dynamic_ncols=True,
-            leave=True,
+            leave=False,
             position=0,
         )
         for step_i in pbar:
@@ -686,15 +706,28 @@ def _worker(rank: int, world_size: int, local_gpu: int, cfg: dict):
         dist.all_reduce(train_loss_t, op=dist.ReduceOp.SUM)
         train_loss = (train_loss_t[0] / train_loss_t[1]).item() if train_loss_t[1] > 0 else math.nan
 
+        # Training bar is complete; close it before validation gets its own bar.
+        pbar.close()
+
         # ---- validation ----
         val_loss = float("nan")
         if should_validate:
-            pbar.set_description(f"Epoch {epoch + 1}/{num_epochs} val")
+            val_pbar = tqdm(
+                total=n_val_batches,
+                desc=f"Epoch {epoch + 1}/{num_epochs} [val]",
+                disable=(rank != 0 or _progress_bars_disabled()),
+                unit="batch",
+                colour="green",
+                dynamic_ncols=True,
+                leave=False,
+                position=0,
+            )
             val_metrics = _distributed_validation(
                 model, val_ds, val_samples, cfg, resolved_specs, device, rank, world_size,
-                norm_stats=norm_stats, pbar=pbar,
+                norm_stats=norm_stats, pbar=val_pbar,
             )
             val_loss = float(val_metrics["val_loss"])
+            val_pbar.close()
             model.train()
 
         row = {
@@ -705,12 +738,14 @@ def _worker(rank: int, world_size: int, local_gpu: int, cfg: dict):
             "lr": float(optimizer.param_groups[0]["lr"]),
         }
         history.append(row)
-        pbar.set_postfix(
-            train=train_loss, val=val_loss,
-            mem=f"{torch.cuda.memory_allocated(device)/1e9:.1f}GB",
-            refresh=True,
+        # Persistent one-line epoch summary (progress bars use leave=False and
+        # vanish on completion, so log the epoch result explicitly).
+        _print0(
+            rank,
+            f"Epoch {epoch + 1}/{num_epochs} | train_loss={train_loss:.4f} | "
+            f"val_loss={val_loss:.4f} | "
+            f"mem={torch.cuda.memory_allocated(device) / 1e9:.1f}GB",
         )
-        pbar.close()
 
         improved = should_validate and np.isfinite(val_loss) and (val_loss < (best_val_loss - min_delta))
         if improved:

@@ -45,7 +45,7 @@ except ImportError:  # pragma: no cover - fallback for minimal environments.
 
 CONFIG = {
     # Path to finetune config YAML
-    "config": "aurora_NO2_finetune_US-WEST_3day_lead_config.yaml",
+    "config": "aurora_O3_finetune_US-WEST_3day_lead_config_v4.yaml",
 
     # Folder containing input NetCDF files (searched with glob patterns)
     "data_folder": "/data/cams",
@@ -286,12 +286,27 @@ def _resolve_case_data_paths(
     if test_out is not None:
         resolved_test = _resolve_path(test_out, project_root)
 
-    for label, path in (("train", resolved_train), ("test", resolved_test), ("validation", resolved_val)):
-        if path is not None and path.parent.resolve() != case_data_dir:
-            raise ValueError(
-                f"{label} output must be inside the case-specific data folder: {case_data_dir}. "
-                f"Got: {path}"
+    # Outputs must live in the case-specific data folder so prepared data stays
+    # co-located with checkpoints/outputs for the same case_name. If a stale or
+    # mismatched --{train,test,val}-out is supplied (e.g. re-running an old
+    # command from a previous case), redirect it into case_data_dir keeping the
+    # given filename rather than hard-failing.
+    def _coerce_into_case_dir(label: str, path: Path | None) -> Path | None:
+        if path is None:
+            return None
+        if path.parent.resolve() != case_data_dir:
+            redirected = (case_data_dir / path.name).resolve()
+            print(
+                f"[prepare] WARNING: {label} output {path} is not inside the "
+                f"case folder for case_name; redirecting to {redirected}.",
+                flush=True,
             )
+            return redirected
+        return path
+
+    resolved_train = _coerce_into_case_dir("train", resolved_train)
+    resolved_test = _coerce_into_case_dir("test", resolved_test)
+    resolved_val = _coerce_into_case_dir("validation", resolved_val)
 
     return resolved_train, resolved_val, resolved_test, case_data_dir
 

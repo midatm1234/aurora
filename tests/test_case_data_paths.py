@@ -77,6 +77,26 @@ def _check_case_specific_prepare_finetune_and_inference_paths(tmp_path: Path) ->
         inference_ds.close()
 
 
+def _check_mismatched_out_path_is_redirected_into_case_dir(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(_config_text())
+    cfg_raw = prep._read_config(config_path)
+
+    stale_out = tmp_path / "data" / "old_case" / "train.nc"
+
+    train_path, _val_path, test_path, case_data_dir = prep._resolve_case_data_paths(
+        cfg_raw,
+        config_path,
+        train_out=stale_out,
+        val_out=None,
+        test_out=None,
+    )
+
+    assert case_data_dir == tmp_path / "data" / "smoke_case"
+    assert train_path == case_data_dir / "train.nc"
+    assert test_path == case_data_dir / "test.nc"
+
+
 def _check_missing_case_name_and_missing_prepared_files_are_clear(tmp_path: Path) -> None:
     missing_case_config = tmp_path / "missing_case.yaml"
     missing_case_config.write_text(
@@ -106,6 +126,10 @@ class CaseDataPathSmokeTest(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             _check_missing_case_name_and_missing_prepared_files_are_clear(Path(tmp))
 
+    def test_mismatched_out_path_is_redirected_into_case_dir(self) -> None:
+        with TemporaryDirectory() as tmp:
+            _check_mismatched_out_path_is_redirected_into_case_dir(Path(tmp))
+
 
 def test_case_specific_prepare_finetune_and_inference_paths(tmp_path: Path) -> None:
     _check_case_specific_prepare_finetune_and_inference_paths(tmp_path)
@@ -113,6 +137,10 @@ def test_case_specific_prepare_finetune_and_inference_paths(tmp_path: Path) -> N
 
 def test_missing_case_name_and_missing_prepared_files_are_clear(tmp_path: Path) -> None:
     _check_missing_case_name_and_missing_prepared_files_are_clear(tmp_path)
+
+
+def test_mismatched_out_path_is_redirected_into_case_dir(tmp_path: Path) -> None:
+    _check_mismatched_out_path_is_redirected_into_case_dir(tmp_path)
 
 
 if __name__ == "__main__":
