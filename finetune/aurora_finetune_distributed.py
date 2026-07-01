@@ -188,24 +188,28 @@ def _worker(rank: int, world_size: int, local_gpu: int, cfg: dict):
     torch.cuda.set_device(local_gpu)
     device = torch.device(f"cuda:{local_gpu}")
     physical_gpus = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    train_cfg = cfg["training"]
+    skip_validation = bool(train_cfg.get("skip_validation", False))
 
     # ---- data (every rank, read-only) ----
     train_ds = ft.open_dataset(cfg["paths"]["train_data_path"], cfg)
-    val_ds = ft.open_dataset(cfg["paths"]["val_data_path"], cfg)
+    val_ds = None if skip_validation else ft.open_dataset(cfg["paths"]["val_data_path"], cfg)
     test_ds = ft.open_dataset(cfg["paths"]["test_data_path"], cfg)
 
     static_path = cfg["paths"].get("static_data_path", "")
     if static_path:
         train_ds = ft.merge_external_static_vars(train_ds, static_path, cfg)
-        val_ds = ft.merge_external_static_vars(val_ds, static_path, cfg)
+        if val_ds is not None:
+            val_ds = ft.merge_external_static_vars(val_ds, static_path, cfg)
         test_ds = ft.merge_external_static_vars(test_ds, static_path, cfg)
 
     resolved_specs = ft.resolve_variable_specs(train_ds, cfg)
     norm_stats = ft.compute_target_normalization_stats(train_ds, resolved_specs, cfg)
     _print0(rank, f"Norm stats: { {k: {sk: sv.tolist() for sk, sv in v.items()} for k, v in norm_stats.items()} }")
     train_samples = ft.build_training_samples(train_ds, cfg, split_name="train")
-    val_samples = ft.build_training_samples(val_ds, cfg, split_name="val")
-    _print0(rank, f"Train samples: {len(train_samples)} | Val samples: {len(val_samples)}")
+    val_samples = [] if skip_validation else ft.build_training_samples(val_ds, cfg, split_name="val")
+    val_label = "skipped" if skip_validation else str(len(val_samples))
+    _print0(rank, f"Train samples: {len(train_samples)} | Val samples: {val_label}")
 
     # ---- model ----
     model_cfg = cfg["model"]
@@ -298,7 +302,6 @@ def _worker(rank: int, world_size: int, local_gpu: int, cfg: dict):
     _print0(rank, f"World size: {world_size} | Physical GPUs: {physical_gpus}")
 
     # ---- optimizer / scheduler ----
-    train_cfg = cfg["training"]
     ft.set_seed(int(train_cfg.get("seed", 42)))
 
     lr = float(train_cfg.get("learning_rate", 3e-4))
@@ -583,7 +586,10 @@ def _worker(rank: int, world_size: int, local_gpu: int, cfg: dict):
         optimizer.zero_grad(set_to_none=True)
 
         n_train_batches = math.ceil(len(rank_samples) / batch_size)
-        should_validate = ((epoch + 1) % validation_frequency == 0) or (epoch == num_epochs - 1)
+        should_validate = (
+            not skip_validation
+            and (((epoch + 1) % validation_frequency == 0) or (epoch == num_epochs - 1))
+        )
         if should_validate:
             val_per_rank = math.ceil(len(val_samples) / world_size)
             my_val_count = len(

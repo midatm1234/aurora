@@ -16,10 +16,18 @@ paths:
 #   <output_dir>/<case_name>/  and  <checkpoint_dir>/<case_name>/
 # resume_from="best"/"last" resolves relative to the case folder, so
 # stages chain naturally when you keep case_name fixed across runs.
-case_name: O3_US-WEST_3day_lead_v2
+case_name: O3_global_3day_lead
 
 data:
+  # v4 uses ALL predictor variables available in CAMS (and supported by the
+  # AuroraAirPollution variant). O3 chemistry is coupled to other species
+  # (NOx titration/production, CO, SO2, aerosols), so feeding the full set of
+  # co-located chemical + meteorological fields gives the model the context it
+  # needs to correct the O3 forecast. This is the complete surf + atmos var set
+  # of AuroraAirPollution; the bias-correction targets stay identical to v2
+  # (go3 at the four loss levels + gtco3 surface column).
   predictor_variables:
+    # --- Surface meteorology ---
     - dataset_name: t2m
       aurora_name: 2t
       kind: surf
@@ -32,9 +40,32 @@ data:
     - dataset_name: msl
       aurora_name: msl
       kind: surf
+    # --- Surface aerosols / total columns ---
+    - dataset_name: pm1
+      aurora_name: pm1
+      kind: surf
+    - dataset_name: pm2p5
+      aurora_name: pm2p5
+      kind: surf
+    - dataset_name: pm10
+      aurora_name: pm10
+      kind: surf
+    - dataset_name: tcco
+      aurora_name: tcco
+      kind: surf
+    - dataset_name: tc_no
+      aurora_name: tc_no
+      kind: surf
+    - dataset_name: tcno2
+      aurora_name: tcno2
+      kind: surf
     - dataset_name: gtco3
       aurora_name: gtco3
       kind: surf
+    - dataset_name: tcso2
+      aurora_name: tcso2
+      kind: surf
+    # --- Atmospheric meteorology ---
     - dataset_name: z
       aurora_name: z
       kind: atmos
@@ -50,8 +81,21 @@ data:
     - dataset_name: q
       aurora_name: q
       kind: atmos
+    # --- Atmospheric chemical species ---
+    - dataset_name: co
+      aurora_name: co
+      kind: atmos
+    - dataset_name: "no"
+      aurora_name: "no"
+      kind: atmos
+    - dataset_name: no2
+      aurora_name: no2
+      kind: atmos
     - dataset_name: go3
       aurora_name: go3
+      kind: atmos
+    - dataset_name: so2
+      aurora_name: so2
       kind: atmos
 
   target_variables:
@@ -106,11 +150,11 @@ data:
   target_lead_times: [1,2,3,4,5,6]  # Multi-step rollout supervision at these target lead indices (1 step = rollout_step_hours).
   target_type: rollout  # next-step | multi-step | rollout
 
-  domain_type: regional  # global | regional
-  lat_min: 31.0
-  lat_max: 52.0
-  lon_min: -128.0
-  lon_max: -100.0
+  domain_type: global  # global | regional
+  lat_min: None
+  lat_max: None
+  lon_min: None
+  lon_max: None
 
   data_format: netcdf  # netcdf | zarr | xarray
   backend: netcdf
@@ -177,7 +221,7 @@ model:
   # the FM ODE and adds it back. Mutually exclusive with conv-refine
   # (flow takes precedence when both are enabled).
   flow_refine_enabled: true
-  flow_refine_hidden: 64           # base UNet width
+  flow_refine_hidden: 16           # Global full-resolution training needs a small UNet width to fit one H100.
   flow_refine_time_dim: 128        # sinusoidal time embedding dim
   flow_refine_sampling_steps: 1    # Phase-1 (early epochs): deterministic regression.
   # Progressive sampling-steps schedule. After the first
@@ -204,7 +248,7 @@ model:
   # is a no-op until trained. Trained on the ordered multi-lead sequence
   # (see training.mamba_temporal_weight) and applied causally at rollout.
   # Requires flow_refine_enabled: true and >= 2 target_lead_times.
-  mamba_temporal_enabled: true
+  mamba_temporal_enabled: false
   mamba_temporal_channels: 16   # per-pixel feature width of the encoder/SSM
   mamba_temporal_state: 8       # SSM hidden state dimension (N)
   mamba_temporal_layers: 2      # stacked Mamba blocks
@@ -214,8 +258,8 @@ model:
 
 training:
   seed: 42
-  batch_size: 4  # 6 leads × 13 atmos levels × FM head OOMs at bs=2 on 22 GB A10G; effective batch = 1 × 4 GPUs × 8 accum = 32
-  num_epochs: 100  # fresh finetune at target_lead_times=[1,2,3,4,5,6] from a clean random init of the FM head
+  batch_size: 1  # Global domain + 6 leads + FM head needs per-GPU bs=1; use accumulation for effective batch.
+  num_epochs: 50  # fresh finetune at target_lead_times=[1,2,3,4,5,6] from a clean random init of the FM head
   # Fresh stage-1 fine-tune over target_lead_times=[1,2,3,4,5,6] from a clean
   # random init of the FM head, trained jointly at the standard 3e-4 UNet
   # LR so the head learns the multi-lead residual across all leads at once.
@@ -226,12 +270,14 @@ training:
   # Short warmup: head-only fine-tune from a pretrained backbone doesn't need
   # the paper's 100-step linear warmup (that's for from-scratch pretraining).
   scheduler_warmup_steps: 10
-  scheduler_t_max: 150  # set near total optimizer updates (num_epochs x updates/epoch); retune if num_epochs or batch geometry changes.
+  # scheduler_t_max omitted -> auto-defaults to updates_per_epoch x num_epochs
+  # (the full run length), so the cosine decays to eta_min exactly at the last
+  # optimizer update. Set an explicit value only to override that span.
   scheduler_eta_min: 0.0
   scheduler_step_size: 10
   scheduler_gamma: 0.5
   gradient_clip_val: 1.0
-  accumulation_steps: 8
+  accumulation_steps: 32
   # Per-parameter LR scaling by weight RMS. AdamW takes ~unit-magnitude steps
   # in normalised weight units regardless of the parameter's actual scale.
   # Setting this enables the trust-ratio-style per-tensor scaling in
@@ -261,10 +307,11 @@ training:
     enabled: false
     patience: 3
     min_delta: 1.0e-5
-  validation_frequency: 1
+  validation_frequency: 10
+  skip_validation: true
   save_best_only: true
   save_last: true
-  resume_training: false
+  resume_training: true
   resume_from: "last"  # "best", "last", or a path to a .ckpt file. Empty = no resume.
   resume_skip_scheduler: true  # only relevant when resume_training=true
   # MSE for warmup-stage fine-tuning: gradient ∝ (pred-tgt)/std² shrinks as
@@ -275,7 +322,7 @@ training:
   # Weight of the Mamba temporal loss (trained on the ordered multi-lead
   # rollout sequence). Only active when model.mamba_temporal_enabled=true
   # and there are >= 2 target lead times. 0 disables the temporal loss term.
-  mamba_temporal_weight: 1.0
+  mamba_temporal_weight: 0.0
 
   # ---------------------------------------------------------------------
   # Structural auxiliary losses for the flow-matching refine head.

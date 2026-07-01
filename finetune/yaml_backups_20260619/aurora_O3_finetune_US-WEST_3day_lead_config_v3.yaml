@@ -16,7 +16,7 @@ paths:
 #   <output_dir>/<case_name>/  and  <checkpoint_dir>/<case_name>/
 # resume_from="best"/"last" resolves relative to the case folder, so
 # stages chain naturally when you keep case_name fixed across runs.
-case_name: O3_US-WEST_3day_lead_v2
+case_name: O3_US-WEST_3day_lead_v3
 
 data:
   predictor_variables:
@@ -55,13 +55,13 @@ data:
       kind: atmos
 
   target_variables:
-    - dataset_name: go3
-      aurora_name: go3
-      kind: atmos
-      # Compute target loss only at these pressure levels. The full
-      # atmospheric level grid remains in data.atmos_levels so Aurora's
-      # encoder/decoder and checkpoint shapes stay compatible.
-      loss_levels: [1000, 500, 100, 50]
+    #- dataset_name: go3
+    #  aurora_name: go3
+    #  kind: atmos
+    #  # Compute target loss only at these pressure levels. The full
+    #  # atmospheric level grid remains in data.atmos_levels so Aurora's
+    #  # encoder/decoder and checkpoint shapes stay compatible.
+    #  loss_levels: [1000, 500, 100, 50]
     - dataset_name: gtco3
       aurora_name: gtco3
       kind: surf
@@ -103,7 +103,7 @@ data:
 
   atmos_levels: [50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000]
   input_time_steps: 2
-  target_lead_times: [1,2,3,4,5,6]  # Multi-step rollout supervision at these target lead indices (1 step = rollout_step_hours).
+  target_lead_times: [1,2,3,4,5,6]  # Paper §D.3: "CAMS 0.4°: train with single-step prediction".
   target_type: rollout  # next-step | multi-step | rollout
 
   domain_type: regional  # global | regional
@@ -194,31 +194,29 @@ model:
   # eval sampler deterministic (1 step) for the column field.
   flow_refine_sampling_steps_late: 1
   flow_refine_phase_fraction: 0.3333
-  # ------------------------------------------------------------------
-  # Mamba temporal module (long-lead rollout corrector).
-  # Adds a selective state-space (Mamba) corrector on top of the
-  # flow-matching output. It learns how the bias-corrected field and
-  # Aurora's residual evolve across a rollout sequence, targeting the
-  # accumulated drift that degrades 2-3 day forecasts relative to 6 h.
-  # The temporal decoder is zero-init (identity-at-init), so the module
-  # is a no-op until trained. Trained on the ordered multi-lead sequence
-  # (see training.mamba_temporal_weight) and applied causally at rollout.
-  # Requires flow_refine_enabled: true and >= 2 target_lead_times.
-  mamba_temporal_enabled: true
-  mamba_temporal_channels: 16   # per-pixel feature width of the encoder/SSM
-  mamba_temporal_state: 8       # SSM hidden state dimension (N)
-  mamba_temporal_layers: 2      # stacked Mamba blocks
-  mamba_temporal_conv: 3        # causal temporal conv kernel
-  mamba_temporal_expand: 2      # SSM inner expansion factor
+  # Seasonal (day-of-year) conditioning. Adds a sin/cos annual-cycle
+  # embedding to the FM head's time conditioning so one shared head can
+  # specialise its residual by season. Ozone has a strong seasonal cycle;
+  # without this, a single head averages a summer-low correction against a
+  # spring-high one. Zero-init so it preserves identity-at-init.
+  flow_refine_doy_cond: true
   model_kwargs: {}
 
 training:
   seed: 42
-  batch_size: 4  # 6 leads × 13 atmos levels × FM head OOMs at bs=2 on 22 GB A10G; effective batch = 1 × 4 GPUs × 8 accum = 32
-  num_epochs: 100  # fresh finetune at target_lead_times=[1,2,3,4,5,6] from a clean random init of the FM head
-  # Fresh stage-1 fine-tune over target_lead_times=[1,2,3,4,5,6] from a clean
-  # random init of the FM head, trained jointly at the standard 3e-4 UNet
-  # LR so the head learns the multi-lead residual across all leads at once.
+  # v3 drops the go3 atmos target, so the FM head is surf-only (no 13-level
+  # atmos head). That frees most of the activation memory the old bs limit was
+  # set against, so we bump the per-GPU batch for better A10G utilisation and
+  # halve accumulation to keep the effective batch (and thus scheduler_t_max)
+  # unchanged: 8 × 4 GPUs × 4 accum = 128, same as the old 4 × 4 × 8. Validate
+  # it fits 22 GB on the first step; drop back to 6 if it OOMs.
+  batch_size: 8
+  num_epochs: 100  # fresh O3 finetune at target_lead_times=[1,2,3,4] from a clean random init of the FM head
+  # Fresh stage-1 fine-tune at lead_times=[1,2,3,4]. The previous run was
+  # warmstarted from a head trained only at leads=[1,2]; extending to lead 3
+  # introduced a large distribution shift that the resumed head couldn't
+  # absorb at the dampened LR=5e-7. Restart from scratch with the standard
+  # 3e-4 UNet LR so the head learns the multi-lead residual jointly.
   learning_rate: 3.0e-4
   optimizer: adamw
   weight_decay: 0.0
@@ -226,28 +224,35 @@ training:
   # Short warmup: head-only fine-tune from a pretrained backbone doesn't need
   # the paper's 100-step linear warmup (that's for from-scratch pretraining).
   scheduler_warmup_steps: 10
-  scheduler_t_max: 150  # set near total optimizer updates (num_epochs x updates/epoch); retune if num_epochs or batch geometry changes.
+  scheduler_t_max: 150  # fresh: 30 epochs × ~4 updates/epoch (29 batches/rank @ bs=1, accum=8) + buffer
   scheduler_eta_min: 0.0
   scheduler_step_size: 10
   scheduler_gamma: 0.5
   gradient_clip_val: 1.0
-  accumulation_steps: 8
+  accumulation_steps: 4  # halved alongside the bs bump to hold effective batch (and scheduler_t_max) constant
   # Per-parameter LR scaling by weight RMS. AdamW takes ~unit-magnitude steps
   # in normalised weight units regardless of the parameter's actual scale.
   # Setting this enables the trust-ratio-style per-tensor scaling in
   # aurora_finetune_distributed.py.
   scale_aware_lr:
     enabled: true
+    # NOTE: with pretrained_lr_scale=0.0 below, all Aurora-pretrained tensors
+    # are frozen (requires_grad=False) BEFORE the optimizer is built, so they
+    # never enter the scale-aware bucketing. min_scale, rms_floor and
+    # reference_rms only act on pretrained params, hence they are INERT in this
+    # config — left at sane defaults for when the backbone is unfrozen. The
+    # surf flow-refine head (the only thing that trains) always runs at the
+    # full configured learning_rate (scale 1.0).
     # Reference RMS used as the "1.0×" scale. Params with rms below this
     # get LR proportionally reduced; params above get clipped to 1.0×.
     # If null, computed automatically as the median rms of well-conditioned
     # pretrained params at optimizer construction time.
     reference_rms: null
     # Lower bound on the per-tensor scale factor so vanishingly small params
-    # are not completely frozen (only applies to pretrained params).
+    # are not completely frozen (only applies to pretrained params; inert here).
     min_scale: 1.0e-3
     # rms below this is considered a (near-)zero-init param (e.g. fresh head
-    # bias) and is excluded from the reference-rms estimate.
+    # bias) and is excluded from the reference-rms estimate (inert here).
     rms_floor: 1.0e-4
     # Multiplicative LR scale on Aurora-pretrained params. The pretrained
     # Aurora is already near-optimal on CAMS dates similar to its training
@@ -272,10 +277,6 @@ training:
   # and bf16 autocast. Switch to "mae" only for late-stage rollout fine-tune.
   loss_function: mse
   multi_target_loss_weights: {}
-  # Weight of the Mamba temporal loss (trained on the ordered multi-lead
-  # rollout sequence). Only active when model.mamba_temporal_enabled=true
-  # and there are >= 2 target lead times. 0 disables the temporal loss term.
-  mamba_temporal_weight: 1.0
 
   # ---------------------------------------------------------------------
   # Structural auxiliary losses for the flow-matching refine head.
@@ -302,6 +303,11 @@ training:
     # Distributional errors: spatial-std match + sorted-value Wasserstein.
     dist_var_weight: 0.25
     dist_wasserstein_weight: 0.25
+    # First-moment / conservation: match the per-sample spatial mean. This is
+    # the only term that pins the field's absolute level, so it directly
+    # counters the column-O3 low bias (mean -4% in the v1 rollout). ACC
+    # removes the mean and var/Wasserstein constrain only spread/shape.
+    bias_weight: 0.5
     # Vertical-profile consistency (atmospheric go3): level-difference MSE.
     vertical_weight: 0.5
     # Column/profile coherence: DISABLED for the column-ozone fine-tune.
@@ -324,10 +330,6 @@ rollout:
   rollout_num_steps: 0  # 0 = use max(target_lead_times) from data config
   rollout_step_hours: 12
   autoregressive_inputs: true
-  # Log, at every rollout step, which variables come from CAMS truth vs the
-  # model's bias-corrected prediction (plus assertions that no bias-corrected
-  # target is ever overwritten by CAMS). Set false to silence the per-step log.
-  verbose_provenance: true
   predicted_fields_get_fed_back: []  # Empty => all model-predicted vars are fed back.
   keep_exogenous_predictors: refresh_from_dataset  # fixed | refresh_from_dataset
   save_predictions_to_netcdf: true

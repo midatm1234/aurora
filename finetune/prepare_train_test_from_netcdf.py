@@ -45,7 +45,7 @@ except ImportError:  # pragma: no cover - fallback for minimal environments.
 
 CONFIG = {
     # Path to finetune config YAML
-    "config": "aurora_O3_finetune_US-WEST_3day_lead_config_v4.yaml",
+    "config": "aurora_O3_global_finetune_3day_lead_config.yaml",
 
     # Folder containing input NetCDF files (searched with glob patterns)
     "data_folder": "/data/cams",
@@ -63,10 +63,10 @@ CONFIG = {
     "test_end_time": "2024-09-30T12:00:00",
 
     # Spatial domain subset (set to None to disable)
-    "lat_min": 31.0,
-    "lat_max": 52.0,
-    "lon_min": -128.0,
-    "lon_max": -100.0,
+    "lat_min": None,
+    "lat_max": None,
+    "lon_min": None,
+    "lon_max": None,
 
     # NetCDF compression level (0-9)
     "compression_level": 1,
@@ -819,6 +819,17 @@ def _apply_domain_subset(
     lon_min = lon_min if lon_min is not None else data_cfg.get("lon_min")
     lon_max = lon_max if lon_max is not None else data_cfg.get("lon_max")
 
+    # Normalize string "None" to actual None (can come from YAML or CLI)
+    def _normalize_bound(val):
+        if val is None or (isinstance(val, str) and val.lower() == "none"):
+            return None
+        return val
+
+    lat_min = _normalize_bound(lat_min)
+    lat_max = _normalize_bound(lat_max)
+    lon_min = _normalize_bound(lon_min)
+    lon_max = _normalize_bound(lon_max)
+
     if None in {lat_min, lat_max, lon_min, lon_max}:
         return ds
 
@@ -937,6 +948,54 @@ def _append_netcdf(ds: xr.Dataset, path: Path, *, time_dim: str, compression_lev
             var[start:end, ...] = values
 
     return n_time
+
+
+def _filter_files_by_date_range(
+    files: list[Path | str],
+    time_start: str | None,
+    time_end: str | None,
+) -> list[Path | str]:
+    """Filter files whose date range (parsed from filename) overlaps [time_start, time_end].
+
+    Expects filenames like: YYYY-MM-DD_to_YYYY-MM-DD-*.nc
+    Files whose date range doesn't overlap the requested range are skipped.
+    """
+    import re
+    from datetime import datetime
+
+    if time_start is None and time_end is None:
+        return files
+
+    # Parse request bounds
+    req_start = datetime.fromisoformat(time_start) if time_start else None
+    req_end = datetime.fromisoformat(time_end) if time_end else None
+
+    # Pattern to extract date range from filename: YYYY-MM-DD_to_YYYY-MM-DD
+    pattern = re.compile(r"(\d{4}-\d{2}-\d{2})_to_(\d{4}-\d{2}-\d{2})")
+
+    filtered = []
+    for f in files:
+        name = Path(f).name
+        match = pattern.search(name)
+        if not match:
+            # Can't parse date; include file to be safe
+            filtered.append(f)
+            continue
+
+        file_start = datetime.strptime(match.group(1), "%Y-%m-%d")
+        file_end = datetime.strptime(match.group(2), "%Y-%m-%d")
+
+        # Check for overlap: file_start <= req_end AND file_end >= req_start
+        overlaps = True
+        if req_end is not None and file_start > req_end:
+            overlaps = False
+        if req_start is not None and file_end < req_start:
+            overlaps = False
+
+        if overlaps:
+            filtered.append(f)
+
+    return filtered
 
 
 def _pair_surface_atmos_files(
@@ -1074,6 +1133,19 @@ def main() -> None:
         raise FileNotFoundError(f"No *lead0-surface-level.nc files found in {data_folder}")
     if not atmos_files:
         raise FileNotFoundError(f"No *lead0-atmospheric.nc files found in {data_folder}")
+
+    # Filter files by date range to avoid loading irrelevant data
+    surface_files = _filter_files_by_date_range(surface_files, args.train_start_time, args.test_end_time)
+    atmos_files = _filter_files_by_date_range(atmos_files, args.train_start_time, args.test_end_time)
+
+    if not surface_files:
+        raise FileNotFoundError(
+            f"No surface files overlap requested time range [{args.train_start_time}, {args.test_end_time}]"
+        )
+    if not atmos_files:
+        raise FileNotFoundError(
+            f"No atmospheric files overlap requested time range [{args.train_start_time}, {args.test_end_time}]"
+        )
 
     data_cfg = cfg.get("data", {})
     time_dim = str(data_cfg.get("time_dim", "time"))
