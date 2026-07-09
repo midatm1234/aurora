@@ -22,12 +22,16 @@ from __future__ import annotations
 import argparse
 import contextlib
 import itertools
+import sys
 import threading
 import time
 from collections import OrderedDict
 from glob import glob as _glob
 from pathlib import Path
 from typing import Any
+
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import numpy as np
 import xarray as xr
@@ -436,6 +440,72 @@ def _normalize_dims(ds: xr.Dataset, cfg: dict[str, Any]) -> xr.Dataset:
         requested_levels = [float(x) for x in data_cfg["atmos_levels"]]
         ds = ds.sel({level_dim: requested_levels})
 
+    return _canonicalize_spatial_coordinates(ds, cfg)
+
+
+def _canonicalize_spatial_coordinates(ds: xr.Dataset, cfg: dict[str, Any]) -> xr.Dataset:
+    """Canonicalize coordinates before any concat, alignment, or write.
+
+    Longitude is always stored internally as sorted, unique ``[0, 360)``.
+    Reindexing the whole dataset is essential: changing coordinate values alone
+    would mislabel every gridded predictor and target.
+    """
+    from finetune.longitude import canonical_longitudes
+
+    data_cfg = cfg.get("data", {})
+    lat_dim = str(data_cfg.get("lat_dim", "latitude"))
+    lon_dim = str(data_cfg.get("lon_dim", "longitude"))
+    if lat_dim not in ds.coords or lon_dim not in ds.coords:
+        raise ValueError(
+            f"Dataset must contain explicit `{lat_dim}` and `{lon_dim}` coordinates."
+        )
+    if ds[lat_dim].ndim != 1 or ds[lon_dim].ndim != 1:
+        raise ValueError("Only one-dimensional latitude/longitude coordinates are supported.")
+
+    lat = np.asarray(ds[lat_dim].values, dtype=np.float64)
+    if lat.size < 2:
+        raise ValueError("Latitude coordinate must contain at least two points.")
+    if not np.all(np.diff(lat) < 0):
+        ds = ds.sortby(lat_dim, ascending=False)
+    if not np.all(np.diff(np.asarray(ds[lat_dim].values, dtype=np.float64)) < 0):
+        raise ValueError("Latitude coordinate must be strictly decreasing after sorting.")
+
+    lon, source_indices = canonical_longitudes(ds[lon_dim].values)
+    lon_attrs = dict(ds[lon_dim].attrs)
+    lon_attrs.update(
+        {
+            "standard_name": "longitude",
+            "long_name": "longitude",
+            "units": "degrees_east",
+            "axis": "X",
+        }
+    )
+    ds = ds.isel({lon_dim: source_indices}).assign_coords(
+        {lon_dim: xr.DataArray(lon, dims=(lon_dim,), attrs=lon_attrs)}
+    )
+    ds[lat_dim].attrs.update(
+        {
+            "standard_name": "latitude",
+            "long_name": "latitude",
+            "units": "degrees_north",
+            "axis": "Y",
+        }
+    )
+
+    # Forecast source files often retain a stale `coordinates` attribute after
+    # `step`/`valid_time` are collapsed. Remove references to variables that no
+    # longer exist so prepared files remain CF-clean.
+    present = set(ds.variables)
+    for da in ds.data_vars.values():
+        for container in (da.attrs, da.encoding):
+            value = container.get("coordinates")
+            if not isinstance(value, str):
+                continue
+            valid = [name for name in value.split() if name in present]
+            if valid:
+                container["coordinates"] = " ".join(valid)
+            else:
+                container.pop("coordinates", None)
     return ds
 
 
@@ -533,6 +603,39 @@ def _drop_non_spatiotemporal_extras(
     return da.transpose(*required_dims)
 
 
+def _snap_spatial_grids(
+    datasets: list[xr.Dataset],
+    cfg: dict[str, Any],
+    *,
+    label: str,
+) -> list[xr.Dataset]:
+    """Validate equivalent spatial grids and snap harmless float round-off."""
+    if len(datasets) < 2:
+        return datasets
+    data_cfg = cfg.get("data", {})
+    lat_dim = str(data_cfg.get("lat_dim", "latitude"))
+    lon_dim = str(data_cfg.get("lon_dim", "longitude"))
+    reference = datasets[0]
+    snapped = [reference]
+    for dataset_index, dataset in enumerate(datasets[1:], start=1):
+        updates: dict[str, xr.DataArray] = {}
+        for coord_name in (lat_dim, lon_dim):
+            ref_values = np.asarray(reference[coord_name].values, dtype=np.float64)
+            values = np.asarray(dataset[coord_name].values, dtype=np.float64)
+            spacing = np.median(np.abs(np.diff(ref_values))) if ref_values.size > 1 else 1.0
+            tolerance = max(1e-7, float(spacing) * 1e-4)
+            if values.shape != ref_values.shape or not np.allclose(
+                values, ref_values, rtol=0.0, atol=tolerance,
+            ):
+                raise ValueError(
+                    f"{label} {coord_name} grid differs for dataset {dataset_index}; "
+                    "refusing an alignment that would drop or create cells."
+                )
+            updates[coord_name] = reference[coord_name]
+        snapped.append(dataset.assign_coords(updates))
+    return snapped
+
+
 def _load_and_merge_files(
     file_paths: list[Path | str],
     cfg: dict[str, Any],
@@ -581,9 +684,12 @@ def _load_and_merge_files(
     if len(datasets) == 1:
         return datasets[0]
 
-    # Merge along time dimension
+    # Merge along time only after snapping harmless float precision differences
+    # in spatial coordinates. Exact alignment prevents xarray from creating a
+    # union grid with alternating NaN columns.
+    datasets = _snap_spatial_grids(datasets, cfg, label=f"{label} file")
     with _elapsed_status(f"Concatenating {label} files"):
-        merged = xr.concat(datasets, dim=time_dim)
+        merged = xr.concat(datasets, dim=time_dim, join="exact")
     with _elapsed_status(f"Sorting {label} by {time_dim}"):
         merged = merged.sortby(time_dim)
 
@@ -654,6 +760,11 @@ def _build_merged_dataset(
         raise ValueError("No variables selected from input datasets.")
 
     if len(parts) > 1:
+        # Equivalent grids can differ by float32 round-off after arriving from
+        # separate surface/atmos files. Snap them to one checked reference
+        # before xarray's exact-label alignment; otherwise `join="inner"` can
+        # silently discard longitude columns.
+        parts = _snap_spatial_grids(parts, cfg, label="Surface/atmospheric")
         with _elapsed_status("Aligning surface and atmospheric datasets"):
             aligned = xr.align(*parts, join="inner", copy=False)
             parts = list(aligned)
@@ -812,6 +923,9 @@ def _apply_domain_subset(
     data_cfg = cfg.get("data", {})
     lat_dim = str(data_cfg.get("lat_dim", "latitude"))
     lon_dim = str(data_cfg.get("lon_dim", "longitude"))
+    # This is intentionally unconditional: global/no-bounds data still needs
+    # the same canonical longitude convention before surface/atmos alignment.
+    ds = _canonicalize_spatial_coordinates(ds, cfg)
 
     # Resolve bounds: explicit args > YAML config > None (no subset)
     lat_min = lat_min if lat_min is not None else data_cfg.get("lat_min")
@@ -845,10 +959,6 @@ def _apply_domain_subset(
             "[0, 360). Please choose a non-wrapping regional longitude interval."
         )
 
-    lon_values = np.asarray(ds[lon_dim].values, dtype=np.float64) % 360.0
-    order = np.argsort(lon_values)
-    ds = ds.isel({lon_dim: order}).assign_coords({lon_dim: lon_values[order]})
-
     # Subset: lat slice works whether latitudes are ascending or descending.
     lat_values = np.asarray(ds[lat_dim].values)
     if lat_values[0] > lat_values[-1]:
@@ -871,28 +981,55 @@ def _apply_domain_subset(
     return ds
 
 
-def _write_netcdf(ds: xr.Dataset, path: Path, compression_level: int) -> None:
+def _write_netcdf(
+    ds: xr.Dataset,
+    path: Path,
+    compression_level: int,
+    cfg: dict[str, Any] | None = None,
+) -> None:
+    if cfg is None:
+        lat_name = "latitude" if "latitude" in ds.coords else "lat"
+        lon_name = "longitude" if "longitude" in ds.coords else "lon"
+        cfg = {"data": {"lat_dim": lat_name, "lon_dim": lon_name}}
+    ds = _canonicalize_spatial_coordinates(ds, cfg)
+    ds.attrs["Conventions"] = "CF-1.10"
     path.parent.mkdir(parents=True, exist_ok=True)
-    encoding = {
-        var: {"zlib": True, "complevel": int(compression_level)} for var in ds.data_vars
-    }
+    encoding = _encoding_for(ds, compression_level)
     with _elapsed_status(f"Writing {path}"):
         ds.to_netcdf(path=path, mode="w", format="NETCDF4", encoding=encoding)
 
 
 def _encoding_for(ds: xr.Dataset, compression_level: int) -> dict[str, dict[str, Any]]:
-    return {
+    encoding: dict[str, dict[str, Any]] = {
         var: {"zlib": True, "complevel": int(compression_level)} for var in ds.data_vars
     }
+    for name, coord in ds.coords.items():
+        if np.issubdtype(coord.dtype, np.number) or np.issubdtype(
+            coord.dtype, np.datetime64,
+        ):
+            encoding.setdefault(name, {})["_FillValue"] = None
+    return encoding
 
 
 def _append_netcdf(ds: xr.Dataset, path: Path, *, time_dim: str, compression_level: int) -> int:
     """Append a time-sorted dataset to a NetCDF file along *time_dim*."""
+    ds = ds.copy(deep=False)
+    ds.attrs["Conventions"] = "CF-1.10"
     n_time = int(ds.sizes.get(time_dim, 0))
     if n_time == 0:
         return 0
 
     ds = ds.sortby(time_dim)
+    time_values = np.asarray(ds[time_dim].values)
+    comparable_times = (
+        time_values.astype("datetime64[ns]").astype(np.int64)
+        if np.issubdtype(time_values.dtype, np.datetime64)
+        else time_values
+    )
+    if comparable_times.size > 1 and np.any(np.diff(comparable_times) <= 0):
+        raise ValueError(
+            f"Cannot append `{time_dim}` values that are duplicated or non-increasing."
+        )
     path.parent.mkdir(parents=True, exist_ok=True)
 
     if not path.exists():
@@ -919,21 +1056,49 @@ def _append_netcdf(ds: xr.Dataset, path: Path, *, time_dim: str, compression_lev
         start = len(root.dimensions[time_dim])
         end = start + n_time
 
+        # Data are appended by position, so every non-time coordinate must be
+        # identical to the coordinate written by the first chunk. Otherwise a
+        # changed longitude convention/order would silently mislabel values.
+        for coord_name, coord in ds.coords.items():
+            if coord_name == time_dim or time_dim in coord.dims:
+                continue
+            if coord_name not in root.variables:
+                raise ValueError(
+                    f"Output file {path} is missing coordinate `{coord_name}`."
+                )
+            existing = np.asarray(root.variables[coord_name][:])
+            incoming = np.asarray(coord.values)
+            same = existing.shape == incoming.shape
+            if same and np.issubdtype(incoming.dtype, np.number):
+                same = bool(np.allclose(existing, incoming, rtol=0.0, atol=1e-7))
+            elif same:
+                same = bool(np.array_equal(existing, incoming))
+            if not same:
+                raise ValueError(
+                    f"Cannot append to {path}: coordinate `{coord_name}` changed "
+                    f"from shape {existing.shape} to {incoming.shape}."
+                )
+
         time_var = root.variables[time_dim]
-        time_values = ds[time_dim].values
         if np.issubdtype(time_values.dtype, np.datetime64):
             units = getattr(time_var, "units", None)
             calendar = getattr(time_var, "calendar", "standard")
             if units is None:
                 raise ValueError(f"Output time variable in {path} has no units attribute.")
             py_datetimes = time_values.astype("datetime64[us]").astype(object).tolist()
-            time_var[start:end] = netCDF4.date2num(
+            encoded_times = np.asarray(netCDF4.date2num(
                 py_datetimes,
                 units=units,
                 calendar=calendar,
-            )
+            ))
         else:
-            time_var[start:end] = time_values
+            encoded_times = np.asarray(time_values)
+        if start > 0 and encoded_times.size and encoded_times[0] <= time_var[start - 1]:
+            raise ValueError(
+                f"Cannot append {time_dim}={time_values[0]!r}: it is not later than the "
+                f"last value already stored in {path}."
+            )
+        time_var[start:end] = encoded_times
 
         for name, da in ds.data_vars.items():
             if name not in root.variables:
@@ -1235,14 +1400,20 @@ def main() -> None:
         return
 
     print("\nWriting output files...", flush=True)
-    _write_netcdf(train_ds, args.train_out, compression_level=args.compression_level)
+    _write_netcdf(
+        train_ds, args.train_out, compression_level=args.compression_level, cfg=cfg,
+    )
     print(f"✓ Wrote train dataset: {args.train_out}", flush=True)
 
     if val_ds is not None:
-        _write_netcdf(val_ds, args.val_out, compression_level=args.compression_level)
+        _write_netcdf(
+            val_ds, args.val_out, compression_level=args.compression_level, cfg=cfg,
+        )
         print(f"✓ Wrote validation dataset: {args.val_out}", flush=True)
 
-    _write_netcdf(test_ds, args.test_out, compression_level=args.compression_level)
+    _write_netcdf(
+        test_ds, args.test_out, compression_level=args.compression_level, cfg=cfg,
+    )
     print(f"✓ Wrote test dataset: {args.test_out}", flush=True)
     print("\nDone!", flush=True)
 

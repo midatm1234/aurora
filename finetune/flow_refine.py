@@ -78,6 +78,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from aurora.batch import Batch
+from finetune.longitude import (
+    PeriodicConv2d,
+    lon_cyclic_features,
+    periodic_avg_pool2d,
+    periodic_bilinear_interpolate,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -170,10 +176,18 @@ def _peak_loss(refined: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     return 0.5 * (F.mse_loss(r_max, t_max) + F.mse_loss(r_min, t_min))
 
 
-def _spatial_gradient_loss(refined: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    """Finite-difference spatial-gradient MSE (penalises pattern/edge errors)."""
-    dx_r = refined[..., :, 1:] - refined[..., :, :-1]
-    dx_t = target[..., :, 1:] - target[..., :, :-1]
+def _spatial_gradient_loss(
+    refined: torch.Tensor,
+    target: torch.Tensor,
+    lon_periodic: bool = False,
+) -> torch.Tensor:
+    """Finite-difference spatial-gradient MSE, including the cyclic edge."""
+    if lon_periodic:
+        dx_r = torch.roll(refined, shifts=-1, dims=-1) - refined
+        dx_t = torch.roll(target, shifts=-1, dims=-1) - target
+    else:
+        dx_r = refined[..., :, 1:] - refined[..., :, :-1]
+        dx_t = target[..., :, 1:] - target[..., :, :-1]
     dy_r = refined[..., 1:, :] - refined[..., :-1, :]
     dy_t = target[..., 1:, :] - target[..., :-1, :]
     return 0.5 * (F.mse_loss(dx_r, dx_t) + F.mse_loss(dy_r, dy_t))
@@ -346,14 +360,20 @@ class _SelfAttention2d(nn.Module):
 
 
 class _ConvBlock(nn.Module):
-    """Conv → GroupNorm → SiLU → FiLM(t) → Conv → GroupNorm → SiLU."""
+    """Conv → GroupNorm → SiLU → FiLM(t) → Conv → GroupNorm → SiLU.
 
-    def __init__(self, in_ch: int, out_ch: int, time_dim: int) -> None:
+    Convolutions use :class:`~finetune.longitude.PeriodicConv2d` so that, on a
+    periodic (global) domain, longitude (``W``) is padded circularly and the
+    correction is continuous across the 0°/360° dateline. ``lon_periodic=False``
+    reproduces the previous ``padding_mode='replicate'`` behaviour exactly.
+    """
+
+    def __init__(self, in_ch: int, out_ch: int, time_dim: int, lon_periodic: bool = True) -> None:
         super().__init__()
-        self.conv1 = nn.Conv2d(in_ch, out_ch, 3, padding=1, padding_mode="replicate")
+        self.conv1 = PeriodicConv2d(in_ch, out_ch, 3, lon_periodic=lon_periodic)
         self.norm1 = nn.GroupNorm(min(8, out_ch), out_ch)
         self.film = _FiLM(time_dim, out_ch)
-        self.conv2 = nn.Conv2d(out_ch, out_ch, 3, padding=1, padding_mode="replicate")
+        self.conv2 = PeriodicConv2d(out_ch, out_ch, 3, lon_periodic=lon_periodic)
         self.norm2 = nn.GroupNorm(min(8, out_ch), out_ch)
         self.skip = (
             nn.Conv2d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()
@@ -372,19 +392,34 @@ class ResidualFlowUNet(nn.Module):
     Inputs (concatenated along the channel axis):
       * ``cond``  — Aurora's normalised prediction ŷ_norm   (1 ch)
       * ``x_t``   — interpolated noisy residual              (1 ch)
+      * ``coords`` — optional cyclic ``[sin(lon), cos(lon)]`` maps (2 ch), enabled
+        via ``lon_encoding=True``. Longitude is never fed as a raw (discontinuous)
+        value; the ``sin``/``cos`` pair is smooth across the 0°/360° dateline.
     Time ``t`` is fed via FiLM modulation in every conv block.
 
     The output (1 ch) is the predicted velocity ``v_θ(x_t, t, ŷ)``.
+
+    All spatial convolutions pad longitude circularly when ``lon_periodic`` so no
+    seam is introduced at the dateline on a global domain.
 
     The architecture is intentionally small (~250k params at hidden=64,
     3 levels) — the conditioning carries most of the structure, the UNet
     only learns *how the residual deviates from zero given ŷ*.
     """
 
-    def __init__(self, hidden: int = 64, time_dim: int = 128, doy_cond: bool = False) -> None:
+    def __init__(
+        self,
+        hidden: int = 64,
+        time_dim: int = 128,
+        doy_cond: bool = False,
+        lon_periodic: bool = True,
+        lon_encoding: bool = False,
+    ) -> None:
         super().__init__()
         self.time_dim = time_dim
         self.doy_cond = bool(doy_cond)
+        self.lon_periodic = bool(lon_periodic)
+        self.lon_encoding = bool(lon_encoding)
         self.time_mlp = nn.Sequential(
             nn.Linear(time_dim, time_dim),
             nn.SiLU(),
@@ -402,15 +437,19 @@ class ResidualFlowUNet(nn.Module):
             )
             nn.init.zeros_(self.doy_mlp[-1].weight)
             nn.init.zeros_(self.doy_mlp[-1].bias)
+        # Input channels: cond + x_t (+ sin/cos lon when lon_encoding).
+        in_ch = 2 + (2 if self.lon_encoding else 0)
         # 3-level UNet operating at full / 1/2 / 1/4 resolution.
-        self.down1 = _ConvBlock(2, hidden, time_dim)
-        self.down2 = _ConvBlock(hidden, hidden * 2, time_dim)
-        self.down3 = _ConvBlock(hidden * 2, hidden * 4, time_dim)
+        self.down1 = _ConvBlock(in_ch, hidden, time_dim, lon_periodic=lon_periodic)
+        self.down2 = _ConvBlock(hidden, hidden * 2, time_dim, lon_periodic=lon_periodic)
+        self.down3 = _ConvBlock(hidden * 2, hidden * 4, time_dim, lon_periodic=lon_periodic)
         # Self-attention at the bottleneck: global context for large-scale
         # systematic biases (e.g. continent-wide ozone over-prediction).
         self.bottleneck_attn = _SelfAttention2d(hidden * 4)
-        self.up2 = _ConvBlock(hidden * 4 + hidden * 2, hidden * 2, time_dim)
-        self.up1 = _ConvBlock(hidden * 2 + hidden, hidden, time_dim)
+        self.up2 = _ConvBlock(
+            hidden * 4 + hidden * 2, hidden * 2, time_dim, lon_periodic=lon_periodic,
+        )
+        self.up1 = _ConvBlock(hidden * 2 + hidden, hidden, time_dim, lon_periodic=lon_periodic)
         self.out = nn.Conv2d(hidden, 1, 1)
         # Zero-init final projection so v(x_t, t, ŷ) ≡ 0 at init.
         # Then x_1 = x_0 (pure noise) → r̂ = 0 → output = ŷ at init,
@@ -424,6 +463,7 @@ class ResidualFlowUNet(nn.Module):
         t: torch.Tensor,
         cond: torch.Tensor,
         doy: torch.Tensor | None = None,
+        coords: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Predict the FM velocity field.
 
@@ -434,10 +474,18 @@ class ResidualFlowUNet(nn.Module):
           doy:  (N,) or None  — fractional day-of-year in [0, 1) for seasonal
                 conditioning (used only when the head was built with
                 ``doy_cond=True``).
+          coords: (N, 2, H, W) or None — cyclic ``[sin(lon), cos(lon)]`` maps,
+                used only when the head was built with ``lon_encoding=True``.
 
         Returns:
           (N, 1, H, W) velocity prediction.
         """
+        if self.lon_periodic and cond.shape[-1] % 4 != 0:
+            raise ValueError(
+                "Periodic Flow Matching requires longitude width divisible by 4 for its "
+                f"two downsampling stages; got W={cond.shape[-1]}. Regrid the complete "
+                "global axis rather than dropping longitude columns."
+            )
         t_emb = self.time_mlp(_sinusoidal_time_embed(t, self.time_dim))
         if self.doy_cond and doy is not None:
             doy_embed = _doy_fraction_embed(doy).to(
@@ -445,15 +493,28 @@ class ResidualFlowUNet(nn.Module):
             )
             t_emb = t_emb + self.doy_mlp(doy_embed)
 
-        h0 = torch.cat([cond, x_t], dim=1)
+        if self.lon_encoding:
+            if coords is None:
+                raise ValueError(
+                    "lon_encoding=True requires cyclic longitude coordinates; "
+                    "none were supplied to the Flow Matching head."
+                )
+            coords = coords.to(device=cond.device, dtype=cond.dtype)
+            h0 = torch.cat([cond, x_t, coords], dim=1)
+        else:
+            h0 = torch.cat([cond, x_t], dim=1)
         d1 = self.down1(h0, t_emb)
-        d2 = self.down2(F.avg_pool2d(d1, 2), t_emb)
-        d3 = self.down3(F.avg_pool2d(d2, 2), t_emb)
+        d2 = self.down2(periodic_avg_pool2d(d1, self.lon_periodic), t_emb)
+        d3 = self.down3(periodic_avg_pool2d(d2, self.lon_periodic), t_emb)
         d3 = self.bottleneck_attn(d3)  # global context at coarsest scale
 
-        u2 = F.interpolate(d3, size=d2.shape[-2:], mode="bilinear", align_corners=False)
+        u2 = periodic_bilinear_interpolate(
+            d3, size=d2.shape[-2:], lon_periodic=self.lon_periodic,
+        )
         u2 = self.up2(torch.cat([u2, d2], dim=1), t_emb)
-        u1 = F.interpolate(u2, size=d1.shape[-2:], mode="bilinear", align_corners=False)
+        u1 = periodic_bilinear_interpolate(
+            u2, size=d1.shape[-2:], lon_periodic=self.lon_periodic,
+        )
         u1 = self.up1(torch.cat([u1, d1], dim=1), t_emb)
 
         return self.out(u1)
@@ -509,6 +570,8 @@ class AuroraFlowRefine(nn.Module):
         doy_cond: bool = False,
         residual_zscore: bool = False,
         res_std_momentum: float = 0.99,
+        lon_periodic: bool = True,
+        lon_encoding: bool = False,
         temporal_enabled: bool = False,
         temporal_channels: int = 16,
         temporal_state: int = 8,
@@ -524,6 +587,12 @@ class AuroraFlowRefine(nn.Module):
         self.sampling_steps = int(sampling_steps)
         self.sigma_min = float(sigma_min)
         self.doy_cond = bool(doy_cond)
+        # Longitude periodicity. ``lon_periodic`` makes every conv pad longitude
+        # circularly (global domain) so the correction has no seam at the
+        # 0°/360° dateline; ``lon_encoding`` additionally feeds smooth
+        # ``[sin(lon), cos(lon)]`` maps as UNet input channels.
+        self.lon_periodic = bool(lon_periodic)
+        self.lon_encoding = bool(lon_encoding)
 
         # Flow-matching z-score: standardise the FM *target* residual by a
         # per-variable running std σ_r so the flow's two endpoints (unit-variance
@@ -552,10 +621,22 @@ class AuroraFlowRefine(nn.Module):
         self.aux_loss_cfg = dict(DEFAULT_AUX_LOSS_CONFIG)
 
         self.surf_flow = nn.ModuleDict(
-            {n: ResidualFlowUNet(hidden, time_dim, doy_cond=self.doy_cond) for n in target_surf_vars}
+            {
+                n: ResidualFlowUNet(
+                    hidden, time_dim, doy_cond=self.doy_cond,
+                    lon_periodic=self.lon_periodic, lon_encoding=self.lon_encoding,
+                )
+                for n in target_surf_vars
+            }
         )
         self.atmos_flow = nn.ModuleDict(
-            {n: ResidualFlowUNet(hidden, time_dim, doy_cond=self.doy_cond) for n in target_atmos_vars}
+            {
+                n: ResidualFlowUNet(
+                    hidden, time_dim, doy_cond=self.doy_cond,
+                    lon_periodic=self.lon_periodic, lon_encoding=self.lon_encoding,
+                )
+                for n in target_atmos_vars
+            }
         )
 
         # Per-variable running residual-std buffers used by the FM z-score
@@ -596,6 +677,7 @@ class AuroraFlowRefine(nn.Module):
                 n_layers=int(temporal_layers),
                 d_conv=int(temporal_conv),
                 expand=int(temporal_expand),
+                lon_periodic=self.lon_periodic,
             )
 
     # --- Delegate Aurora interface -----------------------------------------
@@ -662,10 +744,43 @@ class AuroraFlowRefine(nn.Module):
             std = std.view(1, -1, 1, 1)
         return mean, std
 
+    def _lon_coords(
+        self,
+        lon: torch.Tensor | None,
+        n: int,
+        h: int,
+        w: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor | None:
+        """Cyclic ``[sin(lon), cos(lon)]`` conditioning maps of shape (N, 2, H, W).
+
+        Returns ``None`` when the cyclic longitude encoding is disabled. When
+        it is enabled, missing or mismatched coordinates are an error: silently
+        substituting zero channels would make training and inference use
+        different conditioning semantics.
+        """
+        if not self.lon_encoding:
+            return None
+        if lon is None:
+            raise ValueError("flow_refine_lon_encoding requires longitude metadata.")
+        lon_t = torch.as_tensor(lon)
+        if lon_t.ndim != 1 or int(lon_t.shape[-1]) != int(w):
+            raise ValueError(
+                f"Expected a 1-D longitude coordinate of length {w}, got {tuple(lon_t.shape)}."
+            )
+        feats = lon_cyclic_features(lon_t, h, device=device, dtype=dtype)  # (2, H, W)
+        return feats.unsqueeze(0).expand(int(n), 2, int(h), int(w))
+
     # --- Flow-matching z-score (residual standardisation) ------------------
 
     def _residual_std(
-        self, kind: str, var_name: str, ref: torch.Tensor,
+        self,
+        kind: str,
+        var_name: str,
+        ref: torch.Tensor,
+        *,
+        update: bool = True,
     ) -> torch.Tensor:
         """Per-variable residual std σ_r used to standardise the FM target.
 
@@ -673,10 +788,11 @@ class AuroraFlowRefine(nn.Module):
         :attr:`residual_zscore` is off, or the variable has no buffer, returns
         ``1.0`` so the flow operates on the raw residual (legacy behaviour).
 
-        During training the running EMA buffer is updated in-place from the
-        batch residual std (``ref`` is the detached residual ``r``); the first
-        update seeds the buffer directly. During eval the buffer is read
-        read-only, falling back to ``1.0`` if never initialised.
+        During training, when ``update=True``, the running EMA buffer is updated
+        in-place from the batch residual std (``ref`` is the detached residual
+        ``r``); the first update seeds the buffer directly. Deterministic
+        auxiliary/inference lookups pass ``update=False`` so a prediction tensor
+        can never corrupt residual statistics.
         """
         one = torch.ones((), device=ref.device, dtype=ref.dtype)
         if not self.residual_zscore:
@@ -686,7 +802,7 @@ class AuroraFlowRefine(nn.Module):
             return one
         buf = getattr(self, bufname)
 
-        if self.training:
+        if self.training and update:
             with torch.no_grad():
                 cur = ref.detach().float().std(unbiased=False).clamp_min(self.sigma_min)
                 # Under DDP each rank sees a different shard, so average the
@@ -720,6 +836,7 @@ class AuroraFlowRefine(nn.Module):
         var_name: str,
         kind: str,
         doy: torch.Tensor | None = None,
+        lon: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Conditional residual regression at a sampled noise level.
 
@@ -745,6 +862,9 @@ class AuroraFlowRefine(nn.Module):
           target_norm: Ground-truth target in normalised space, same shape.
           var_name:    aurora-name of the variable (selects the UNet head).
           kind:        ``"surf"`` or ``"atmos"``.
+          doy:         Optional per-sample fractional day-of-year (B,).
+          lon:         Optional longitude vector (W,) in degrees for the cyclic
+                       ``lon_encoding`` input (ignored when the feature is off).
 
         Returns:
           Scalar tensor — mean residual MSE.
@@ -782,6 +902,9 @@ class AuroraFlowRefine(nn.Module):
             else:
                 doy_n = doy
 
+        # Cyclic longitude conditioning maps (shared across the flattened axis).
+        coords = self._lon_coords(lon, N, H, W, device, dtype)
+
         x0 = torch.randn(N, 1, H, W, device=device, dtype=dtype)
         # FM z-score: standardise the target residual so it is ~unit-variance,
         # scale-matched to the unit-variance noise x0. σ_r = 1 when the feature
@@ -798,7 +921,7 @@ class AuroraFlowRefine(nn.Module):
         t_b = t.view(N, 1, 1, 1).to(dtype)
 
         x_t = (1.0 - t_b) * x0 + t_b * r_std
-        r_pred = head(x_t, t, cond, doy=doy_n)
+        r_pred = head(x_t, t, cond, doy=doy_n, coords=coords)
         base_loss = F.mse_loss(r_pred, r_std)
 
         # --- Structural auxiliary losses ------------------------------------
@@ -863,7 +986,9 @@ class AuroraFlowRefine(nn.Module):
         if w_peak > 0.0:
             total = total + w_peak * _peak_loss(refined_flat, target_flat)
         if w_grad > 0.0:
-            total = total + w_grad * _spatial_gradient_loss(refined_flat, target_flat)
+            total = total + w_grad * _spatial_gradient_loss(
+                refined_flat, target_flat, lon_periodic=self.lon_periodic,
+            )
         if w_acc > 0.0:
             total = total + w_acc * _anomaly_correlation_loss(refined_flat, target_flat)
         if w_var > 0.0:
@@ -886,6 +1011,7 @@ class AuroraFlowRefine(nn.Module):
 
     def refine_norm_deterministic(
         self, pred_norm: torch.Tensor, var_name: str, kind: str,
+        lon: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Deterministic refined estimate E[r|ŷ] added to ``pred_norm``.
 
@@ -909,9 +1035,10 @@ class AuroraFlowRefine(nn.Module):
         N = cond.shape[0]
         x_t = torch.zeros(N, 1, H, W, device=cond.device, dtype=cond.dtype)
         t = torch.ones(N, device=cond.device, dtype=torch.float32)
-        r_hat = head(x_t, t, cond)
+        coords = self._lon_coords(lon, N, H, W, cond.device, cond.dtype)
+        r_hat = head(x_t, t, cond, coords=coords)
         # Un-standardise the predicted residual (σ_r = 1 when z-score is off).
-        sigma_r = self._residual_std(kind, var_name, cond)
+        sigma_r = self._residual_std(kind, var_name, cond, update=False)
         refined = (cond + r_hat * sigma_r).reshape(pred_norm.shape)
         return refined
 
@@ -1045,6 +1172,7 @@ class AuroraFlowRefine(nn.Module):
         level_pressures: Sequence[float],
         profile_var: str,
         column_var: str,
+        lon: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Column ↔ profile coherence penalty.
 
@@ -1062,8 +1190,12 @@ class AuroraFlowRefine(nn.Module):
         Shapes:
           profile_*: (B, L, H, W)   column_*: (B, H, W)
         """
-        refined_prof = self.refine_norm_deterministic(profile_pred_norm, profile_var, "atmos")
-        refined_col = self.refine_norm_deterministic(column_pred_norm, column_var, "surf")
+        refined_prof = self.refine_norm_deterministic(
+            profile_pred_norm, profile_var, "atmos", lon=lon,
+        )
+        refined_col = self.refine_norm_deterministic(
+            column_pred_norm, column_var, "surf", lon=lon,
+        )
 
         w = _pressure_thickness_weights(
             level_pressures, device=refined_prof.device, dtype=refined_prof.dtype,
@@ -1084,6 +1216,7 @@ class AuroraFlowRefine(nn.Module):
         cond_norm: torch.Tensor,
         head: ResidualFlowUNet,
         doy: torch.Tensor | None = None,
+        coords: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Iterative refinement of the residual prediction.
 
@@ -1098,6 +1231,8 @@ class AuroraFlowRefine(nn.Module):
         Args:
           cond_norm: (N, 1, H, W) — normalised Aurora prediction (cond).
           head: per-variable :class:`ResidualFlowUNet`.
+          doy: optional per-sample day-of-year conditioning.
+          coords: optional (N, 2, H, W) cyclic longitude channels.
 
         Returns:
           (N, 1, H, W) sampled residual in normalised space.
@@ -1114,7 +1249,7 @@ class AuroraFlowRefine(nn.Module):
             # x_t = 0, t = 1 → head predicts residual from conditioning alone.
             x_t = torch.zeros(N, 1, H, W, device=device, dtype=dtype)
             t = torch.ones(N, device=device, dtype=torch.float32)
-            return head(x_t, t, cond_norm, doy=doy)
+            return head(x_t, t, cond_norm, doy=doy, coords=coords)
 
         # Multi-step DDIM-style Euler ODE from t=0 (pure noise) toward t=1
         # (clean residual) using the x₁-prediction parameterisation.
@@ -1135,7 +1270,7 @@ class AuroraFlowRefine(nn.Module):
             t_curr = float(t_schedule[i].item())
             t_next = float(t_schedule[i + 1].item())
             t = torch.full((N,), t_curr, device=device, dtype=torch.float32)
-            r_hat = head(x, t, cond_norm, doy=doy)
+            r_hat = head(x, t, cond_norm, doy=doy, coords=coords)
             if t_curr > 0.0:
                 # Estimate x₀ from x_t and r̂, then interpolate to t_next.
                 x0_est = (x - t_curr * r_hat) / (1.0 - t_curr)
@@ -1162,6 +1297,9 @@ class AuroraFlowRefine(nn.Module):
         # Per-batch-element seasonal phase (fractional day-of-year), derived
         # from the prediction's valid-time metadata. ``None`` disables it.
         base_doy = self._doy_from_metadata(pred) if self.doy_cond else None
+        # Longitude vector (degrees) for the cyclic ``lon_encoding`` input.
+        # Missing metadata is a hard error when the feature is enabled.
+        base_lon = self._lon_from_metadata(pred) if self.lon_encoding else None
 
         new_surf: dict[str, torch.Tensor] = dict(pred.surf_vars)
         for name, head in self.surf_flow.items():
@@ -1181,7 +1319,8 @@ class AuroraFlowRefine(nn.Module):
             mean, std = self._norm_for(name, flat, kind="surf")
             cond = ((flat - mean) / std).unsqueeze(1)  # (N, 1, H, W)
             doy_n = base_doy.repeat_interleave(T) if base_doy is not None else None
-            r = self._sample_residual(cond, head, doy=doy_n).squeeze(1)
+            coords = self._lon_coords(base_lon, cond.shape[0], H, W, cond.device, cond.dtype)
+            r = self._sample_residual(cond, head, doy=doy_n, coords=coords).squeeze(1)
             sigma_r = self._residual_std("surf", name, flat)
             refined = flat + r * sigma_r * std  # un-standardise + de-normalise
             new_surf[name] = refined.reshape(orig_shape)
@@ -1211,7 +1350,12 @@ class AuroraFlowRefine(nn.Module):
                 N, Lsub = cond_norm.shape[0], cond_norm.shape[1]
                 cond_in = cond_norm.reshape(N * Lsub, 1, H, W)
                 doy_in = doy_bt.repeat_interleave(Lsub) if doy_bt is not None else None
-                r = self._sample_residual(cond_in, head, doy=doy_in).reshape(N, Lsub, H, W)
+                coords = self._lon_coords(
+                    base_lon, cond_in.shape[0], H, W, cond_in.device, cond_in.dtype,
+                )
+                r = self._sample_residual(
+                    cond_in, head, doy=doy_in, coords=coords,
+                ).reshape(N, Lsub, H, W)
                 sigma_r = self._residual_std("atmos", name, flat_subset)
                 refined_subset = flat_subset + r * sigma_r * std
                 # Scatter refined levels back; unrefined levels stay as-is.
@@ -1224,7 +1368,12 @@ class AuroraFlowRefine(nn.Module):
                 N = cond_norm.shape[0]
                 cond_in = cond_norm.reshape(N * L, 1, H, W)
                 doy_in = doy_bt.repeat_interleave(L) if doy_bt is not None else None
-                r = self._sample_residual(cond_in, head, doy=doy_in).reshape(N, L, H, W)
+                coords = self._lon_coords(
+                    base_lon, cond_in.shape[0], H, W, cond_in.device, cond_in.dtype,
+                )
+                r = self._sample_residual(
+                    cond_in, head, doy=doy_in, coords=coords,
+                ).reshape(N, L, H, W)
                 sigma_r = self._residual_std("atmos", name, flat)
                 refined = flat + r * sigma_r * std
                 new_atmos[name] = refined.reshape(orig_shape)
@@ -1249,6 +1398,25 @@ class AuroraFlowRefine(nn.Module):
             except Exception:
                 return None
         return torch.tensor(fracs, dtype=torch.float32)
+
+    @staticmethod
+    def _lon_from_metadata(pred: Batch) -> torch.Tensor | None:
+        """Longitude vector (degrees) from ``pred.metadata.lon``.
+
+        Returns a 1-D float tensor of length W, or ``None`` when longitude
+        metadata is unavailable. Callers fail fast in that case whenever the
+        cyclic longitude encoding is enabled.
+        """
+        lon = getattr(getattr(pred, "metadata", None), "lon", None)
+        if lon is None:
+            return None
+        try:
+            lon_t = torch.as_tensor(lon, dtype=torch.float64).reshape(-1)
+        except Exception:
+            return None
+        if lon_t.numel() == 0:
+            return None
+        return lon_t
 
     # --- Convenience --------------------------------------------------------
 

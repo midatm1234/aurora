@@ -21,6 +21,50 @@ Variable dims expected:
 - Atmospheric predictors/targets: `(time, level, latitude, longitude)`
 - Static fields: `(latitude, longitude)` (or singleton extra dims indexed via `data.extra_dim_indexers`)
 
+### Periodic longitude contract
+
+The fine-tuning pipeline accepts either longitude convention at its file
+boundary, then reorders every coordinate and data variable to one internal
+sorted `[0, 360)` grid. A duplicated cyclic endpoint (`0/360` or `-180/180`)
+is removed. Training, validation, and inference grids are checked for equality.
+
+For a complete global grid, Flow Matching, ConvRefine, and the Mamba spatial
+encoder use circular longitude padding and non-periodic latitude padding. The
+Flow UNet also uses cyclic down/up-sampling, and its spatial-gradient objective
+includes the last-to-first longitude edge. Regional domains keep ordinary edge
+padding. Configure this explicitly or let the actual grid decide:
+
+```yaml
+model:
+  lon_periodic: auto                 # auto | true | false
+  flow_refine_lon_encoding: false    # optional sin(lon), cos(lon) channels
+```
+
+Raw longitude is never passed to the Flow head. If absolute longitude
+conditioning is enabled, it uses only `sin(lon)` and `cos(lon)`. Because this
+changes the first Flow layer's input width, use the same setting when resuming
+or loading a checkpoint.
+
+Checkpoints created before `lon_periodic_resolved` was persisted are rejected
+for global/periodic runs: their replicate-edge weights cannot be assumed to
+have periodic training semantics. Legacy regional checkpoints remain valid
+when the current run is also non-periodic and longitude encoding is disabled,
+because that path is numerically unchanged. Start a new periodic fine-tune
+(disable legacy resume) once; subsequent resume/inference runs validate the
+saved padding mode and grid fingerprint.
+
+Global longitude must not be cropped to satisfy patch sizing. The loader fails
+with a clear message if the complete width is incompatible, rather than joining
+two non-neighbouring columns. NetCDF output is CF-labelled, strictly increasing,
+and never stores both 0 and 360. Plotting adds a duplicate cyclic column only in
+memory, only for a detected global grid.
+
+To report the stored field's wrap jump and nearby residual gradients:
+
+```bash
+python finetune/diagnose_longitude.py outputs/<case>/rollout_predictions.nc
+```
+
 ## Predictor/Target Mapping
 
 Use:
@@ -165,6 +209,9 @@ data:
 ```
 
 The helper layer converts longitudes to `[0, 360)`, subsets the region, and preserves regional coordinates in rollout NetCDF outputs.
+Intervals that cross the canonical wrap are rejected rather than reordered into
+a disconnected regional image; split/regrid such a domain to a non-wrapping
+interval before fine-tuning.
 
 ## Notebook Usage
 

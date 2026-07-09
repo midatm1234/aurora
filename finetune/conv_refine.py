@@ -7,7 +7,7 @@ pixel resolution, smoothing patch boundaries while preserving learned structure.
 
 Inspired by the Prithvi WxC / Granite-WxC CORDEX fine-tuning approach
 (``ClimateDownscaleFinetuneUNETModel``) which uses:
-  - Conv layers with ``padding_mode='replicate'`` (no edge artifacts)
+  - Conv layers with periodic/replicate padding (no edge artifacts)
   - PReLU / LeakyReLU activations
   - Skip connections from static covariates
 
@@ -17,7 +17,11 @@ Architecture per variable (residual refinement, no spatial rescaling):
          │                                                                              │
          └──────────────────────────── residual skip ──────────────────────────────────┘
 
-* ``padding_mode='replicate'`` on all convolutions to avoid edge artifacts.
+* Convolutions use :class:`~finetune.longitude.PeriodicConv2d`: longitude (``W``)
+  is padded **circularly** on a periodic (global) domain so the correction is
+  continuous across the 0°/360° dateline, while latitude (``H``) uses replicate
+  padding (the poles are not periodic). On a regional domain
+  (``lon_periodic=False``) this is identical to ``padding_mode='replicate'``.
 * Kernel sizes 7→5→3→1 ensure the first layer spans 2+ patch boundaries
   (for patch_size=3).
 * The final conv is zero-initialized so the wrapper is identity at init
@@ -35,22 +39,30 @@ import torch
 import torch.nn as nn
 
 from aurora.batch import Batch
+from finetune.longitude import PeriodicConv2d
 
 
 class ConvRefineBlock(nn.Module):
     """Residual convolutional refinement for a single 2-D field.
 
-    Follows the Prithvi WxC conv patterns: replicate padding, PReLU activations.
+    Follows the Prithvi WxC conv patterns (PReLU activations) but pads longitude
+    circularly on periodic domains so no seam is introduced at the dateline.
+
+    Args:
+        hidden: Number of hidden channels.
+        lon_periodic: Treat longitude (``W``) as periodic (circular padding).
+            ``False`` reproduces the previous replicate-padding behaviour.
     """
 
-    def __init__(self, hidden: int = 32) -> None:
+    def __init__(self, hidden: int = 32, lon_periodic: bool = True) -> None:
         super().__init__()
+        self.lon_periodic = bool(lon_periodic)
         self.net = nn.Sequential(
-            nn.Conv2d(1, hidden, kernel_size=7, padding=3, padding_mode="replicate"),
+            PeriodicConv2d(1, hidden, kernel_size=7, lon_periodic=lon_periodic),
             nn.PReLU(num_parameters=hidden),
-            nn.Conv2d(hidden, hidden, kernel_size=5, padding=2, padding_mode="replicate"),
+            PeriodicConv2d(hidden, hidden, kernel_size=5, lon_periodic=lon_periodic),
             nn.PReLU(num_parameters=hidden),
-            nn.Conv2d(hidden, hidden, kernel_size=3, padding=1, padding_mode="replicate"),
+            PeriodicConv2d(hidden, hidden, kernel_size=3, lon_periodic=lon_periodic),
             nn.PReLU(num_parameters=hidden),
             nn.Conv2d(hidden, 1, kernel_size=1),
         )
@@ -103,17 +115,25 @@ class AuroraConvRefine(nn.Module):
         target_surf_vars: tuple[str, ...] = (),
         target_atmos_vars: tuple[str, ...] = (),
         hidden: int = 32,
+        lon_periodic: bool = True,
     ) -> None:
         super().__init__()
         self.base = base
         self.target_surf_vars = set(target_surf_vars)
         self.target_atmos_vars = set(target_atmos_vars)
+        self.lon_periodic = bool(lon_periodic)
 
         self.surf_refine = nn.ModuleDict(
-            {name: ConvRefineBlock(hidden=hidden) for name in target_surf_vars}
+            {
+                name: ConvRefineBlock(hidden=hidden, lon_periodic=lon_periodic)
+                for name in target_surf_vars
+            }
         )
         self.atmos_refine = nn.ModuleDict(
-            {name: ConvRefineBlock(hidden=hidden) for name in target_atmos_vars}
+            {
+                name: ConvRefineBlock(hidden=hidden, lon_periodic=lon_periodic)
+                for name in target_atmos_vars
+            }
         )
 
     # --- Delegate common Aurora attributes to the base model ---

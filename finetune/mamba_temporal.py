@@ -41,6 +41,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from finetune.longitude import PeriodicConv2d
+
 __all__ = ["MambaTemporalModule", "SelectiveSSM", "MambaBlock"]
 
 
@@ -206,12 +208,16 @@ class _VarTemporalHead(nn.Module):
         n_layers: int = 2,
         d_conv: int = 3,
         expand: int = 2,
+        lon_periodic: bool = True,
     ) -> None:
         super().__init__()
         self.channels = int(channels)
-        # Spatial encoder: 1 frame channel -> C features (3x3 context).
+        self.lon_periodic = bool(lon_periodic)
+        # Spatial encoder: 1 frame channel -> C features (3x3 context). Longitude
+        # is padded circularly on a periodic (global) domain so the temporal
+        # correction does not inherit a seam at the 0°/360° dateline.
         self.encoder = nn.Sequential(
-            nn.Conv2d(1, self.channels, 3, padding=1, padding_mode="replicate"),
+            PeriodicConv2d(1, self.channels, 3, lon_periodic=lon_periodic),
             nn.GroupNorm(min(8, self.channels), self.channels),
             nn.SiLU(),
         )
@@ -264,11 +270,13 @@ class MambaTemporalModule(nn.Module):
         n_layers: int = 2,
         d_conv: int = 3,
         expand: int = 2,
+        lon_periodic: bool = True,
     ) -> None:
         super().__init__()
+        self.lon_periodic = bool(lon_periodic)
         head_kwargs = dict(
             channels=channels, d_state=d_state, n_layers=n_layers,
-            d_conv=d_conv, expand=expand,
+            d_conv=d_conv, expand=expand, lon_periodic=lon_periodic,
         )
         self.surf_heads = nn.ModuleDict(
             {n: _VarTemporalHead(**head_kwargs) for n in surf_vars}

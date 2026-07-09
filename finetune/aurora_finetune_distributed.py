@@ -196,6 +196,18 @@ def _worker(rank: int, world_size: int, local_gpu: int, cfg: dict):
     val_ds = None if skip_validation else ft.open_dataset(cfg["paths"]["val_data_path"], cfg)
     test_ds = ft.open_dataset(cfg["paths"]["test_data_path"], cfg)
 
+    longitude_datasets = [train_ds, test_ds]
+    if val_ds is not None:
+        longitude_datasets.insert(1, val_ds)
+    lon_periodic = ft.validate_longitude_consistency(longitude_datasets, cfg)
+    lon_dim = str(cfg.get("data", {}).get("lon_dim", "longitude"))
+    train_lon = train_ds[lon_dim].values
+    _print0(
+        rank,
+        f"Longitude grid: {len(train_lon)} columns | periodic={lon_periodic} | "
+        f"range=[{float(train_lon[0]):.6g}, {float(train_lon[-1]):.6g}]",
+    )
+
     static_path = cfg["paths"].get("static_data_path", "")
     if static_path:
         train_ds = ft.merge_external_static_vars(train_ds, static_path, cfg)
@@ -245,11 +257,11 @@ def _worker(rank: int, world_size: int, local_gpu: int, cfg: dict):
         model.configure_activation_checkpointing()
 
     # Optionally wrap with convolutional refinement heads.
-    model = ft.maybe_wrap_conv_refine(model, cfg, resolved_specs)
+    model = ft.maybe_wrap_conv_refine(model, cfg, resolved_specs, lon=train_lon)
 
     # Optionally wrap with rectified-flow residual refine heads. Mutually
     # exclusive with conv-refine (the helper checks the flag itself).
-    model = ft.maybe_wrap_flow_refine(model, cfg, resolved_specs)
+    model = ft.maybe_wrap_flow_refine(model, cfg, resolved_specs, lon=train_lon)
     # If the flow wrapper is in use, hand it the per-variable normalisation
     # stats so its de-normalisation step at inference time matches the
     # space the FM head was trained in.
@@ -484,6 +496,7 @@ def _worker(rank: int, world_size: int, local_gpu: int, cfg: dict):
     if resume_path and resume_path.exists():
         _print0(rank, f"Resuming from checkpoint: {resume_path}")
         ckpt = torch.load(str(resume_path), map_location=device, weights_only=False)
+        ft.validate_checkpoint_longitude(model, ckpt)
         # Tolerant load so checkpoints from flow-matching-only runs (which lack
         # the Mamba temporal parameters) resume cleanly into a temporal-enabled
         # model, and vice-versa. Missing keys keep their fresh init; unexpected
@@ -792,6 +805,7 @@ def _worker(rank: int, world_size: int, local_gpu: int, cfg: dict):
         if bool(rollout_cfg.get("run_rollout_after_training", True)):
             if last_ckpt_path.exists():
                 state = torch.load(str(last_ckpt_path), map_location=device, weights_only=False)
+                ft.validate_checkpoint_longitude(model, state)
                 model.load_state_dict(state["model_state_dict"])
 
             input_steps = int(cfg["data"].get("input_time_steps", 2))
@@ -811,7 +825,13 @@ def _worker(rank: int, world_size: int, local_gpu: int, cfg: dict):
             if predictions and bool(rollout_cfg.get("save_predictions_to_netcdf", True)):
                 # Convert bf16 predictions to float32 for numpy/netCDF compatibility.
                 predictions = [p.type(torch.float32) for p in predictions]
-                ft.save_predictions(predictions, rollout_path, save_netcdf=True, resolved_specs=resolved_specs)
+                ft.save_predictions(
+                    predictions, rollout_path, save_netcdf=True,
+                    resolved_specs=resolved_specs,
+                    smooth_sigma=float(rollout_cfg.get("smooth_sigma", 0.0)),
+                    patch_size=int(model_cfg.get("patch_size", 3)),
+                    lon_periodic=lon_periodic,
+                )
                 print(f"Saved rollout NetCDF: {rollout_path}")
 
         ft.write_run_manifest(

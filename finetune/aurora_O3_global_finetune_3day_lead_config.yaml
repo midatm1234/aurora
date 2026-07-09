@@ -203,6 +203,9 @@ data:
 model:
   model_variant: aurora_air_pollution
   patch_size: 3  # AuroraAirPollution uses patch_size=3.
+  # Resolve from the canonical training grid. Global grids use circular
+  # longitude padding; regional grids retain non-periodic edge padding.
+  lon_periodic: auto
   use_pretrained_weights: true
   backbone_freeze: true
   freeze_embeddings: true
@@ -223,6 +226,10 @@ model:
   flow_refine_enabled: true
   flow_refine_hidden: 16           # Global full-resolution training needs a small UNet width to fit one H100.
   flow_refine_time_dim: 128        # sinusoidal time embedding dim
+  # Optional absolute-position conditioning. When enabled, the Flow head gets
+  # sin(lon)/cos(lon), never raw longitude. Enabling changes checkpoint input
+  # channels, so leave false when resuming a checkpoint trained without it.
+  flow_refine_lon_encoding: false
   flow_refine_sampling_steps: 1    # Phase-1 (early epochs): deterministic regression.
   # Progressive sampling-steps schedule. After the first
   # `flow_refine_phase_fraction` of training (default 1/3) the eval-time
@@ -259,7 +266,7 @@ model:
 training:
   seed: 42
   batch_size: 1  # Global domain + 6 leads + FM head needs per-GPU bs=1; use accumulation for effective batch.
-  num_epochs: 50  # fresh finetune at target_lead_times=[1,2,3,4,5,6] from a clean random init of the FM head
+  num_epochs: 100  # fresh finetune at target_lead_times=[1,2,3,4,5,6] from a clean random init of the FM head
   # Fresh stage-1 fine-tune over target_lead_times=[1,2,3,4,5,6] from a clean
   # random init of the FM head, trained jointly at the standard 3e-4 UNet
   # LR so the head learns the multi-lead residual across all leads at once.
@@ -311,7 +318,9 @@ training:
   skip_validation: true
   save_best_only: true
   save_last: true
-  resume_training: true
+  # Start one fresh run after the periodic-longitude architecture change;
+  # legacy replicate-edge Flow checkpoints are intentionally rejected.
+  resume_training: false
   resume_from: "last"  # "best", "last", or a path to a .ckpt file. Empty = no resume.
   resume_skip_scheduler: true  # only relevant when resume_training=true
   # MSE for warmup-stage fine-tuning: gradient ∝ (pred-tgt)/std² shrinks as

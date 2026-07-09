@@ -37,6 +37,7 @@ __all__ = [
     "load_config",
     "set_seed",
     "open_dataset",
+    "validate_longitude_consistency",
     "merge_external_static_vars",
     "resolve_variable_specs",
     "derive_model_variable_config",
@@ -52,6 +53,7 @@ __all__ = [
     "run_rollout",
     "save_checkpoint",
     "load_checkpoint_if_available",
+    "validate_checkpoint_longitude",
     "write_training_history",
     "write_run_manifest",
     "save_predictions",
@@ -113,6 +115,38 @@ def _to_python_datetime(value: Any) -> datetime:
     return np.datetime64(value, "s").tolist()
 
 
+def _canonicalize_longitude_coordinate(ds: xr.Dataset, lon_dim: str) -> xr.Dataset:
+    """Wrap, sort, and de-duplicate a 1-D longitude coordinate and its data.
+
+    All fine-tuning stages use ``[0, 360)`` internally because
+    :class:`aurora.batch.Metadata` requires that convention. The source may use
+    either common Earth convention; reindexing the dataset here keeps every
+    predictor/target/static field aligned with the canonical coordinate.
+    """
+    from finetune.longitude import canonical_longitudes
+
+    coord = ds[lon_dim]
+    if coord.ndim != 1 or coord.dims != (lon_dim,):
+        raise ValueError(
+            f"Longitude `{lon_dim}` must be a 1-D coordinate on its own dimension; "
+            f"got dims {coord.dims}."
+        )
+    canonical, source_indices = canonical_longitudes(coord.values)
+    attrs = dict(coord.attrs)
+    attrs.update(
+        {
+            "standard_name": "longitude",
+            "long_name": "longitude",
+            "units": "degrees_east",
+            "axis": "X",
+        }
+    )
+    ds = ds.isel({lon_dim: source_indices})
+    return ds.assign_coords(
+        {lon_dim: xr.DataArray(canonical, dims=(lon_dim,), attrs=attrs)}
+    )
+
+
 def _ensure_monotonic_lat_lon(ds: xr.Dataset, lat_dim: str, lon_dim: str) -> xr.Dataset:
     if ds[lat_dim].ndim != 1 or ds[lon_dim].ndim != 1:
         raise ValueError(
@@ -128,17 +162,7 @@ def _ensure_monotonic_lat_lon(ds: xr.Dataset, lat_dim: str, lon_dim: str) -> xr.
         ds = ds.sortby(lat_dim, ascending=False)
 
     # Aurora metadata requires longitudes in [0, 360) and strictly increasing.
-    lon_values = np.asarray(ds[lon_dim].values, dtype=np.float64)
-    lon_values = np.mod(lon_values, 360.0)
-    order = np.argsort(lon_values)
-    lon_sorted = lon_values[order]
-    ds = ds.isel({lon_dim: order}).assign_coords({lon_dim: lon_sorted})
-
-    # Drop any duplicate longitudes that may arise after modulo conversion.
-    rounded = np.round(lon_sorted, 8)
-    unique_values, unique_indices = np.unique(rounded, return_index=True)
-    if unique_values.size != lon_sorted.size:
-        ds = ds.isel({lon_dim: np.sort(unique_indices)})
+    ds = _canonicalize_longitude_coordinate(ds, lon_dim)
 
     lat_values = np.asarray(ds[lat_dim].values)
     lon_values = np.asarray(ds[lon_dim].values)
@@ -326,9 +350,10 @@ def open_dataset(path: str | Path, config: dict[str, Any]) -> xr.Dataset:
 
     time_dim, lat_dim, lon_dim, _ = _dim_names(config)
     for required_dim in (time_dim, lat_dim, lon_dim):
-        if required_dim not in ds.coords and required_dim not in ds.dims:
+        if required_dim not in ds.coords:
             raise ValueError(
-                f"Dataset {path} is missing required coordinate/dimension `{required_dim}`."
+                f"Dataset {path} is missing required coordinate `{required_dim}`. "
+                "Implicit integer dimensions cannot be interpreted as Earth coordinates."
             )
 
     ds = _ensure_monotonic_lat_lon(ds, lat_dim=lat_dim, lon_dim=lon_dim)
@@ -336,6 +361,57 @@ def open_dataset(path: str | Path, config: dict[str, Any]) -> xr.Dataset:
     ds = _ensure_monotonic_lat_lon(ds, lat_dim=lat_dim, lon_dim=lon_dim)
 
     return ds
+
+
+def validate_longitude_consistency(
+    datasets: Sequence[xr.Dataset],
+    config: dict[str, Any],
+) -> bool:
+    """Validate one canonical longitude grid across train/validation/inference.
+
+    Returns the single resolved periodicity value that must be used to build
+    refinement heads and write their outputs.
+    """
+    if not datasets:
+        raise ValueError("At least one dataset is required for longitude validation.")
+    from finetune.longitude import (
+        longitude_grid_signature,
+        longitude_is_periodic,
+        resolve_lon_periodic,
+    )
+
+    _, _, lon_dim, _ = _dim_names(config)
+    grids = [np.asarray(ds[lon_dim].values, dtype=np.float64) for ds in datasets]
+    reference = grids[0]
+    reference_signature = longitude_grid_signature(reference)
+    for index, grid in enumerate(grids[1:], start=1):
+        if grid.shape != reference.shape or longitude_grid_signature(
+            grid
+        ) != reference_signature:
+            raise ValueError(
+                "Training, validation, and inference datasets must use the same canonical "
+                f"longitude grid; dataset 0 has shape {reference.shape}, dataset {index} "
+                f"has shape {grid.shape}."
+            )
+
+    detected = longitude_is_periodic(reference)
+    resolved = resolve_lon_periodic(config, reference)
+    if resolved and not detected:
+        raise ValueError(
+            "Periodic longitude was requested, but the canonical coordinate does not cover "
+            "a complete, uniformly spaced 360-degree grid. Refusing to join unrelated edges."
+        )
+    domain = str(config.get("data", {}).get("domain_type", "global")).strip().lower()
+    requested = str(config.get("model", {}).get("lon_periodic", "auto")).strip().lower()
+    if domain == "global" and requested == "auto" and not detected:
+        raise ValueError(
+            "data.domain_type is global, but the longitude grid is incomplete. Do not crop "
+            "longitude from a global training grid."
+        )
+    model_cfg = config.setdefault("model", {})
+    model_cfg["lon_periodic_resolved"] = bool(resolved)
+    model_cfg["longitude_grid_signature"] = reference_signature
+    return bool(resolved)
 
 
 def merge_external_static_vars(
@@ -767,6 +843,7 @@ def _align_spatial_dims_for_patch(
     patch_size: int,
     *,
     strategy: str,
+    lon_periodic: bool = False,
 ) -> tuple[
     dict[str, torch.Tensor],
     dict[str, torch.Tensor],
@@ -794,6 +871,13 @@ def _align_spatial_dims_for_patch(
         raise ValueError(
             f"Unsupported data.patch_alignment_strategy={strategy!r}. Currently only `crop` is "
             "implemented."
+        )
+
+    if lon_periodic and target_w != w:
+        raise ValueError(
+            f"Global longitude width {w} is not divisible by patch_size={patch_size}. "
+            "Cropping longitude would remove part of the periodic Earth grid; regrid the "
+            "source to a compatible global width instead."
         )
 
     surf_vars = {k: v[..., :target_h, :target_w] for k, v in surf_vars.items()}
@@ -912,6 +996,11 @@ def build_aurora_batch(
     model_cfg = config.get("model", {})
     patch_size = int(model_cfg.get("patch_size", 4))
     alignment_strategy = str(config.get("data", {}).get("patch_alignment_strategy", "crop"))
+    from finetune.longitude import longitude_is_periodic
+
+    # Preserve the actual global grid even when circular padding is explicitly
+    # disabled for an ablation; model semantics must not permit data loss.
+    lon_periodic = longitude_is_periodic(ds[lon_dim].values)
 
     surf_vars_stacked: dict[str, list[torch.Tensor]] = {}
     atmos_vars_stacked: dict[str, list[torch.Tensor]] = {}
@@ -940,8 +1029,10 @@ def build_aurora_batch(
                 config=config,
             )
 
-        lat = torch.from_numpy(np.asarray(ds[lat_dim].values, dtype=np.float32))
-        lon = torch.from_numpy(np.asarray(ds[lon_dim].values, dtype=np.float32))
+        # Keep coordinate precision in metadata / NetCDF output. Aurora's
+        # encoder performs its own float32 cast for positional calculations.
+        lat = torch.from_numpy(np.asarray(ds[lat_dim].values, dtype=np.float64))
+        lon = torch.from_numpy(np.asarray(ds[lon_dim].values, dtype=np.float64))
 
         surf_single, static_single, atmos_single, lat, lon, _ = _align_spatial_dims_for_patch(
             surf_vars=surf_single,
@@ -951,6 +1042,7 @@ def build_aurora_batch(
             lon=lon,
             patch_size=patch_size,
             strategy=alignment_strategy,
+            lon_periodic=lon_periodic,
         )
 
         if static_vars_ref is None:
@@ -1017,6 +1109,10 @@ def build_targets(
     sample_list = _sample_list(samples)
     patch_size = int(config.get("model", {}).get("patch_size", 4))
     alignment_strategy = str(config.get("data", {}).get("patch_alignment_strategy", "crop"))
+    _, _, lon_dim, _ = _dim_names(config)
+    from finetune.longitude import longitude_is_periodic
+
+    lon_periodic = longitude_is_periodic(ds[lon_dim].values)
 
     target_by_lead: dict[int, dict[str, list[torch.Tensor]]] = {}
 
@@ -1046,6 +1142,7 @@ def build_targets(
                         lon=torch.arange(tensor.shape[-1], dtype=tensor.dtype),
                         patch_size=patch_size,
                         strategy=alignment_strategy,
+                        lon_periodic=lon_periodic,
                     )
                     tensor = surf["tmp"][0, 0]
                 elif spec.kind == "atmos":
@@ -1072,6 +1169,7 @@ def build_targets(
                         lon=torch.arange(tensor.shape[-1], dtype=tensor.dtype),
                         patch_size=patch_size,
                         strategy=alignment_strategy,
+                        lon_periodic=lon_periodic,
                     )
                     tensor = atmos["tmp_atmos"][0, 0]
 
@@ -1569,12 +1667,20 @@ def compute_supervised_loss(
                     flow_doy = _AFR._doy_from_metadata(pred)
                     if flow_doy is not None:
                         flow_doy = flow_doy.to(device)
+                # Longitude vector for the cyclic ``lon_encoding`` input. Built
+                # only when the feature is on so training matches inference.
+                flow_lon = None
+                if getattr(base_for_fm, "lon_encoding", False):
+                    flow_lon = _AFR._lon_from_metadata(pred)
+                    if flow_lon is not None:
+                        flow_lon = flow_lon.to(device)
                 masked = base_for_fm.flow_loss(
                     pred_norm=pred_tensor,
                     target_norm=target_tensor,
                     var_name=aurora_name,
                     kind=target_spec.kind,
                     doy=flow_doy,
+                    lon=flow_lon,
                 )
                 # Cache normalised tensors for the coherence term (computed
                 # once per lead after this inner loop).
@@ -1584,6 +1690,7 @@ def compute_supervised_loss(
                         "target": target_tensor,
                         "kind": target_spec.kind,
                         "levels": var_levels,
+                        "lon": flow_lon,
                     }
                 # Collect the per-lead normalised (base) prediction and target
                 # so the Mamba temporal module can be trained on the ordered
@@ -1591,7 +1698,12 @@ def compute_supervised_loss(
                 if temporal_weight > 0.0 and getattr(base_for_fm, "has_temporal", False):
                     slot = temporal_seq.setdefault(
                         aurora_name,
-                        {"kind": target_spec.kind, "preds": [], "targets": []},
+                        {
+                            "kind": target_spec.kind,
+                            "preds": [],
+                            "targets": [],
+                            "lon": flow_lon,
+                        },
                     )
                     slot["preds"].append(pred_tensor)
                     slot["targets"].append(target_tensor)
@@ -1649,6 +1761,7 @@ def compute_supervised_loss(
                     level_pressures=prof["levels"] or [],
                     profile_var=prof_name,
                     column_var=col_name,
+                    lon=prof.get("lon"),
                 )
                 total_loss = total_loss + coherence_weight * coh
                 total_weight += coherence_weight
@@ -1667,12 +1780,15 @@ def compute_supervised_loss(
                 preds = slot["preds"]
                 tgts = slot["targets"]
                 kind = slot["kind"]
+                flow_lon = slot.get("lon")
                 if len(preds) < 2:
                     # A temporal model needs at least two ordered steps.
                     continue
                 with torch.no_grad():
                     flow_frames = [
-                        base_for_fm.refine_norm_deterministic(p, aurora_name, kind).detach()
+                        base_for_fm.refine_norm_deterministic(
+                            p, aurora_name, kind, lon=flow_lon,
+                        ).detach()
                         for p in preds
                     ]
                 seq = torch.stack(flow_frames, dim=1)             # (B,S,[L,]H,W)
@@ -1703,6 +1819,7 @@ def maybe_wrap_conv_refine(
     model: torch.nn.Module,
     config: dict[str, Any],
     resolved_specs: ResolvedVariableSpecs,
+    lon: Any | None = None,
 ) -> torch.nn.Module:
     """Optionally wrap *model* with convolutional refinement heads.
 
@@ -1718,6 +1835,7 @@ def maybe_wrap_conv_refine(
         return model
 
     from finetune.conv_refine import AuroraConvRefine
+    from finetune.longitude import longitude_grid_signature, resolve_lon_periodic
 
     target_surf = tuple(
         spec.aurora_name for spec in resolved_specs.targets if spec.kind == "surf"
@@ -1726,13 +1844,21 @@ def maybe_wrap_conv_refine(
         spec.aurora_name for spec in resolved_specs.targets if spec.kind == "atmos"
     )
     hidden = int(model_cfg.get("conv_refine_hidden", 32))
+    # Treat longitude as periodic on global domains so the conv correction has
+    # no seam at the 0°/360° dateline (regional domains keep replicate padding).
+    lon_periodic = resolve_lon_periodic(config, lon)
+    model_cfg["lon_periodic_resolved"] = lon_periodic
+    if lon is not None:
+        model_cfg["longitude_grid_signature"] = longitude_grid_signature(lon)
 
     wrapper = AuroraConvRefine(
         base=model,
         target_surf_vars=target_surf,
         target_atmos_vars=target_atmos,
         hidden=hidden,
+        lon_periodic=lon_periodic,
     )
+    wrapper.longitude_grid_signature = model_cfg.get("longitude_grid_signature")
     return wrapper
 
 
@@ -1740,6 +1866,7 @@ def maybe_wrap_flow_refine(
     model: torch.nn.Module,
     config: dict[str, Any],
     resolved_specs: ResolvedVariableSpecs,
+    lon: Any | None = None,
 ) -> torch.nn.Module:
     """Optionally wrap *model* with rectified-flow residual refine heads.
 
@@ -1754,6 +1881,7 @@ def maybe_wrap_flow_refine(
         return model
 
     from finetune.flow_refine import AuroraFlowRefine
+    from finetune.longitude import longitude_grid_signature, resolve_lon_periodic
 
     target_surf = tuple(
         spec.aurora_name for spec in resolved_specs.targets if spec.kind == "surf"
@@ -1767,6 +1895,15 @@ def maybe_wrap_flow_refine(
     doy_cond = bool(model_cfg.get("flow_refine_doy_cond", False))
     residual_zscore = bool(model_cfg.get("flow_refine_residual_zscore", False))
     res_std_momentum = float(model_cfg.get("flow_refine_res_std_momentum", 0.99))
+    # Longitude periodicity: circular conv padding on global domains (no seam at
+    # the dateline). ``flow_refine_lon_encoding`` additionally feeds smooth
+    # sin/cos-longitude channels as UNet inputs (opt-in; default off to keep the
+    # input-channel count and existing checkpoints unchanged).
+    lon_periodic = resolve_lon_periodic(config, lon)
+    model_cfg["lon_periodic_resolved"] = lon_periodic
+    if lon is not None:
+        model_cfg["longitude_grid_signature"] = longitude_grid_signature(lon)
+    lon_encoding = bool(model_cfg.get("flow_refine_lon_encoding", False))
 
     # Mamba temporal module (optional; default off → backward compatible).
     temporal_enabled = bool(model_cfg.get("mamba_temporal_enabled", False))
@@ -1800,6 +1937,8 @@ def maybe_wrap_flow_refine(
         doy_cond=doy_cond,
         residual_zscore=residual_zscore,
         res_std_momentum=res_std_momentum,
+        lon_periodic=lon_periodic,
+        lon_encoding=lon_encoding,
         temporal_enabled=temporal_enabled,
         temporal_channels=temporal_channels,
         temporal_state=temporal_state,
@@ -1807,6 +1946,7 @@ def maybe_wrap_flow_refine(
         temporal_conv=temporal_conv,
         temporal_expand=temporal_expand,
     )
+    wrapper.longitude_grid_signature = model_cfg.get("longitude_grid_signature")
 
     # Structural auxiliary-loss weights (extreme-event, spatial-pattern,
     # distributional, vertical-profile, column/profile coherence). Read from
@@ -2278,6 +2418,74 @@ def save_checkpoint(
     torch.save(payload, str(path))
 
 
+def validate_checkpoint_longitude(
+    model: torch.nn.Module,
+    checkpoint: dict[str, Any],
+) -> None:
+    """Refuse to silently change longitude semantics when loading weights.
+
+    Circular padding is architectural behavior but has no learnable tensor, so
+    it is not represented by ordinary convolution state dictionaries. The
+    resolved training value is therefore persisted in the checkpoint config
+    and compared with the constructed inference/resume model here.
+    """
+    inner = model.module if hasattr(model, "module") else model
+    if not hasattr(inner, "lon_periodic"):
+        return
+
+    checkpoint_cfg = checkpoint.get("config")
+    if not isinstance(checkpoint_cfg, dict):
+        raise ValueError(
+            "Checkpoint has no saved config, so longitude padding semantics cannot be "
+            "verified. Use a checkpoint produced by the periodic-longitude pipeline."
+        )
+    checkpoint_model_cfg = checkpoint_cfg.get("model", {})
+    current_periodic = bool(getattr(inner, "lon_periodic"))
+    current_encoding = bool(getattr(inner, "lon_encoding", False))
+    saved_periodic = checkpoint_model_cfg.get("lon_periodic_resolved")
+    if not isinstance(saved_periodic, bool):
+        # Before this field was persisted, every refinement head used replicate
+        # longitude padding and no cyclic coordinate channels. That is exactly
+        # the current non-periodic architecture (including state-dict keys), so
+        # regional legacy checkpoints remain safe. They must never be promoted
+        # to a periodic/global model merely because the tensor shapes happen to
+        # load successfully.
+        if current_periodic or current_encoding:
+            raise ValueError(
+                "Legacy checkpoint has no model.lon_periodic_resolved value. Its weights "
+                "were trained with non-periodic longitude edges and cannot be loaded into "
+                "a periodic or longitude-encoded model. Retrain/fine-tune with this "
+                "pipeline to create a longitude-aware checkpoint."
+            )
+        saved_periodic = False
+    if bool(saved_periodic) != current_periodic:
+        raise ValueError(
+            "Checkpoint longitude mismatch: training used "
+            f"lon_periodic={bool(saved_periodic)}, but the current model uses "
+            f"lon_periodic={current_periodic}. Use the checkpoint's data/model convention."
+        )
+
+    saved_encoding = bool(checkpoint_model_cfg.get("flow_refine_lon_encoding", False))
+    if saved_encoding != current_encoding:
+        raise ValueError(
+            "Checkpoint longitude-feature mismatch: training used "
+            f"flow_refine_lon_encoding={saved_encoding}, but the current model uses "
+            f"{current_encoding}."
+        )
+
+    saved_signature = checkpoint_model_cfg.get("longitude_grid_signature")
+    current_signature = getattr(inner, "longitude_grid_signature", None)
+    if (
+        isinstance(saved_signature, str)
+        and isinstance(current_signature, str)
+        and saved_signature != current_signature
+    ):
+        raise ValueError(
+            "Checkpoint longitude-grid mismatch: inference coordinates differ from the "
+            "canonical grid used for training."
+        )
+
+
 def load_checkpoint_if_available(
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
@@ -2298,6 +2506,7 @@ def load_checkpoint_if_available(
         map_location=torch.device(device),
         weights_only=False,
     )
+    validate_checkpoint_longitude(model, checkpoint)
     model.load_state_dict(checkpoint["model_state_dict"])
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
 
@@ -2359,7 +2568,9 @@ def write_run_manifest(
     return str(path.resolve())
 
 
-def _smooth_patch_artifacts(arr: np.ndarray, sigma: float, patch_size: int) -> np.ndarray:
+def _smooth_patch_artifacts(
+    arr: np.ndarray, sigma: float, patch_size: int, lon_periodic: bool = False,
+) -> np.ndarray:
     """Apply Gaussian smoothing to remove patch-boundary artifacts.
 
     Works on 2-D (H, W) or higher-dimensional arrays by smoothing the last
@@ -2370,6 +2581,11 @@ def _smooth_patch_artifacts(arr: np.ndarray, sigma: float, patch_size: int) -> n
     The smoothing preserves the overall magnitude and spatial structure while
     blending the sharp patch-boundary discontinuities produced by the ViT
     decoder's ``unpatchify`` operation.
+
+    When ``lon_periodic`` the longitude axis (last) is smoothed with a *wrap*
+    boundary so no seam is introduced at the 0°/360° dateline; latitude (the
+    poles) always uses the non-periodic boundary. With ``lon_periodic=False``
+    the behaviour is identical to the previous replicate/reflect smoothing.
     """
     if sigma <= 0:
         return arr
@@ -2379,7 +2595,12 @@ def _smooth_patch_artifacts(arr: np.ndarray, sigma: float, patch_size: int) -> n
 
         # Smooth only the last two (lat, lon) dimensions.
         axes = tuple(range(arr.ndim - 2, arr.ndim))  # e.g. (-2, -1)
-        return gaussian_filter(arr.astype(np.float64), sigma=sigma, axes=axes).astype(arr.dtype)
+        # Per-axis boundary mode: latitude keeps the default 'reflect'; the
+        # longitude axis wraps when the domain is periodic.
+        mode = ["reflect", "wrap"] if lon_periodic else "reflect"
+        return gaussian_filter(
+            arr.astype(np.float64), sigma=sigma, axes=axes, mode=mode,
+        ).astype(arr.dtype)
     except ImportError:
         pass
 
@@ -2390,7 +2611,12 @@ def _smooth_patch_artifacts(arr: np.ndarray, sigma: float, patch_size: int) -> n
     pad = kernel_size // 2
 
     def _smooth_2d(img: np.ndarray) -> np.ndarray:
-        padded = np.pad(img, pad, mode="reflect")
+        if lon_periodic:
+            # Latitude reflect, longitude wrap (periodic across the dateline).
+            padded = np.pad(img, ((pad, pad), (0, 0)), mode="reflect")
+            padded = np.pad(padded, ((0, 0), (pad, pad)), mode="wrap")
+        else:
+            padded = np.pad(img, pad, mode="reflect")
         kernel = np.ones((kernel_size, kernel_size), dtype=np.float64) / (kernel_size**2)
         from numpy.lib.stride_tricks import sliding_window_view  # type: ignore[attr-defined]
 
@@ -2414,6 +2640,7 @@ def save_predictions(
     resolved_specs: "ResolvedVariableSpecs | None" = None,
     smooth_sigma: float = 0.0,
     patch_size: int = 3,
+    lon_periodic: bool | None = None,
 ) -> xr.Dataset:
     """Save rollout predictions to NetCDF using original dataset variable names.
 
@@ -2432,6 +2659,12 @@ def save_predictions(
     When *smooth_sigma* > 0, a Gaussian filter with this sigma (in grid cells)
     is applied to the spatial dimensions to remove patch-boundary artifacts
     from the ViT decoder.
+
+    Longitude is treated as periodic (wrap smoothing, no seam at the 0°/360°
+    dateline) when *lon_periodic* is true. ``None`` (default) auto-detects it
+    from the longitude grid, so global outputs are handled correctly without
+    extra configuration. A duplicated wrap column (both 0° and 360° present) is
+    dropped so the CF longitude coordinate is not degenerate.
     """
     if not predictions:
         raise ValueError("No predictions were provided to save_predictions.")
@@ -2457,8 +2690,62 @@ def save_predictions(
     first = predictions[0]
     # Use float64 for spatial coords to match CF / input data conventions.
     lat = np.asarray(first.metadata.lat.detach().cpu().numpy(), dtype=np.float64)
-    lon = np.asarray(first.metadata.lon.detach().cpu().numpy(), dtype=np.float64)
     levels = np.asarray(first.metadata.atmos_levels, dtype=np.float64)
+
+    # Canonicalise every step independently and retain its reindexer. This both
+    # removes a duplicated 0/360 endpoint and prevents values from being written
+    # under the wrong coordinate if one step arrives in a different convention.
+    from finetune.longitude import canonical_longitudes, longitude_is_periodic
+
+    lon_indices: list[np.ndarray] = []
+    lon: np.ndarray | None = None
+    for step, pred in enumerate(predictions):
+        step_lat = np.asarray(pred.metadata.lat.detach().cpu().numpy(), dtype=np.float64)
+        step_levels = np.asarray(pred.metadata.atmos_levels, dtype=np.float64)
+        if step_levels.shape != levels.shape or not np.allclose(
+            step_levels, levels, rtol=0.0, atol=1e-7,
+        ):
+            raise ValueError(f"Prediction step {step} uses different atmospheric levels.")
+        raw_step_lon = np.asarray(
+            pred.metadata.lon.detach().cpu().numpy(), dtype=np.float64,
+        )
+        for kind, variables in (
+            ("surface", pred.surf_vars),
+            ("atmospheric", pred.atmos_vars),
+        ):
+            for name, value in variables.items():
+                if value.shape[-2:] != (step_lat.size, raw_step_lon.size):
+                    raise ValueError(
+                        f"Prediction step {step} {kind} variable {name!r} has spatial "
+                        f"shape {tuple(value.shape[-2:])}, expected "
+                        f"{(step_lat.size, raw_step_lon.size)} from metadata."
+                    )
+                if kind == "atmospheric" and value.shape[-3] != step_levels.size:
+                    raise ValueError(
+                        f"Prediction step {step} atmospheric variable {name!r} has "
+                        f"{value.shape[-3]} levels, expected {step_levels.size}."
+                    )
+        step_lon, step_indices = canonical_longitudes(raw_step_lon)
+        if step_lat.shape != lat.shape or not np.allclose(
+            step_lat, lat, rtol=0.0, atol=1e-7,
+        ):
+            raise ValueError(f"Prediction step {step} uses a different latitude grid.")
+        if lon is None:
+            lon = step_lon
+        elif step_lon.shape != lon.shape or not np.allclose(
+            step_lon, lon, rtol=0.0, atol=1e-7,
+        ):
+            raise ValueError(f"Prediction step {step} uses a different longitude grid.")
+        lon_indices.append(step_indices)
+    assert lon is not None
+
+    coordinate_is_periodic = bool(longitude_is_periodic(lon))
+    if lon_periodic is None:
+        lon_periodic = coordinate_is_periodic
+    if lon_periodic and not coordinate_is_periodic:
+        raise ValueError(
+            "Cannot apply periodic output processing to an incomplete longitude coordinate."
+        )
 
     # Build a 1-D time coordinate from prediction metadata (first batch element).
     times = np.array(
@@ -2473,11 +2760,18 @@ def save_predictions(
             continue
         # pred.surf_vars[name] shape: (batch, 1, H, W) — take batch=0, history=0
         arr = np.stack(
-            [pred.surf_vars[var_name][0, 0].detach().cpu().float().numpy() for pred in predictions],
+            [
+                pred.surf_vars[var_name][0, 0].detach().cpu().float().numpy()[
+                    ..., lon_indices[step]
+                ]
+                for step, pred in enumerate(predictions)
+            ],
             axis=0,
         )  # (time, lat, lon)
         if smooth_sigma > 0:
-            arr = _smooth_patch_artifacts(arr, sigma=smooth_sigma, patch_size=patch_size)
+            arr = _smooth_patch_artifacts(
+                arr, sigma=smooth_sigma, patch_size=patch_size, lon_periodic=lon_periodic,
+            )
         out_name = surf_name_map.get(var_name, var_name)
         data_vars[out_name] = (("time", "latitude", "longitude"), arr)
 
@@ -2485,11 +2779,18 @@ def save_predictions(
         if target_aurora_names is not None and var_name not in target_aurora_names:
             continue
         arr = np.stack(
-            [pred.atmos_vars[var_name][0, 0].detach().cpu().float().numpy() for pred in predictions],
+            [
+                pred.atmos_vars[var_name][0, 0].detach().cpu().float().numpy()[
+                    ..., lon_indices[step]
+                ]
+                for step, pred in enumerate(predictions)
+            ],
             axis=0,
         )  # (time, level, lat, lon)
         if smooth_sigma > 0:
-            arr = _smooth_patch_artifacts(arr, sigma=smooth_sigma, patch_size=patch_size)
+            arr = _smooth_patch_artifacts(
+                arr, sigma=smooth_sigma, patch_size=patch_size, lon_periodic=lon_periodic,
+            )
         out_name = atmos_name_map.get(var_name, var_name)
         data_vars[out_name] = (("time", "level", "latitude", "longitude"), arr)
 
@@ -2502,6 +2803,42 @@ def save_predictions(
             "level": levels,
         },
     )
+
+    # CF-compliant coordinate metadata so downstream tools recognise the axes
+    # and (for longitude) the periodic wrap convention.
+    ds_out["latitude"].attrs.update(
+        {
+            "standard_name": "latitude",
+            "long_name": "latitude",
+            "units": "degrees_north",
+            "axis": "Y",
+        }
+    )
+    lon_attrs = {
+        "standard_name": "longitude",
+        "long_name": "longitude",
+        "units": "degrees_east",
+        "axis": "X",
+    }
+    if coordinate_is_periodic:
+        # Helpful circular-axis extensions. CF recognition itself comes from
+        # standard_name + degrees_east; no duplicate endpoint is stored.
+        lon_attrs["modulo"] = 360.0
+        lon_attrs["topology"] = "circular"
+    ds_out["longitude"].attrs.update(lon_attrs)
+    if "level" in ds_out.coords:
+        ds_out["level"].attrs.update(
+            {
+                "standard_name": "air_pressure",
+                "units": "hPa",
+                "axis": "Z",
+                "positive": "down",
+            }
+        )
+    ds_out["time"].attrs.update({"standard_name": "time", "axis": "T"})
+    ds_out.attrs["Conventions"] = "CF-1.10"
+    for coord_name in ("time", "latitude", "longitude", "level"):
+        ds_out[coord_name].encoding["_FillValue"] = None
 
     if save_netcdf:
         ds_out.to_netcdf(str(output_path))
