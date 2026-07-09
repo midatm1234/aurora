@@ -1,16 +1,17 @@
 """
 Sequential CAMS downloader in half-month chunks.
 Takes a start_date and end_date and generates date ranges automatically.
-Skips ranges whose output files already exist.
+Skips ranges whose output files already exist and pass a basic completeness check.
 """
 
 import argparse
 import calendar
 import zipfile
-from datetime import date, timedelta
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 
-import cdsapi
+import numpy as np
+import xarray as xr
 
 OUTPUT_DIR = Path("/data/cams")
 TIMES_UTC = ["00:00", "12:00"]
@@ -71,6 +72,62 @@ def _exists_nonempty(path: Path) -> bool:
     return path.exists() and path.stat().st_size > 0
 
 
+def _expected_time_bounds(start: str, end: str) -> tuple[np.datetime64, np.datetime64, int]:
+    start_date = date.fromisoformat(start)
+    end_date = date.fromisoformat(end)
+    times = [time.fromisoformat(t) for t in TIMES_UTC]
+    first = datetime.combine(start_date, min(times))
+    last = datetime.combine(end_date, max(times))
+    count = ((end_date - start_date).days + 1) * len(times)
+    return np.datetime64(first), np.datetime64(last), count
+
+
+def _time_values(ds: xr.Dataset) -> np.ndarray:
+    for coord_name in ("forecast_reference_time", "time", "valid_time"):
+        if coord_name in ds.coords or coord_name in ds.variables:
+            values = np.asarray(ds[coord_name].values).reshape(-1)
+            if values.size:
+                return values
+    raise ValueError("no usable time coordinate found")
+
+
+def _is_complete_netcdf(path: Path, start: str, end: str, required_vars: set[str]) -> tuple[bool, str]:
+    if not _exists_nonempty(path):
+        return False, "missing or empty"
+
+    expected_first, expected_last, expected_count = _expected_time_bounds(start, end)
+    try:
+        with xr.open_dataset(path, decode_times=True) as ds:
+            missing_vars = sorted(required_vars - set(ds.data_vars))
+            if missing_vars:
+                return False, f"missing variables: {', '.join(missing_vars[:5])}"
+
+            values = _time_values(ds).astype("datetime64[ns]")
+            unique_values = np.unique(values)
+            actual_first = unique_values[0]
+            actual_last = unique_values[-1]
+            if unique_values.size != expected_count:
+                return False, f"expected {expected_count} times, found {unique_values.size}"
+            if actual_first != expected_first.astype("datetime64[ns]"):
+                return False, f"first time is {actual_first}, expected {expected_first}"
+            if actual_last != expected_last.astype("datetime64[ns]"):
+                return False, f"last time is {actual_last}, expected {expected_last}"
+    except Exception as exc:
+        return False, f"cannot read NetCDF: {exc}"
+
+    return True, "complete"
+
+
+def _outputs_are_complete(surface_path: Path, atmos_path: Path, start: str, end: str) -> tuple[bool, str]:
+    surface_vars = {"u10", "v10", "t2m", "msl", "pm1", "pm2p5", "pm10"}
+    atmos_vars = {"t", "z", "q", "co", "no2", "no", "go3", "so2"}
+    surface_ok, surface_reason = _is_complete_netcdf(surface_path, start, end, surface_vars)
+    atmos_ok, atmos_reason = _is_complete_netcdf(atmos_path, start, end, atmos_vars)
+    if surface_ok and atmos_ok:
+        return True, "surface and atmospheric files are complete"
+    return False, f"surface: {surface_reason}; atmos: {atmos_reason}"
+
+
 def download_range(start: str, end: str) -> bool:
     """Returns True on success, False on failure."""
     date_range = f"{start}/{end}"
@@ -84,9 +141,12 @@ def download_range(start: str, end: str) -> bool:
     print(f"  Surface : {surface_path.name}")
     print(f"  Atmos   : {atmos_path.name}")
 
-    if _exists_nonempty(surface_path) and _exists_nonempty(atmos_path) and not OVERWRITE:
-        print("  -> Skipping: output files already exist.")
+    outputs_complete, completeness_reason = _outputs_are_complete(surface_path, atmos_path, start, end)
+    if outputs_complete and not OVERWRITE:
+        print(f"  -> Skipping: {completeness_reason}.")
         return True
+    if not outputs_complete:
+        print(f"  -> Existing output incomplete or absent: {completeness_reason}")
 
     request = {
         "type": "forecast",
@@ -102,6 +162,8 @@ def download_range(start: str, end: str) -> bool:
         if _exists_nonempty(zip_path) and not OVERWRITE:
             print(f"  -> Zip already exists, skipping download: {zip_path.name}")
         else:
+            import cdsapi
+
             client = cdsapi.Client()
             client.retrieve(
                 "cams-global-atmospheric-composition-forecasts",
@@ -118,7 +180,11 @@ def download_range(start: str, end: str) -> bool:
         print(f"  -> Extracted: {surface_path.name}")
         print(f"  -> Extracted: {atmos_path.name}")
 
-        if REMOVE_ZIP_AFTER_EXTRACTION and zip_path.exists() and _exists_nonempty(surface_path) and _exists_nonempty(atmos_path):
+        outputs_complete, completeness_reason = _outputs_are_complete(surface_path, atmos_path, start, end)
+        if not outputs_complete:
+            raise ValueError(f"extracted files failed completeness check: {completeness_reason}")
+
+        if REMOVE_ZIP_AFTER_EXTRACTION and zip_path.exists():
             zip_path.unlink()
             print(f"  -> Removed zip: {zip_path.name}")
         return True
@@ -126,7 +192,8 @@ def download_range(start: str, end: str) -> bool:
     except Exception as e:
         print(f"  -> FAILED: {e}")
         # Clean up partial zip to avoid issues on retry
-        if zip_path.exists() and not (_exists_nonempty(surface_path) and _exists_nonempty(atmos_path)):
+        outputs_complete, _ = _outputs_are_complete(surface_path, atmos_path, start, end)
+        if zip_path.exists() and not outputs_complete:
             zip_path.unlink(missing_ok=True)
             print(f"  -> Cleaned up partial zip: {zip_path.name}")
         return False
@@ -137,9 +204,11 @@ if __name__ == "__main__":
     parser.add_argument("--start-date", default=START_DATE, help=f"Start date YYYY-MM-DD (default: {START_DATE})")
     parser.add_argument("--end-date", default=END_DATE, help=f"End date YYYY-MM-DD (default: {END_DATE})")
     parser.add_argument("--output-dir", default=str(OUTPUT_DIR), help=f"Output directory (default: {OUTPUT_DIR})")
+    parser.add_argument("--overwrite", action="store_true", help="Download and extract even when complete files exist.")
     args = parser.parse_args()
 
     OUTPUT_DIR = Path(args.output_dir)
+    OVERWRITE = args.overwrite
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     start = date.fromisoformat(args.start_date)
