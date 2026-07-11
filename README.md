@@ -105,6 +105,10 @@ Note that this will incur a 500 MB download.
 
 Please read the [documentation](https://microsoft.github.io/aurora) for more detailed instructions and for which models are available.
 
+For static-variable inspection/editing, see [`examples/static_variables_editor.ipynb`](examples/static_variables_editor.ipynb).
+This notebook can help you visualise and modify existing static-variable arrays in a pickle file.
+Adding a brand-new static variable and making Aurora consume that new variable in model inference is not available yet.
+
 ## Contributing
 
 See [`CONTRIBUTING.md`](CONTRIBUTING.md).

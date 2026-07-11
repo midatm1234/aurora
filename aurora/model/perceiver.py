@@ -150,12 +150,23 @@ class PerceiverAttention(nn.Module):
 
         q, k, v = map(lambda t: rearrange(t, "b l (h d) -> b h l d", h=h), (q, k, v))
 
-        sdpa = (
-            fp16_safe_scaled_dot_product_attention
-            if self.use_fp16_safe_attention
-            else F.scaled_dot_product_attention
-        )
-        out = sdpa(q, k, v)
+        if self.use_fp16_safe_attention:
+            out = fp16_safe_scaled_dot_product_attention(q, k, v)
+        elif q.is_cuda:
+            # On the H100/PyTorch 2.10 stack used by the fine-tuning notebooks,
+            # fused SDP kernels can raise cudaErrorInvalidConfiguration for these
+            # Perceiver cross-attention shapes. Restrict only this call to the
+            # math backend so other attention blocks can still use efficient CUDA
+            # kernels and avoid materialising huge attention matrices.
+            with torch.backends.cuda.sdp_kernel(
+                enable_flash=False,
+                enable_math=True,
+                enable_mem_efficient=False,
+                enable_cudnn=False,
+            ):
+                out = F.scaled_dot_product_attention(q, k, v)
+        else:
+            out = F.scaled_dot_product_attention(q, k, v)
         out = rearrange(out, "B H L1 D -> B L1 (H D)")  # (B, L1, D)
         return self.to_out(out)  # (B, L1, Latent_D)
 

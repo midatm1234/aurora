@@ -1,0 +1,329 @@
+paths:
+  project_root: .
+  data_dir: ../data
+  train_data_path: ../data/train.nc
+  val_data_path: ../data/test.nc
+  test_data_path: ../data/test.nc
+  output_dir: ./outputs
+  checkpoint_dir: ./outputs/checkpoints
+  pretrained_checkpoint: ""  # Optional local checkpoint path. Empty uses model default HF checkpoint.
+  static_data_path: /data/cams/aurora-0.4-air-pollution-static.pickle  # Pickle with lsm, z, slt (from HuggingFace)
+  optional_resume_checkpoint: ""
+
+# Sub-folder under output_dir / checkpoint_dir for this experiment.
+# When set, all artifacts (best.ckpt, last.ckpt, training_history.*,
+# rollout_predictions.nc, plots, run_manifest.json) land in
+#   <output_dir>/<case_name>/  and  <checkpoint_dir>/<case_name>/
+# resume_from="best"/"last" resolves relative to the case folder, so
+# stages chain naturally when you keep case_name fixed across runs.
+case_name: two-day_lead
+
+data:
+  predictor_variables:
+    - dataset_name: t2m
+      aurora_name: 2t
+      kind: surf
+    - dataset_name: u10
+      aurora_name: 10u
+      kind: surf
+    - dataset_name: v10
+      aurora_name: 10v
+      kind: surf
+    - dataset_name: msl
+      aurora_name: msl
+      kind: surf
+    - dataset_name: tcno2
+      aurora_name: tcno2
+      kind: surf
+    - dataset_name: z
+      aurora_name: z
+      kind: atmos
+    - dataset_name: u
+      aurora_name: u
+      kind: atmos
+    - dataset_name: v
+      aurora_name: v
+      kind: atmos
+    - dataset_name: t
+      aurora_name: t
+      kind: atmos
+    - dataset_name: q
+      aurora_name: q
+      kind: atmos
+    - dataset_name: no2
+      aurora_name: no2
+      kind: atmos
+
+  target_variables:
+    - dataset_name: no2
+      aurora_name: no2
+      kind: atmos
+      # Use ALL 13 pressure levels. The per-level normalisation scales for
+      # top-of-atmosphere NO2 collapse to ~1e-9, but those vertical gradients
+      # carry real physical signal — dropping levels here was wrong. The
+      # numerical pathology this used to mask is fixed in the optimizer
+      # (per-parameter LR scaling by weight magnitude in the training loop).
+    - dataset_name: tcno2
+      aurora_name: tcno2
+      kind: surf
+
+  static_variables:
+    - dataset_name: lsm
+      aurora_name: lsm
+      kind: static
+    - dataset_name: z_static
+      aurora_name: z
+      kind: static
+    - dataset_name: slt
+      aurora_name: slt
+      kind: static
+    - dataset_name: static_ammonia
+      aurora_name: static_ammonia
+      kind: static
+    - dataset_name: static_ammonia_log
+      aurora_name: static_ammonia_log
+      kind: static
+    - dataset_name: static_co
+      aurora_name: static_co
+      kind: static
+    - dataset_name: static_co_log
+      aurora_name: static_co_log
+      kind: static
+    - dataset_name: static_nox
+      aurora_name: static_nox
+      kind: static
+    - dataset_name: static_nox_log
+      aurora_name: static_nox_log
+      kind: static
+    - dataset_name: static_so2
+      aurora_name: static_so2
+      kind: static
+    - dataset_name: static_so2_log
+      aurora_name: static_so2_log
+      kind: static
+
+  atmos_levels: [50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000]
+  input_time_steps: 2
+  target_lead_times: [1,2,3]  # Paper §D.3: "CAMS 0.4°: train with single-step prediction".
+  target_type: rollout  # next-step | multi-step | rollout
+
+  domain_type: regional  # global | regional
+  lat_min: 31.0
+  lat_max: 52.0
+  lon_min: -128.0
+  lon_max: -100.0
+
+  data_format: netcdf  # netcdf | zarr | xarray
+  backend: netcdf
+  predictor_mapping_to_aurora_names: {}
+  target_mapping_from_aurora_outputs: {}
+  static_mapping_to_aurora_names: {}
+
+  time_dim: time
+  lat_dim: latitude
+  lon_dim: longitude
+  level_dim: level
+  extra_dim_indexers: {}  # Example: {member: 0}
+
+  normalization:
+    enabled: false
+    mode: none
+    input_stats: {}
+    target_stats: {}
+
+  split_controls:
+    train:
+      start_offset: 0
+      end_offset: null
+      stride: 1
+      max_samples: null
+    val:
+      start_offset: 0
+      end_offset: null
+      stride: 1
+      max_samples: null
+    test:
+      start_offset: 0
+      end_offset: null
+      stride: 1
+      max_samples: null
+
+  optional_masks_for_missing_values: {}  # Example: {t2m: valid_mask_t2m}
+
+  loss_mask_options:
+    mode: none  # none | land | ocean
+    threshold: 0.5
+
+  include_target_variables_as_predictors: false
+  patch_alignment_strategy: crop
+
+model:
+  model_variant: aurora_air_pollution
+  patch_size: 3  # AuroraAirPollution uses patch_size=3.
+  use_pretrained_weights: true
+  backbone_freeze: true
+  freeze_embeddings: true
+  freeze_encoder: true
+  freeze_decoder: false
+  trainable_head_only: false
+  gradient_checkpointing: true
+  mixed_precision: bf16  # none | bf16 | fp16
+  device: cuda
+  compile_model: false
+  conv_refine_enabled: false  # Wrap decoder with convolutional refinement heads.
+  conv_refine_hidden: 32      # Hidden channels in conv refinement blocks.
+  # Rectified-flow residual decoder for bias correction.
+  # Trains a small UNet on the conditional residual r = y_true − ŷ in
+  # normalised space; at inference, samples r̂ via Euler integration of
+  # the FM ODE and adds it back. Mutually exclusive with conv-refine
+  # (flow takes precedence when both are enabled).
+  flow_refine_enabled: true
+  flow_refine_hidden: 64           # base UNet width
+  flow_refine_time_dim: 128        # sinusoidal time embedding dim
+  flow_refine_sampling_steps: 1    # Phase-1 (early epochs): deterministic regression.
+  # Progressive sampling-steps schedule. After the first
+  # `flow_refine_phase_fraction` of training (default 1/3) the eval-time
+  # sampler switches to `flow_refine_sampling_steps_late` to let the
+  # head express multi-modal residuals. Training loss is independent of
+  # this knob (t is sampled uniformly in [0,1]); it only affects
+  # validation/rollout.
+  flow_refine_sampling_steps_late: 8
+  flow_refine_phase_fraction: 0.3333
+  # --- Mamba temporal module (optional) --------------------------------
+  # Adds a selective state-space (Mamba) corrector on top of the
+  # flow-matching output. It learns how the bias-corrected field and
+  # Aurora's residual evolve across a rollout sequence, targeting the
+  # accumulated drift that degrades 2–3 day forecasts relative to 6 h.
+  # Default disabled → flow-matching-only behaviour is unchanged. The
+  # temporal decoder is zero-init (identity-at-init), so enabling it does
+  # nothing until trained. Trained on the ordered multi-lead sequence
+  # (see training.mamba_temporal_weight) and applied causally at rollout.
+  mamba_temporal_enabled: false
+  mamba_temporal_channels: 16   # per-pixel feature width of the encoder/SSM
+  mamba_temporal_state: 8       # SSM hidden state dimension (N)
+  mamba_temporal_layers: 2      # stacked Mamba blocks
+  mamba_temporal_conv: 3        # causal temporal conv kernel
+  mamba_temporal_expand: 2      # SSM inner expansion factor
+  model_kwargs: {}
+
+training:
+  seed: 42
+  batch_size: 1  # 4 leads × 14 atmos levels × FM head OOMs at bs=2 on 22 GB A10G; effective batch = 1 × 4 GPUs × 8 accum = 32
+  num_epochs: 25  # fresh finetune at target_lead_times=[1,2,3] from a clean random init of the FM head
+  # Fresh stage-1 fine-tune at lead_times=[1,2,3,4]. The previous run was
+  # warmstarted from a head trained only at leads=[1,2]; extending to lead 3
+  # introduced a large distribution shift that the resumed head couldn't
+  # absorb at the dampened LR=5e-7. Restart from scratch with the standard
+  # 3e-4 UNet LR so the head learns the multi-lead residual jointly.
+  learning_rate: 3.0e-4
+  optimizer: adamw
+  weight_decay: 0.0
+  scheduler: cosine_warmup  # none | cosine | cosine_warmup | step
+  # Short warmup: head-only fine-tune from a pretrained backbone doesn't need
+  # the paper's 100-step linear warmup (that's for from-scratch pretraining).
+  scheduler_warmup_steps: 10
+  scheduler_t_max: 150  # fresh: 30 epochs × ~4 updates/epoch (29 batches/rank @ bs=1, accum=8) + buffer
+  scheduler_eta_min: 0.0
+  scheduler_step_size: 10
+  scheduler_gamma: 0.5
+  gradient_clip_val: 1.0
+  accumulation_steps: 8
+  # Per-parameter LR scaling by weight RMS. AdamW takes ~unit-magnitude steps
+  # in normalised weight units regardless of the parameter's actual scale; for
+  # Aurora's per-level NO2 head/embed weights (which are themselves O(1e-9) at
+  # the top of atmosphere), one un-scaled AdamW step shifts them by ~10^3×
+  # their natural size and destroys the pretrained mapping. Setting this
+  # enables the trust-ratio-style per-tensor scaling in
+  # aurora_finetune_distributed.py.
+  scale_aware_lr:
+    enabled: true
+    # Reference RMS used as the "1.0×" scale. Params with rms below this
+    # get LR proportionally reduced; params above get clipped to 1.0×.
+    # If null, computed automatically as the median rms of well-conditioned
+    # pretrained params at optimizer construction time.
+    reference_rms: null
+    # Lower bound on the per-tensor scale factor so vanishingly small params
+    # are not completely frozen (only applies to pretrained params).
+    min_scale: 1.0e-3
+    # rms below this is considered a (near-)zero-init param (e.g. fresh head
+    # bias) and is excluded from the reference-rms estimate.
+    rms_floor: 1.0e-4
+    # Multiplicative LR scale on Aurora-pretrained params. The pretrained
+    # Aurora is already near-optimal on CAMS dates similar to its training
+    # set (init val_loss < end-of-epoch-1 val_loss in our run); fine-tuning
+    # those weights drifts the model AWAY from the optimum. Set this to 0.0
+    # to freeze pretrained params entirely and let the convolutional refine
+    # heads (newly initialised) absorb the residual biases. The refine
+    # heads always run at the full configured `learning_rate`.
+    pretrained_lr_scale: 0.0
+  early_stopping:
+    enabled: false
+    patience: 3
+    min_delta: 1.0e-5
+  validation_frequency: 1
+  save_best_only: true
+  save_last: true
+  resume_training: true
+  resume_from: "last"  # "best", "last", or a path to a .ckpt file. Empty = no resume.
+  resume_skip_scheduler: true  # only relevant when resume_training=true
+  # MSE for warmup-stage fine-tuning: gradient ∝ (pred-tgt)/std² shrinks as
+  # the model converges, which is essential under tight normalisation floors
+  # and bf16 autocast. Switch to "mae" only for late-stage rollout fine-tune.
+  loss_function: mse
+  multi_target_loss_weights: {}
+  # Weight of the Mamba temporal loss (trained on the ordered multi-lead
+  # rollout sequence). Only active when model.mamba_temporal_enabled=true and
+  # there are >= 2 target lead times. 0 disables the temporal loss term.
+  mamba_temporal_weight: 1.0
+
+  # ---------------------------------------------------------------------
+  # Structural auxiliary losses for the flow-matching refine head.
+  #
+  # The base flow loss is a per-pixel / per-level residual MSE, which has no
+  # notion of spatial pattern, extremes, distribution, vertical shape, or the
+  # column<->profile relationship. These weighted terms (computed on the head's
+  # clean residual estimate refined = y_hat + r_hat vs the target) add those
+  # objectives. Toggle the whole feature with `enabled`; set any weight to 0 to
+  # disable an individual term.
+  flow_aux_loss:
+    enabled: false              # master on/off switch (single line)
+    # Extreme-event performance: tail-cell weighting + spatial peak match.
+    extreme_weight: 0.5
+    extreme_quantile: 0.95
+    extreme_intensity: 4.0
+    peak_weight: 0.25
+    # Spatial-pattern agreement: gradient-field MSE + anomaly correlation.
+    spatial_grad_weight: 0.5
+    spatial_acc_weight: 0.25
+    # Distributional errors: spatial-std match + sorted-value Wasserstein.
+    dist_var_weight: 0.25
+    dist_wasserstein_weight: 0.25
+    # Vertical-profile consistency (atmospheric no2): level-difference MSE.
+    vertical_weight: 0.5
+    # Column/profile coherence: tie tcno2 (column) to the pressure-weighted
+    # vertical integral of no2 (profile). Empty var names => auto-detect.
+    coherence_weight: 0.25
+    coherence_column_var: tcno2
+    coherence_profile_var: no2
+
+rollout:
+  run_rollout_after_training: true
+  rollout_num_steps: 0  # 0 = use max(target_lead_times) from data config
+  rollout_step_hours: 12
+  autoregressive_inputs: true
+  # Log, at every rollout step, which variables come from CAMS truth vs the
+  # model's bias-corrected prediction (plus assertions that no bias-corrected
+  # target is ever overwritten by CAMS). Set false to silence the per-step log.
+  verbose_provenance: true
+  predicted_fields_get_fed_back: []  # Empty => all model-predicted vars are fed back.
+  keep_exogenous_predictors: refresh_from_dataset  # fixed | refresh_from_dataset
+  save_predictions_to_netcdf: true
+  smooth_sigma: 1.0  # Gaussian sigma (grid cells) to smooth patch artifacts. 0 = off.
+  save_plots: true
+
+notebook:
+  quicklook_sample_index: 0
+  plot_variables:
+    - no2
+    - tcno2
+  verbosity: 1

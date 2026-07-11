@@ -10,6 +10,21 @@ model = AuroraPretrained()
 model.load_checkpoint()
 ```
 
+## Notebook Fine-Tuning + Rollout Workflow
+
+For a config-driven notebook workflow, see:
+
+- [`finetune/aurora_finetune_rollout.ipynb`](../finetune/aurora_finetune_rollout.ipynb)
+- [`finetune/aurora_finetune_rollout_config.yaml`](../finetune/aurora_finetune_rollout_config.yaml)
+- [`finetune/README.md`](../finetune/README.md)
+
+This workflow supports:
+
+- user-defined predictor and target variables for supervised fine-tuning;
+- frozen-backbone or full-model fine-tuning;
+- regional domains (cropped latitude/longitude windows);
+- config-based training/validation/checkpointing/rollout outputs.
+
 ## Fine-Tuning Environment
 
 We provide a very basic Docker image and fine-tuning loop to get you started.

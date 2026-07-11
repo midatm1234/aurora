@@ -918,7 +918,11 @@ class AuroraAirPollution(Aurora):
             name: str,
         ) -> torch.Tensor:
             if name in dim_lookup:
-                return model[name] + (1 + model[f"{name}_mod"]) * prev[name][:, dim_lookup[name]]
+                idx = dim_lookup[name]
+                # Use slicing to keep the history dimension so broadcasting
+                # is correct for any batch size B (avoids [B,H,W] vs [B,1,H,W]).
+                hist = prev[name][:, idx : idx + 1]
+                return model[name] + (1 + model[f"{name}_mod"]) * hist
             else:
                 return model[name]
 
@@ -932,7 +936,7 @@ class AuroraAirPollution(Aurora):
 
         # When using LoRA, the lower-atmospheric levels of SO2 can be problematic and blow up.
         # We attempt to fix that by some very aggressive output clipping.
-        if self.use_lora:
+        if self.use_lora and "so2" in pred.atmos_vars:
             parts: list[torch.Tensor] = []
             for i, level in enumerate(pred.metadata.atmos_levels):
                 section = pred.atmos_vars["so2"][..., i, :, :]
