@@ -61,6 +61,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
+from aurora.model.util import fp16_safe_scaled_dot_product_attention
+
 __all__ = ["MLP", "PerceiverResampler"]
 
 
@@ -116,6 +118,7 @@ class PerceiverAttention(nn.Module):
         self.to_q = nn.Linear(latent_dim, self.inner_dim, bias=False)
         self.to_kv = nn.Linear(context_dim, self.inner_dim * 2, bias=False)
         self.to_out = nn.Linear(self.inner_dim, latent_dim, bias=False)
+        self.use_fp16_safe_attention = False
 
         if ln_k_q:
             self.ln_k = nn.LayerNorm(num_heads * head_dim)
@@ -147,12 +150,14 @@ class PerceiverAttention(nn.Module):
 
         q, k, v = map(lambda t: rearrange(t, "b l (h d) -> b h l d", h=h), (q, k, v))
 
-        # On the H100/PyTorch 2.10 stack used by the fine-tuning notebooks,
-        # fused SDP kernels can raise cudaErrorInvalidConfiguration for these
-        # Perceiver cross-attention shapes. Restrict only this call to the
-        # math backend so other attention blocks can still use efficient CUDA
-        # kernels and avoid materialising huge attention matrices.
-        if q.is_cuda:
+        if self.use_fp16_safe_attention:
+            out = fp16_safe_scaled_dot_product_attention(q, k, v)
+        elif q.is_cuda:
+            # On the H100/PyTorch 2.10 stack used by the fine-tuning notebooks,
+            # fused SDP kernels can raise cudaErrorInvalidConfiguration for these
+            # Perceiver cross-attention shapes. Restrict only this call to the
+            # math backend so other attention blocks can still use efficient
+            # CUDA kernels.
             with torch.backends.cuda.sdp_kernel(
                 enable_flash=False,
                 enable_math=True,
@@ -243,5 +248,8 @@ class PerceiverResampler(nn.Module):
             #   https://github.com/huggingface/transformers/blob/v4.35.2/src/transformers/models/perceiver/modeling_perceiver.py#L398
             #
             latents = attn_out + latents if self.residual_latent else attn_out
+            if not self.training:
+                # Save memory in inference by not keeping intermediate activations
+                del attn_out
             latents = ln2(ff(latents)) + latents
         return latents
