@@ -266,7 +266,7 @@ model:
 training:
   seed: 42
   batch_size: 1  # Global domain + 6 leads + FM head needs per-GPU bs=1; use accumulation for effective batch.
-  num_epochs: 100  # fresh finetune at target_lead_times=[1,2,3,4,5,6] from a clean random init of the FM head
+  num_epochs: 50  # fresh finetune at target_lead_times=[1,2,3,4,5,6] from a clean random init of the FM head
   # Fresh stage-1 fine-tune over target_lead_times=[1,2,3,4,5,6] from a clean
   # random init of the FM head, trained jointly at the standard 3e-4 UNet
   # LR so the head learns the multi-lead residual across all leads at once.
@@ -320,9 +320,9 @@ training:
   save_last: true
   # Start one fresh run after the periodic-longitude architecture change;
   # legacy replicate-edge Flow checkpoints are intentionally rejected.
-  resume_training: false
+  resume_training: true
   resume_from: "last"  # "best", "last", or a path to a .ckpt file. Empty = no resume.
-  resume_skip_scheduler: true  # only relevant when resume_training=true
+  resume_skip_scheduler: false  # Restore scheduler state for an interrupted same-run resume.
   # MSE for warmup-stage fine-tuning: gradient ∝ (pred-tgt)/std² shrinks as
   # the model converges, which is essential under tight normalisation floors
   # and bf16 autocast. Switch to "mae" only for late-stage rollout fine-tune.

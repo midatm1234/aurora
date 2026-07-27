@@ -457,6 +457,11 @@ def _worker(rank: int, world_size: int, local_gpu: int, cfg: dict):
     else:
         raise ValueError(f"Unsupported optimizer: {optimizer_name}")
 
+    # Keep independent snapshots: scheduler construction mutates each optimizer
+    # group's live LR (for example, LambdaLR applies its first warmup factor).
+    # Referring back to ``param_groups`` during resume is therefore unsafe.
+    configured_group_lrs = [float(g["lr"]) for g in optimizer.param_groups]
+
     batch_size = int(train_cfg.get("batch_size", 1))
     num_epochs = int(train_cfg.get("num_epochs", 1))
     accumulation_steps = max(1, int(train_cfg.get("accumulation_steps", 1)))
@@ -470,6 +475,7 @@ def _worker(rank: int, world_size: int, local_gpu: int, cfg: dict):
     scheduler = ft.create_scheduler(
         optimizer, cfg, num_training_steps=updates_per_epoch * max(1, num_epochs),
     )
+    fresh_scheduler_lrs = [float(g["lr"]) for g in optimizer.param_groups]
 
     checkpoint_dir = Path(cfg["paths"]["checkpoint_dir"])
     output_dir = Path(cfg["paths"]["output_dir"])
@@ -512,22 +518,32 @@ def _worker(rank: int, world_size: int, local_gpu: int, cfg: dict):
             _print0(rank, f"  checkpoint has {len(unexpected)} unexpected key(s) "
                           f"(ignored), e.g. {unexpected[:3]}")
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-        # `optimizer.load_state_dict` overwrites each param_group's `lr` with
-        # the value saved at checkpoint time. Re-apply the LR (and per-group
-        # scales) computed from the *current* YAML so stage-2 fine-tuning
-        # actually runs at the configured rate.
-        if scale_aware_enabled:
-            for g, src_g in zip(optimizer.param_groups, param_groups):
-                g["lr"] = float(src_g["lr"])
-                g["initial_lr"] = float(src_g["lr"])
-        else:
-            for g in optimizer.param_groups:
-                g["lr"] = lr
-                g["initial_lr"] = lr
+        checkpoint_group_lrs = [float(g["lr"]) for g in optimizer.param_groups]
         skip_sched = bool(train_cfg.get("resume_skip_scheduler", False))
-        if scheduler is not None and "scheduler_state_dict" in ckpt and not skip_sched:
-            scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-        elif skip_sched:
+        scheduler_state = ckpt.get("scheduler_state_dict")
+        if scheduler is not None and scheduler_state is not None and not skip_sched:
+            scheduler.load_state_dict(scheduler_state)
+            restored_lrs = scheduler.get_last_lr()
+            if not isinstance(restored_lrs, (list, tuple)) or len(restored_lrs) != len(
+                optimizer.param_groups
+            ):
+                restored_lrs = checkpoint_group_lrs
+            for group, restored_lr in zip(optimizer.param_groups, restored_lrs):
+                group["lr"] = float(restored_lr)
+            _print0(
+                rank,
+                f"  Restored scheduler at step {scheduler.last_epoch}, "
+                f"lr={[float(g['lr']) for g in optimizer.param_groups]}",
+            )
+        else:
+            # A skipped/missing scheduler state is a deliberate fresh stage:
+            # use the current YAML's group scales and fresh warmup position.
+            for group, group_lr, initial_lr in zip(
+                optimizer.param_groups, fresh_scheduler_lrs, configured_group_lrs
+            ):
+                group["lr"] = group_lr
+                group["initial_lr"] = initial_lr
+        if skip_sched:
             _print0(rank, "  resume_skip_scheduler=true -> using fresh scheduler "
                           f"(t_max={train_cfg.get('scheduler_t_max')})")
         start_epoch = int(ckpt.get("epoch", -1)) + 1
