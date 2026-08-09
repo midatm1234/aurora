@@ -6,7 +6,7 @@ set -e  # Exit on error
 
 cd "$(dirname "$0")"  # cd to finetune/ directory
 
-CONFIG_NAME="aurora_O3_finetune_US-WEST_3day_lead_config_v3.yaml"
+CONFIG_NAME="backup/aurora_O3_finetune_US-WEST/aurora_O3_finetune_US-WEST_3day_lead_config_v3.yaml"
 INPUT_NB="aurora_finetune_rollout.ipynb"
 OUTPUT_NB="outputs/O3_US-WEST_3day_lead_v3/aurora_finetune_rollout_executed_$(date +%Y%m%d_%H%M%S).ipynb"
 LOG_FILE="outputs/O3_US-WEST_3day_lead_v3/training_$(date +%Y%m%d_%H%M%S).log"

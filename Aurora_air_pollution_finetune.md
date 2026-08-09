@@ -200,9 +200,10 @@ For a column-O₃ fine-tune, prefer:
 * `bias_weight > 0` — pin the absolute level to counter the systematic low bias.
 * `flow_refine_doy_cond: true` — absorb the strong ozone seasonal cycle.
 
-See `finetune/aurora_O3_finetune_US-WEST_3day_lead_config_v2.yaml` (subtraction:
+See `finetune/backup/aurora_O3_finetune_US-WEST/aurora_O3_finetune_US-WEST_3day_lead_config_v2.yaml` (subtraction:
 drop coherence + multi-step) and `..._config_v3.yaml` (v2 + `bias_weight` +
-seasonal conditioning).
+seasonal conditioning). These configs are archived for historical reference; active
+O₃ fine-tuning uses `aurora_O3_global_finetune_3day_lead_config.yaml`.
 
 ### Checkpoints
 
