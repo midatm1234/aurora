@@ -298,14 +298,14 @@ training:
     # Distributional errors: spatial-std match + sorted-value Wasserstein.
     dist_var_weight: 0.25
     dist_wasserstein_weight: 0.25
-    # Vertical-profile consistency (atmospheric go3): level-difference MSE.
+    # Vertical-profile consistency (atmospheric no2): level-difference MSE.
     vertical_weight: 0.5
-    # Column/profile coherence: tie gtco3 (column) to the pressure-weighted
-    # vertical integral of go3 (profile). Empty var names => auto-detect the
+    # Column/profile coherence: tie tcno2 (column) to the pressure-weighted
+    # vertical integral of no2 (profile). Empty var names => auto-detect the
     # first surf target as column and first atmos target as profile.
     coherence_weight: 0.25
-    coherence_column_var: gtco3
-    coherence_profile_var: go3
+    coherence_column_var: tcno2
+    coherence_profile_var: no2
 
 rollout:
   run_rollout_after_training: true
@@ -325,6 +325,6 @@ rollout:
 notebook:
   quicklook_sample_index: 0
   plot_variables:
-    - go3
-    - gtco3
+    - no2
+    - tcno2
   verbosity: 1

@@ -1,3 +1,13 @@
+# Example configuration: conditional diffusion UNet (DDPM training / DDIM sampling)
+#
+# Derived, unmodified except where noted, from
+# ``finetune/aurora_O3_global_finetune_3day_lead_config.yaml`` (a currently
+# working Aurora flow-matching configuration). Existing YAML files are never
+# overwritten; this is an additional, explicitly versioned example.
+#
+# Residual diffusion in the same normalized target space. The diffusion timestep and the forecast lead time have separate embeddings.
+#
+# See docs/STOCHASTIC_REFINEMENT.md for the full schema.
 paths:
   project_root: .
   data_dir: ../data
@@ -245,7 +255,7 @@ model:
   # Trains a small UNet on the conditional residual r = y_true − ŷ in
   # normalised space. Deterministic inference predicts r̂ at the source
   # endpoint and adds it back. Mutually exclusive with conv-refine.
-  flow_refine_enabled: true
+  flow_refine_enabled: false
   # Version 3 adds explicit cumulative forecast-lead conditioning to the
   # corrected t=0 endpoint and per-level residual scaling. Older checkpoints
   # have no lead embedding and are deliberately incompatible with this recipe.
@@ -256,7 +266,7 @@ model:
   # physical lead hours (12, 24, ..., 72) so each head can learn that CAMS
   # rollout residual amplitude and structure evolve with lead. The scale is
   # also the maximum supported lead for inference; longer rollouts fail loudly.
-  flow_refine_lead_time_cond: true
+  flow_refine_lead_time_cond: false
   flow_refine_lead_time_scale_hours: 72
   # Optional absolute-position conditioning. When enabled, the Flow head gets
   # sin(lon)/cos(lon), never raw longitude. Enabling changes checkpoint input
@@ -288,6 +298,68 @@ model:
   # is a no-op until trained. Trained on the ordered multi-lead sequence
   # (see training.mamba_temporal_weight) and applied causally at rollout.
   # Requires flow_refine_enabled: true and >= 2 target_lead_times.
+
+  # ------------------------------------------------------------------
+  # Unified stochastic residual refinement (Phase 2).
+  # Phase 1 stays the existing deterministic Aurora rollout. Phase 2 predicts a
+  # residual in Aurora's normalized target space for each rollout step and is
+  # applied as POSTPROCESSING: the deterministic state that produces later
+  # rollout steps is never replaced (feedback_to_rollout: false).
+  # ------------------------------------------------------------------
+  refinement:
+    enabled: true
+    type: diffusion_unet
+    checkpoint: null
+    freeze_aurora: true
+    joint_finetuning: false
+    train_on_residual: true
+    feedback_to_rollout: false   # experimental when true; evaluate separately
+    seed: 1234
+    ensemble_size: 10
+
+    target_space:
+      use_existing_normalization: true
+      residual_space: normalized
+
+    conditioning:
+      aurora_rollout: true
+      aurora_input_state: false
+      aurora_features: false
+      static_fields: false
+      masks: true
+      forecast_lead_time: true   # physical hours; separate from process time
+
+    loss:
+      generative: mse
+      reconstruction_weight: 0.0
+      bias_weight: 0.0
+      gradient_weight: 0.0
+      pattern_correlation_weight: 0.0
+      area_weighted: true
+      separate_by_variable: true
+      separate_by_level: true
+      separate_by_lead_time: true
+
+    diffusion:
+      training_timesteps: 1000
+      inference_steps: 50
+      prediction_type: epsilon
+      schedule: cosine
+      sampler: ddim
+      eta: 0.0
+      clip_sample: false
+      clip_sample_range: 10.0
+
+    unet:
+      hidden_channels: 16
+      num_levels: 3
+      num_residual_blocks: 2
+      time_embedding_dim: 128
+      dropout: 0.0
+      bottleneck_attention: true
+      attention_heads: 4
+      zero_init_output: true
+
   mamba_temporal_enabled: false
   mamba_temporal_channels: 16   # per-pixel feature width of the encoder/SSM
   mamba_temporal_state: 8       # SSM hidden state dimension (N)
@@ -375,7 +447,7 @@ training:
   # Train each later lead on the same corrected autoregressive state that
   # inference feeds back, while retaining the unrefined prediction as the
   # residual-loss reference.
-  flow_refine_autoregressive_feedback: true
+  flow_refine_autoregressive_feedback: false
 
   # ---------------------------------------------------------------------
   # Structural auxiliary losses for the flow-matching refine head.
@@ -455,3 +527,34 @@ notebook:
     - go3
     - gtco3
   verbosity: 1
+
+performance:
+  profile: false
+  dataloader:
+    num_workers: auto
+    pin_memory: true
+    persistent_workers: true
+    prefetch_factor: 2
+    non_blocking_transfer: true
+  precision:
+    mode: fp32
+    allow_tf32: false
+  compile:
+    enabled: false
+    aurora: false
+    refinement: false
+  rollout_cache:
+    enabled: false
+    path: null
+    validate_cache: true
+  conditioning_cache:
+    enabled: false
+    path: null
+    validate_cache: true
+  ensemble:
+    batch_members: true
+    chunk_size: auto
+  io:
+    atomic_checkpoints: true
+    netcdf_compression: true
+    netcdf_compression_level: 4

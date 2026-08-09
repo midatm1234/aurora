@@ -24,6 +24,7 @@ import math
 import os
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 
 import numpy as np
@@ -136,6 +137,23 @@ def _allreduce_grads(model: torch.nn.Module, world_size: int):
             param.grad.data.copy_((grad_cpu / world_size).to(param.grad.dtype))
 
 
+def _optimizer_updates_per_epoch(
+    num_samples: int,
+    *,
+    world_size: int,
+    batch_size: int,
+    accumulation_steps: int,
+) -> int:
+    """Return scheduler steps per epoch after sharding and accumulation."""
+    samples_per_rank = max(1, int(math.ceil(num_samples / max(1, world_size))))
+    batches_per_rank = max(
+        1, int(math.ceil(samples_per_rank / max(1, batch_size))),
+    )
+    return max(
+        1, int(math.ceil(batches_per_rank / max(1, accumulation_steps))),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Distributed validation
 # ---------------------------------------------------------------------------
@@ -151,7 +169,10 @@ def _distributed_validation(
     my_samples = val_samples[rank * per_rank : min((rank + 1) * per_rank, len(val_samples))]
 
     loss_sum = torch.zeros(1)
+    baseline_loss_sum = torch.zeros(1)
     count = torch.zeros(1)
+    inner = model.module if hasattr(model, "module") else model
+    baseline_model = getattr(inner, "base", None)
 
     with torch.inference_mode():
         for i in range(0, len(my_samples), batch_size):
@@ -162,18 +183,42 @@ def _distributed_validation(
                 norm_stats=norm_stats,
             )
             loss_sum += loss.detach().cpu()
+            if baseline_model is not None:
+                baseline_loss, _ = ft.compute_supervised_loss(
+                    model=baseline_model, ds=ds_val, samples=sample_batch,
+                    config=cfg, resolved_specs=resolved_specs, device=device,
+                    norm_stats=norm_stats,
+                )
+            else:
+                baseline_loss = loss
+            baseline_loss_sum += baseline_loss.detach().cpu()
             count += 1
             if pbar is not None and rank == 0:
                 pbar.update(1)
                 pbar.set_postfix(
                     val_loss=loss_sum.item() / max(count.item(), 1.0),
+                    base_loss=baseline_loss_sum.item() / max(count.item(), 1.0),
                     refresh=True,
                 )
 
     dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
+    dist.all_reduce(baseline_loss_sum, op=dist.ReduceOp.SUM)
     dist.all_reduce(count, op=dist.ReduceOp.SUM)
     val_loss = (loss_sum / count).item() if count.item() > 0 else math.nan
-    return {"val_loss": val_loss, "num_val_batches": int(count.item())}
+    baseline_val_loss = (
+        (baseline_loss_sum / count).item() if count.item() > 0 else math.nan
+    )
+    improvement_percent = (
+        100.0 * (baseline_val_loss - val_loss) / abs(baseline_val_loss)
+        if np.isfinite(baseline_val_loss) and abs(baseline_val_loss) > 1.0e-12
+        else math.nan
+    )
+    return {
+        "val_loss": val_loss,
+        "baseline_val_loss": baseline_val_loss,
+        "val_improvement_percent": improvement_percent,
+        "num_val_batches": int(count.item()),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -189,11 +234,25 @@ def _worker(rank: int, world_size: int, local_gpu: int, cfg: dict):
     device = torch.device(f"cuda:{local_gpu}")
     physical_gpus = os.environ.get("CUDA_VISIBLE_DEVICES", "")
     train_cfg = cfg["training"]
+    cfg.setdefault("runtime", {})["training_run_id"] = os.environ.get(
+        "_AURORA_TRAINING_RUN_ID", ""
+    )
     skip_validation = bool(train_cfg.get("skip_validation", False))
+    validation_source = str(
+        train_cfg.get("validation_source", "configured")
+    ).lower()
+    if validation_source not in {"configured", "train_tail"}:
+        raise ValueError(
+            "training.validation_source must be `configured` or `train_tail`."
+        )
 
     # ---- data (every rank, read-only) ----
     train_ds = ft.open_dataset(cfg["paths"]["train_data_path"], cfg)
-    val_ds = None if skip_validation else ft.open_dataset(cfg["paths"]["val_data_path"], cfg)
+    val_ds = (
+        None
+        if skip_validation or validation_source == "train_tail"
+        else ft.open_dataset(cfg["paths"]["val_data_path"], cfg)
+    )
     test_ds = ft.open_dataset(cfg["paths"]["test_data_path"], cfg)
 
     longitude_datasets = [train_ds, test_ds]
@@ -202,6 +261,8 @@ def _worker(rank: int, world_size: int, local_gpu: int, cfg: dict):
     lon_periodic = ft.validate_longitude_consistency(longitude_datasets, cfg)
     lon_dim = str(cfg.get("data", {}).get("lon_dim", "longitude"))
     train_lon = train_ds[lon_dim].values
+    lat_dim = str(cfg.get("data", {}).get("lat_dim", "latitude"))
+    train_lat = train_ds[lat_dim].values if lat_dim in train_ds.coords else None
     _print0(
         rank,
         f"Longitude grid: {len(train_lon)} columns | periodic={lon_periodic} | "
@@ -214,12 +275,44 @@ def _worker(rank: int, world_size: int, local_gpu: int, cfg: dict):
         if val_ds is not None:
             val_ds = ft.merge_external_static_vars(val_ds, static_path, cfg)
         test_ds = ft.merge_external_static_vars(test_ds, static_path, cfg)
+    if not skip_validation and validation_source == "train_tail":
+        val_ds = train_ds
 
     resolved_specs = ft.resolve_variable_specs(train_ds, cfg)
     norm_stats = ft.compute_target_normalization_stats(train_ds, resolved_specs, cfg)
     _print0(rank, f"Norm stats: { {k: {sk: sv.tolist() for sk, sv in v.items()} for k, v in norm_stats.items()} }")
     train_samples = ft.build_training_samples(train_ds, cfg, split_name="train")
-    val_samples = [] if skip_validation else ft.build_training_samples(val_ds, cfg, split_name="val")
+    if skip_validation:
+        val_samples = []
+    elif validation_source == "train_tail":
+        validation_fraction = float(
+            train_cfg.get("validation_fraction", 0.1)
+        )
+        if not 0.0 < validation_fraction < 0.5:
+            raise ValueError(
+                "training.validation_fraction must be between 0 and 0.5 "
+                "for validation_source=train_tail."
+            )
+        all_samples = train_samples
+        val_count = max(1, int(math.ceil(len(all_samples) * validation_fraction)))
+        split_index = len(all_samples) - val_count
+        gap = max(int(x) for x in cfg["data"].get("target_lead_times", [1]))
+        train_end = split_index - gap
+        if train_end <= 0:
+            raise ValueError(
+                "Not enough training samples for a disjoint train-tail "
+                f"validation split (samples={len(all_samples)}, "
+                f"validation={val_count}, temporal_gap={gap})."
+            )
+        train_samples = all_samples[:train_end]
+        val_samples = all_samples[split_index:]
+        _print0(
+            rank,
+            f"Validation source: train tail | train={len(train_samples)} | "
+            f"gap={gap} sample(s) | val={len(val_samples)}",
+        )
+    else:
+        val_samples = ft.build_training_samples(val_ds, cfg, split_name="val")
     val_label = "skipped" if skip_validation else str(len(val_samples))
     _print0(rank, f"Train samples: {len(train_samples)} | Val samples: {val_label}")
 
@@ -265,25 +358,47 @@ def _worker(rank: int, world_size: int, local_gpu: int, cfg: dict):
     # If the flow wrapper is in use, hand it the per-variable normalisation
     # stats so its de-normalisation step at inference time matches the
     # space the FM head was trained in.
-    try:
-        from finetune.flow_refine import AuroraFlowRefine as _AFR
-        if isinstance(model, _AFR):
-            model.set_norm_stats(norm_stats)
+    from finetune.flow_refine import AuroraFlowRefine as _AFR
+    if isinstance(model, _AFR):
+        model.set_norm_stats(norm_stats)
+        _print0(
+            rank,
+            f"Flow-refine head active: {model.refine_parameter_count():,} "
+            f"trainable refine params, sampling_steps={model.sampling_steps}",
+        )
+        if getattr(model, "has_temporal", False):
             _print0(
                 rank,
-                f"Flow-refine head active: {model.refine_parameter_count():,} "
-                f"trainable refine params, sampling_steps={model.sampling_steps}",
+                f"Mamba temporal module active: "
+                f"{model.temporal_parameter_count():,} params "
+                f"(surf={list(model.target_surf_vars)}, "
+                f"atmos={list(model.target_atmos_vars)})",
             )
-            if getattr(model, "has_temporal", False):
-                _print0(
-                    rank,
-                    f"Mamba temporal module active: "
-                    f"{model.temporal_parameter_count():,} params "
-                    f"(surf={list(model.target_surf_vars)}, "
-                    f"atmos={list(model.target_atmos_vars)})",
-                )
-    except Exception:
-        pass
+
+    # Optionally wrap with the unified stochastic residual refiner
+    # (flow_matching_transformer / diffusion_unet / diffusion_transformer).
+    # Returns the model unchanged for `none` and for the legacy
+    # flow_matching_unet path handled above.
+    model = ft.maybe_wrap_stochastic_refine(
+        model,
+        cfg,
+        resolved_specs,
+        lon=train_lon,
+        lat=train_lat,
+        norm_stats=norm_stats,
+    )
+    from finetune.refinement.two_phase import AuroraTwoPhaseRefiner as _ATP
+
+    if isinstance(model, _ATP):
+        _print0(
+            rank,
+            f"Stochastic refinement active: type="
+            f"{model.refinement_config.type}, "
+            f"{model.refine_parameter_count():,} refiner params, "
+            f"aurora_frozen={model.aurora_frozen}, "
+            f"channels={model.packing.num_channels}, "
+            f"feedback_to_rollout={model.refinement_config.feedback_to_rollout}",
+        )
 
     param_summary = ft.configure_trainable_parameters(model, cfg)
     _print0(rank, f"Parameters: {json.dumps(param_summary)}")
@@ -471,7 +586,16 @@ def _worker(rank: int, world_size: int, local_gpu: int, cfg: dict):
     save_last = bool(train_cfg.get("save_last", True))
     diagnostics_enabled = bool(train_cfg.get("diagnostics_enabled", False))
 
-    updates_per_epoch = max(1, int(np.ceil(len(train_samples) / max(1, batch_size))))
+    # The scheduler advances once per *optimizer update*, not once per sample
+    # batch. Account for both data-parallel sharding and gradient accumulation;
+    # omitting accumulation made a 32-step accumulated run decay its LR about
+    # 32x too slowly.
+    updates_per_epoch = _optimizer_updates_per_epoch(
+        len(train_samples),
+        world_size=world_size,
+        batch_size=batch_size,
+        accumulation_steps=accumulation_steps,
+    )
     scheduler = ft.create_scheduler(
         optimizer, cfg, num_training_steps=updates_per_epoch * max(1, num_epochs),
     )
@@ -502,7 +626,28 @@ def _worker(rank: int, world_size: int, local_gpu: int, cfg: dict):
     if resume_path and resume_path.exists():
         _print0(rank, f"Resuming from checkpoint: {resume_path}")
         ckpt = torch.load(str(resume_path), map_location=device, weights_only=False)
+        saved_run_id = (
+            ckpt.get("config", {}).get("runtime", {}).get("training_run_id")
+        )
+        if saved_run_id:
+            cfg["runtime"]["training_run_id"] = str(saved_run_id)
         ft.validate_checkpoint_longitude(model, ckpt)
+        saved_temporal_enabled = bool(
+            ckpt.get("config", {}).get("model", {}).get(
+                "mamba_temporal_enabled", False,
+            )
+        )
+        current_temporal_enabled = bool(
+            cfg.get("model", {}).get("mamba_temporal_enabled", False)
+        )
+        temporal_migration = saved_temporal_enabled != current_temporal_enabled
+        ft.validate_checkpoint_refinement_contract(
+            model,
+            ckpt,
+            cfg,
+            resolved_specs,
+            allow_temporal_migration=True,
+        )
         # Tolerant load so checkpoints from flow-matching-only runs (which lack
         # the Mamba temporal parameters) resume cleanly into a temporal-enabled
         # model, and vice-versa. Missing keys keep their fresh init; unexpected
@@ -517,11 +662,24 @@ def _worker(rank: int, world_size: int, local_gpu: int, cfg: dict):
         if unexpected:
             _print0(rank, f"  checkpoint has {len(unexpected)} unexpected key(s) "
                           f"(ignored), e.g. {unexpected[:3]}")
-        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-        checkpoint_group_lrs = [float(g["lr"]) for g in optimizer.param_groups]
+        if temporal_migration:
+            _print0(
+                rank,
+                "  Temporal architecture changed; keeping the current optimizer "
+                "and scheduler state so new/removed Mamba parameters are handled safely.",
+            )
+            checkpoint_group_lrs = configured_group_lrs
+        else:
+            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            checkpoint_group_lrs = [float(g["lr"]) for g in optimizer.param_groups]
         skip_sched = bool(train_cfg.get("resume_skip_scheduler", False))
         scheduler_state = ckpt.get("scheduler_state_dict")
-        if scheduler is not None and scheduler_state is not None and not skip_sched:
+        if (
+            scheduler is not None
+            and scheduler_state is not None
+            and not skip_sched
+            and not temporal_migration
+        ):
             scheduler.load_state_dict(scheduler_state)
             restored_lrs = scheduler.get_last_lr()
             if not isinstance(restored_lrs, (list, tuple)) or len(restored_lrs) != len(
@@ -559,6 +717,25 @@ def _worker(rank: int, world_size: int, local_gpu: int, cfg: dict):
     elif resume_training and resume_from:
         _print0(rank, f"WARNING: resume_from='{resume_from}' but checkpoint not found — training from scratch")
 
+    # Mark the current logical run independently of best/last. Inference uses
+    # this marker to reject a stale best checkpoint when a fresh run produces
+    # no acceptable validation improvement.
+    if rank == 0:
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        (checkpoint_dir / "training_run.metadata.json").write_text(
+            json.dumps(
+                {
+                    "training_run_id": cfg.get("runtime", {}).get(
+                        "training_run_id", ""
+                    ),
+                    "resume_path": str(resume_path) if resume_path else None,
+                },
+                indent=2,
+            )
+            + "\n"
+        )
+    dist.barrier()
+
     patience_cfg = train_cfg.get("early_stopping", {})
     early_stop_enabled = bool(patience_cfg.get("enabled", False))
     patience = int(patience_cfg.get("patience", 5))
@@ -569,33 +746,30 @@ def _worker(rank: int, world_size: int, local_gpu: int, cfg: dict):
     for epoch in range(start_epoch, num_epochs):
         model.train()
 
-        # Progressive sampling-steps schedule for the flow-matching head.
-        # Phase 1 (epochs [0, num_epochs/3)): single-step deterministic
-        #   regression — learn the residual mean fast and stably.
-        # Phase 2 (epochs [num_epochs/3, num_epochs)): multi-step stochastic
-        #   refinement — let the head model the conditional residual
-        #   distribution (multi-modal corrections, calibrated spread).
-        # Only affects eval-time sampling; training loss is independent of
-        # `sampling_steps` (loss draws t uniformly in [0,1]).
-        try:
-            from finetune.flow_refine import AuroraFlowRefine as _AFR
-            inner = model.module if hasattr(model, "module") else model
-            if isinstance(inner, _AFR):
-                init_steps = int(model_cfg.get("flow_refine_sampling_steps", 1))
-                late_steps = int(model_cfg.get("flow_refine_sampling_steps_late", 8))
-                phase_frac = float(model_cfg.get("flow_refine_phase_fraction", 1.0 / 3.0))
-                switch_epoch = int(round(num_epochs * phase_frac))
-                desired = late_steps if epoch >= switch_epoch else init_steps
-                if desired != inner.sampling_steps:
-                    if rank == 0:
-                        print(
-                            f"  [flow] epoch {epoch}: sampling_steps "
-                            f"{inner.sampling_steps} -> {desired} "
-                            f"(switch at epoch {switch_epoch})"
-                        )
-                    inner.sampling_steps = desired
-        except Exception:
-            pass
+        # Optional sampling-step schedule. The safe default keeps deterministic
+        # one-step validation throughout. Multi-step stochastic validation must
+        # be requested explicitly and is inappropriate for deterministic
+        # bias-correction model selection unless ensemble metrics are used.
+        # Training loss itself is independent of `sampling_steps`.
+        inner = model.module if hasattr(model, "module") else model
+        if isinstance(inner, _AFR):
+            init_steps = int(model_cfg.get("flow_refine_sampling_steps", 1))
+            late_steps = int(
+                model_cfg.get("flow_refine_sampling_steps_late", init_steps)
+            )
+            phase_frac = float(
+                model_cfg.get("flow_refine_phase_fraction", 1.0 / 3.0)
+            )
+            switch_epoch = int(round(num_epochs * phase_frac))
+            desired = late_steps if epoch >= switch_epoch else init_steps
+            if desired != inner.sampling_steps:
+                if rank == 0:
+                    print(
+                        f"  [flow] epoch {epoch}: sampling_steps "
+                        f"{inner.sampling_steps} -> {desired} "
+                        f"(switch at epoch {switch_epoch})"
+                    )
+                inner.sampling_steps = desired
 
         epoch_samples = list(train_samples)
         rng = np.random.default_rng(int(train_cfg.get("seed", 42)) + epoch)
@@ -679,6 +853,7 @@ def _worker(rank: int, world_size: int, local_gpu: int, cfg: dict):
             if update_now:
                 _allreduce_grads(model, world_size)
                 trainable_params = [p for p in model.parameters() if p.requires_grad]
+                optimizer_updated = False
                 # ---- DIAGNOSTIC: locate top-gradient params on first update ----
                 if diagnostics_enabled and global_step <= 1 and rank == 0:
                     grad_info = []
@@ -714,6 +889,7 @@ def _worker(rank: int, world_size: int, local_gpu: int, cfg: dict):
                         min(float(pre_clip_norm), grad_clip) if grad_clip > 0 else float(pre_clip_norm)
                     )
                     optimizer.step()
+                    optimizer_updated = True
                     optimizer.zero_grad(set_to_none=True)
                     if rank == 0:
                         pbar.set_postfix(
@@ -724,7 +900,7 @@ def _worker(rank: int, world_size: int, local_gpu: int, cfg: dict):
                             clip=f"{post_clip:.2e}",
                             refresh=True,
                         )
-                if scheduler is not None:
+                if scheduler is not None and optimizer_updated:
                     scheduler.step()
 
             epoch_loss_sum += float(loss.detach().cpu().item())
@@ -746,6 +922,8 @@ def _worker(rank: int, world_size: int, local_gpu: int, cfg: dict):
 
         # ---- validation ----
         val_loss = float("nan")
+        baseline_val_loss = float("nan")
+        val_improvement_percent = float("nan")
         if should_validate:
             val_pbar = tqdm(
                 total=n_val_batches,
@@ -762,6 +940,10 @@ def _worker(rank: int, world_size: int, local_gpu: int, cfg: dict):
                 norm_stats=norm_stats, pbar=val_pbar,
             )
             val_loss = float(val_metrics["val_loss"])
+            baseline_val_loss = float(val_metrics["baseline_val_loss"])
+            val_improvement_percent = float(
+                val_metrics["val_improvement_percent"]
+            )
             val_pbar.close()
             model.train()
 
@@ -770,6 +952,8 @@ def _worker(rank: int, world_size: int, local_gpu: int, cfg: dict):
             "global_step": global_step,
             "train_loss": train_loss,
             "val_loss": val_loss,
+            "baseline_val_loss": baseline_val_loss,
+            "val_improvement_percent": val_improvement_percent,
             "lr": float(optimizer.param_groups[0]["lr"]),
         }
         history.append(row)
@@ -778,11 +962,27 @@ def _worker(rank: int, world_size: int, local_gpu: int, cfg: dict):
         _print0(
             rank,
             f"Epoch {epoch + 1}/{num_epochs} | train_loss={train_loss:.4f} | "
-            f"val_loss={val_loss:.4f} | "
+            f"val_loss={val_loss:.4f} | baseline_val_loss={baseline_val_loss:.4f} | "
+            f"improvement={val_improvement_percent:+.2f}% | "
             f"mem={torch.cuda.memory_allocated(device) / 1e9:.1f}GB",
         )
 
-        improved = should_validate and np.isfinite(val_loss) and (val_loss < (best_val_loss - min_delta))
+        require_improvement = bool(
+            train_cfg.get("require_refinement_improvement", False)
+        )
+        non_degrading = (
+            not require_improvement
+            or (
+                np.isfinite(baseline_val_loss)
+                and val_loss <= baseline_val_loss
+            )
+        )
+        improved = (
+            should_validate
+            and np.isfinite(val_loss)
+            and non_degrading
+            and (val_loss < (best_val_loss - min_delta))
+        )
         if improved:
             best_val_loss = val_loss
             no_improve_epochs = 0
@@ -819,10 +1019,21 @@ def _worker(rank: int, world_size: int, local_gpu: int, cfg: dict):
 
         rollout_cfg = cfg.get("rollout", {})
         if bool(rollout_cfg.get("run_rollout_after_training", True)):
-            if last_ckpt_path.exists():
-                state = torch.load(str(last_ckpt_path), map_location=device, weights_only=False)
+            rollout_ckpt_path = (
+                best_ckpt_path
+                if np.isfinite(best_val_loss) and best_ckpt_path.exists()
+                else last_ckpt_path
+            )
+            if rollout_ckpt_path.exists():
+                state = torch.load(
+                    str(rollout_ckpt_path), map_location=device, weights_only=False,
+                )
                 ft.validate_checkpoint_longitude(model, state)
+                ft.validate_checkpoint_refinement_contract(
+                    model, state, cfg, resolved_specs,
+                )
                 model.load_state_dict(state["model_state_dict"])
+                _print0(rank, f"Post-training rollout checkpoint: {rollout_ckpt_path}")
 
             input_steps = int(cfg["data"].get("input_time_steps", 2))
             test_samples = [{
@@ -944,6 +1155,7 @@ def main():
     env["CUDA_VISIBLE_DEVICES"] = visible_devices
     env["_AURORA_GPU_IDS"] = visible_devices
     env["_AURORA_CONFIG"] = str(config_path.resolve())
+    env["_AURORA_TRAINING_RUN_ID"] = uuid.uuid4().hex
     # Mitigate fragmentation in the long, multi-stage rollout fine-tune. The
     # FM head allocates many small tensors per (lead × level × variable);
     # the default best-fit allocator fragments enough to OOM on a 22 GB A10G

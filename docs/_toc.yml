@@ -9,6 +9,7 @@ parts:
     - file: tracking
     - file: beware
     - file: finetuning
+    - file: STOCHASTIC_REFINEMENT
     - file: ai_models_plugin
     - file: api
 - caption: Examples

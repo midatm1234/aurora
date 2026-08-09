@@ -111,7 +111,7 @@ Two heads are available, mutually exclusive:
 | Head | File | Behaviour | Best for |
 |------|------|-----------|----------|
 | `AuroraConvRefine` | `conv_refine.py` | Deterministic per-variable 3-conv stack. ~few-hundred-K params. | Cheapest baseline, single forward pass. |
-| `AuroraFlowRefine` | `flow_refine.py` | Rectified-flow / x₁-prediction UNet (FiLM time-conditioned), zero-init output layer. ~4 M params. | Multi-modal residual structure; principled single-step regression *and* multi-step stochastic refinement from the same weights. |
+| `AuroraFlowRefine` | `flow_refine.py` | Rectified-flow / x₁-prediction UNet (separate FiLM flow-time and forecast-lead conditioning), zero-init output layer. ~4 M params. | Deterministic lead-aware residual correction; optional stochastic sampling when it is explicitly validated as an ensemble product. |
 
 Enable in YAML:
 
@@ -120,9 +120,10 @@ model:
   conv_refine_enabled: false
   flow_refine_enabled: true
   flow_refine_hidden: 64
-  flow_refine_sampling_steps: 1        # phase-1 eval (deterministic regression)
-  flow_refine_sampling_steps_late: 8   # phase-2 eval (stochastic refinement)
-  flow_refine_phase_fraction: 0.3333   # epoch fraction at which phase 2 begins
+  flow_refine_lead_time_cond: true
+  flow_refine_lead_time_scale_hours: 72  # normalize and bound trained support
+  flow_refine_sampling_steps: 1        # safe deterministic source-mean query
+  flow_refine_sampling_steps_late: 1   # keep deterministic for bias correction
 
 training:
   scale_aware_lr:
@@ -133,12 +134,27 @@ training:
 The flow-matching head is described in detail in `Aurora_air_pollution_finetune.md`. Key properties:
 
 - **Identity-at-init** (zero-init output): `eval()` output before any training equals Aurora's prediction exactly.
-- **Train-loss is residual-MSE at random noise level** in normalised space — *not* directly comparable to a prediction MSE.
-- **Eval uses an iterative sampler** controlled by `sampling_steps`. The trainer ramps it from 1 → `flow_refine_sampling_steps_late` at epoch ≥ `num_epochs × phase_fraction`.
+- **Train-loss includes the exact inference endpoint**: besides random-noise-level residual regression, `deterministic_reconstruction_weight` trains `t=0, x₀=0` directly. The degradation hinge penalises a correction whose squared error exceeds the unchanged baseline.
+- **Single-step inference queries `t=0, x₀=0`**, where the squared-error target is the conditional residual mean. The old `t=1, x_t=0` query was inconsistent because training has `x_t=r` at `t=1`.
+- **Multi-step sampling is opt-in.** Do not use it for deterministic bias correction merely because the head supports it; validate ensemble calibration and magnitude metrics first.
+- **Forecast lead is explicit and separate from flow time.** Training derives cumulative hours from initialization and valid time; inference passes `step * rollout_step_hours`. Atmospheric levels receive the same case lead after the level axis is flattened. A lead-conditioned rollout fails beyond `flow_refine_lead_time_scale_hours` rather than extrapolating silently.
+
+The global O₃ failure analysis, mathematical corrections, before/after
+metrics, and remaining limitations are documented in
+[`REFINEMENT_REVIEW.md`](REFINEMENT_REVIEW.md). Expanded diagnostics can be
+generated without overwriting existing results:
+
+```bash
+python finetune/diagnose_refinement.py \
+  --config finetune/aurora_O3_global_finetune_3day_lead_config.yaml \
+  --finetuned-dir finetune/outputs/O3_global_3day_lead \
+  --output-dir finetune/outputs/O3_global_3day_lead/evaluation/refinement_diagnostics
+```
 
 ## Mamba Temporal Module (optional, for long-lead rollouts)
 
-The flow-matching head corrects each rollout step *independently* — it has no
+The flow-matching head is explicitly aware of cumulative forecast lead but
+still corrects each rollout step *independently* — it has no
 memory of how the field (or Aurora's error in it) evolves through time, which is
 exactly where 2–3 day rollouts drift relative to a 6 h forecast. The optional
 **Mamba temporal module** (`mamba_temporal.py`) adds a selective state-space
@@ -174,8 +190,8 @@ Key properties:
   behaviour. The flow-corrected frames are detached, so it trains only the Mamba
   parameters and leaves the flow head/backbone untouched.
 - **Causal multi-step rollout**: applied step-by-step over the growing history;
-  step *s* depends only on steps ≤ *s*. Works for any configured lead
-  (6 h, 12 h, 1/2/3 days).
+  step *s* depends only on steps ≤ *s*. Works for configured leads within
+  the support used to train the checkpoint.
 - **Portable**: a pure-PyTorch selective scan runs on CPU/GPU with no extra
   deps; the `mamba_ssm` CUDA kernel is used automatically when available.
 
@@ -228,3 +244,26 @@ In the notebook:
 3. Run preprocess/sample build.
 4. Train, validate, and save checkpoints (`best.ckpt`, `last.ckpt`).
 5. Run rollout and write outputs (`rollout_predictions.nc`, figures, manifest, history).
+
+## Stochastic Residual Refinement (Phase 2)
+
+The deterministic Aurora rollout can optionally be post-processed by a
+stochastic **residual** refiner selected with `model.refinement.type`:
+
+| value | model |
+| --- | --- |
+| `none` | disabled (deterministic Aurora only) |
+| `flow_matching_unet` (alias `flow_matching`) | the existing Aurora rectified-flow UNet heads |
+| `flow_matching_transformer` | spatial-token Transformer velocity network |
+| `diffusion_unet` | conditional convolutional UNet, DDPM training / DDIM sampling |
+| `diffusion_transformer` | spatial-token Transformer denoiser, DDPM / DDIM |
+
+Configurations that only set the historical `model.flow_refine_*` keys keep
+working unchanged and resolve to `flow_matching_unet`.
+
+Refinement is postprocessing of each rollout step: the deterministic state that
+produces later rollout steps is not replaced. See
+[`docs/STOCHASTIC_REFINEMENT.md`](../docs/STOCHASTIC_REFINEMENT.md) for the full
+schema, the residual formulation, the spatial-attention design, checkpoint
+compatibility and example commands, and
+`finetune/examples/stochastic_refinement/` for ready-to-run example configs.

@@ -3,11 +3,11 @@
 This module adds a small **conditional residual regressor** on top of a
 frozen Aurora backbone.  The decoder learns
 
-    p(r | ŷ, x)  where  r = y_true - ŷ
+    p(r | ŷ, lead, x)  where  r = y_true - ŷ
 
-in the per-variable normalised space (so the per-level NO2 std-floor
-problem disappears: the loss is a unit-normal-scale MSE, no 1/std
-amplification).
+in the per-variable normalised space. When residual z-scoring is enabled,
+the residual target is additionally scaled to unit variance so it is
+commensurate with the unit-Gaussian source.
 
 We use the **x₁ (data) parameterisation** of rectified flow, which is
 mathematically equivalent to velocity-prediction but has two
@@ -18,10 +18,12 @@ practically important advantages:
   before any training happens. (With v-prediction, zero-init produces
   pure-noise residuals at eval, which is the wrong baseline.)
 * **Single-step deterministic eval is principled.** At ``sampling_steps
-  = 1`` the head reduces to a regression of ``E[r | ŷ]`` — exactly
-  what a deterministic conv-refine learns — but trained at *all* noise
-  levels, which acts as a strong stochastic regulariser. Multi-step
-  refinement is a strict generalisation.
+  = 1`` the head is queried at the *source* endpoint ``t=0, x₀=0``.
+  Since source noise is independent of the target residual, the
+  squared-error optimum there is ``E[r | ŷ]``. Querying ``t=1, x_t=0``
+  is mathematically wrong: training has ``x_t=r`` at ``t=1``, so that
+  input asks the network about a zero residual rather than the
+  conditional residual mean.
 
 Why not DDPM:
 
@@ -40,7 +42,7 @@ The wrapper ``AuroraFlowRefine`` plugs in the same way as
         target_surf_vars=("tcno2",),
         target_atmos_vars=("no2",),
         hidden=64,
-        sampling_steps=1,   # 1 = deterministic regression; >1 = MCMC-style
+        sampling_steps=1,   # safe default: deterministic conditional mean
     )
     model.set_norm_stats(norm_stats)  # required for de-norm at inference
 
@@ -54,10 +56,9 @@ Training:
 
 Inference / validation:
 
-* ``model.eval()`` then ``forward(batch)`` runs Aurora once, then for
-  each target variable iteratively refines a residual estimate via the
-  noise-conditioned regressor, and returns ``ŷ + r̂`` in physical
-  space.
+* ``model.eval()`` then ``forward(batch)`` runs Aurora once and returns
+  ``ŷ + r̂`` in physical space. The safe default queries the deterministic
+  source mean once; explicit multi-step sampling starts from Gaussian noise.
 
 For atmospheric variables, each pressure level is processed
 independently by the same shared UNet (level dim is collapsed into the
@@ -121,6 +122,18 @@ DEFAULT_AUX_LOSS_CONFIG: dict = {
     # constrains the field's *mean*. This term directly penalises a
     # systematic domain-wide offset (e.g. the column-O3 low bias).
     "bias_weight": 0.0,
+    # Train the exact deterministic inference query (t=0, x0=0) against the
+    # true standardised residual. The random-t x1 objective alone does not
+    # constrain this single point strongly enough on small residual datasets.
+    "deterministic_reconstruction_weight": 0.0,
+    # Hinge penalty on pointwise degradation relative to the unrefined
+    # baseline: relu((r_hat-r)^2-r^2). This is zero whenever refinement is no
+    # worse than applying no correction.
+    "degradation_weight": 0.0,
+    # Structural losses should normally act on the same deterministic
+    # correction used at inference, not on a random-t estimate that receives
+    # part of the true residual through x_t.
+    "aux_on_deterministic": False,
     # Vertical-profile consistency (atmospheric vars only): level-to-level
     # finite-difference MSE.
     "vertical_weight": 0.0,
@@ -387,7 +400,7 @@ class _ConvBlock(nn.Module):
 
 
 class ResidualFlowUNet(nn.Module):
-    """Tiny conditional UNet predicting the rectified-flow velocity.
+    """Tiny conditional UNet predicting the clean residual endpoint.
 
     Inputs (concatenated along the channel axis):
       * ``cond``  — Aurora's normalised prediction ŷ_norm   (1 ch)
@@ -395,9 +408,11 @@ class ResidualFlowUNet(nn.Module):
       * ``coords`` — optional cyclic ``[sin(lon), cos(lon)]`` maps (2 ch), enabled
         via ``lon_encoding=True``. Longitude is never fed as a raw (discontinuous)
         value; the ``sin``/``cos`` pair is smooth across the 0°/360° dateline.
-    Time ``t`` is fed via FiLM modulation in every conv block.
+    Flow time ``t`` and optional cumulative forecast lead time are fed via FiLM
+    modulation in every conv block.
 
-    The output (1 ch) is the predicted velocity ``v_θ(x_t, t, ŷ)``.
+    The output (1 ch) is the predicted residual endpoint
+    ``r_θ(x_t, t, ŷ)`` (the x1/data parameterisation), not flow velocity.
 
     All spatial convolutions pad longitude circularly when ``lon_periodic`` so no
     seam is introduced at the dateline on a global domain.
@@ -412,12 +427,21 @@ class ResidualFlowUNet(nn.Module):
         hidden: int = 64,
         time_dim: int = 128,
         doy_cond: bool = False,
+        lead_time_cond: bool = False,
+        lead_time_scale_hours: float = 72.0,
         lon_periodic: bool = True,
         lon_encoding: bool = False,
     ) -> None:
         super().__init__()
         self.time_dim = time_dim
         self.doy_cond = bool(doy_cond)
+        self.lead_time_cond = bool(lead_time_cond)
+        self.lead_time_scale_hours = float(lead_time_scale_hours)
+        if self.lead_time_cond and (
+            not math.isfinite(self.lead_time_scale_hours)
+            or self.lead_time_scale_hours <= 0
+        ):
+            raise ValueError("lead_time_scale_hours must be positive.")
         self.lon_periodic = bool(lon_periodic)
         self.lon_encoding = bool(lon_encoding)
         self.time_mlp = nn.Sequential(
@@ -437,6 +461,18 @@ class ResidualFlowUNet(nn.Module):
             )
             nn.init.zeros_(self.doy_mlp[-1].weight)
             nn.init.zeros_(self.doy_mlp[-1].bias)
+        # Continuous cumulative forecast-lead conditioning. The monotone
+        # features preserve the ordering 12 h < ... < 72 h without a
+        # discrete embedding lookup. Rollout code bounds requested leads to
+        # the support used during training.
+        if self.lead_time_cond:
+            self.lead_mlp = nn.Sequential(
+                nn.Linear(3, time_dim),
+                nn.SiLU(),
+                nn.Linear(time_dim, time_dim),
+            )
+            nn.init.zeros_(self.lead_mlp[-1].weight)
+            nn.init.zeros_(self.lead_mlp[-1].bias)
         # Input channels: cond + x_t (+ sin/cos lon when lon_encoding).
         in_ch = 2 + (2 if self.lon_encoding else 0)
         # 3-level UNet operating at full / 1/2 / 1/4 resolution.
@@ -451,9 +487,8 @@ class ResidualFlowUNet(nn.Module):
         )
         self.up1 = _ConvBlock(hidden * 2 + hidden, hidden, time_dim, lon_periodic=lon_periodic)
         self.out = nn.Conv2d(hidden, 1, 1)
-        # Zero-init final projection so v(x_t, t, ŷ) ≡ 0 at init.
-        # Then x_1 = x_0 (pure noise) → r̂ = 0 → output = ŷ at init,
-        # exactly like the conv-refine "identity-at-init" property.
+        # Zero-init final projection so r_hat(x_t, t, y_hat) == 0 at init,
+        # giving an exact identity refinement before training.
         nn.init.zeros_(self.out.weight)
         nn.init.zeros_(self.out.bias)
 
@@ -463,9 +498,10 @@ class ResidualFlowUNet(nn.Module):
         t: torch.Tensor,
         cond: torch.Tensor,
         doy: torch.Tensor | None = None,
+        lead_hours: torch.Tensor | None = None,
         coords: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Predict the FM velocity field.
+        """Predict the clean residual endpoint.
 
         Args:
           x_t:  (N, 1, H, W)  — interpolated noisy residual.
@@ -474,11 +510,13 @@ class ResidualFlowUNet(nn.Module):
           doy:  (N,) or None  — fractional day-of-year in [0, 1) for seasonal
                 conditioning (used only when the head was built with
                 ``doy_cond=True``).
+          lead_hours: (N,) or None — cumulative forecast lead in hours, used
+                only when ``lead_time_cond=True``.
           coords: (N, 2, H, W) or None — cyclic ``[sin(lon), cos(lon)]`` maps,
                 used only when the head was built with ``lon_encoding=True``.
 
         Returns:
-          (N, 1, H, W) velocity prediction.
+          (N, 1, H, W) clean residual endpoint prediction.
         """
         if self.lon_periodic and cond.shape[-1] % 4 != 0:
             raise ValueError(
@@ -492,6 +530,42 @@ class ResidualFlowUNet(nn.Module):
                 device=t_emb.device, dtype=t_emb.dtype
             )
             t_emb = t_emb + self.doy_mlp(doy_embed)
+        if self.lead_time_cond:
+            if lead_hours is None:
+                raise ValueError(
+                    "lead_time_cond=True requires cumulative forecast lead hours."
+                )
+            lead_hours = torch.as_tensor(
+                lead_hours, device=t_emb.device, dtype=torch.float32,
+            ).reshape(-1)
+            if lead_hours.numel() == 1 and t_emb.shape[0] != 1:
+                lead_hours = lead_hours.expand(t_emb.shape[0])
+            if lead_hours.numel() != t_emb.shape[0]:
+                raise ValueError(
+                    f"Expected {t_emb.shape[0]} lead values, got "
+                    f"{lead_hours.numel()}."
+                )
+            if not torch.all(torch.isfinite(lead_hours)) or torch.any(
+                lead_hours <= 0
+            ):
+                raise ValueError(
+                    "Forecast lead hours must be finite and strictly positive."
+                )
+            if torch.any(lead_hours > self.lead_time_scale_hours + 1.0e-6):
+                raise ValueError(
+                    "Forecast lead exceeds lead_time_scale_hours, the trained "
+                    "support declared by this correction head."
+                )
+            scaled = lead_hours / self.lead_time_scale_hours
+            lead_features = torch.stack(
+                [
+                    scaled,
+                    torch.log1p(scaled),
+                    torch.sqrt(scaled.clamp_min(0.0)),
+                ],
+                dim=-1,
+            )
+            t_emb = t_emb + self.lead_mlp(lead_features).to(t_emb.dtype)
 
         if self.lon_encoding:
             if coords is None:
@@ -545,10 +619,10 @@ class AuroraFlowRefine(nn.Module):
         place of the standard MSE.
 
     Eval / inference:
-      * ``forward(batch)`` runs Aurora, then for each target variable
-        integrates the FM ODE (Euler, ``sampling_steps`` steps) starting
-        from a Gaussian noise sample, and returns ``ŷ + r̂`` in physical
-        space.
+      * ``forward(batch)`` runs Aurora, then for each target variable predicts
+        a correction and returns ``ŷ + r̂`` in physical space. The default
+        one-step path is deterministic; explicitly requested multi-step
+        sampling starts from a Gaussian source.
 
     The wrapper requires the per-variable normalisation stats (mean/std
     in physical space) so it can convert between ŷ_norm (where the FM
@@ -564,10 +638,12 @@ class AuroraFlowRefine(nn.Module):
         target_atmos_vars: tuple[str, ...] = (),
         hidden: int = 64,
         time_dim: int = 128,
-        sampling_steps: int = 8,
+        sampling_steps: int = 1,
         sigma_min: float = 1e-3,
         atmos_loss_levels: Mapping[str, Sequence[int]] | None = None,
         doy_cond: bool = False,
+        lead_time_cond: bool = False,
+        lead_time_scale_hours: float = 72.0,
         residual_zscore: bool = False,
         res_std_momentum: float = 0.99,
         lon_periodic: bool = True,
@@ -587,6 +663,13 @@ class AuroraFlowRefine(nn.Module):
         self.sampling_steps = int(sampling_steps)
         self.sigma_min = float(sigma_min)
         self.doy_cond = bool(doy_cond)
+        self.lead_time_cond = bool(lead_time_cond)
+        self.lead_time_scale_hours = float(lead_time_scale_hours)
+        if self.lead_time_cond and (
+            not math.isfinite(self.lead_time_scale_hours)
+            or self.lead_time_scale_hours <= 0
+        ):
+            raise ValueError("flow_refine_lead_time_scale_hours must be positive.")
         # Longitude periodicity. ``lon_periodic`` makes every conv pad longitude
         # circularly (global domain) so the correction has no seam at the
         # 0°/360° dateline; ``lon_encoding`` additionally feeds smooth
@@ -624,6 +707,8 @@ class AuroraFlowRefine(nn.Module):
             {
                 n: ResidualFlowUNet(
                     hidden, time_dim, doy_cond=self.doy_cond,
+                    lead_time_cond=self.lead_time_cond,
+                    lead_time_scale_hours=self.lead_time_scale_hours,
                     lon_periodic=self.lon_periodic, lon_encoding=self.lon_encoding,
                 )
                 for n in target_surf_vars
@@ -633,14 +718,17 @@ class AuroraFlowRefine(nn.Module):
             {
                 n: ResidualFlowUNet(
                     hidden, time_dim, doy_cond=self.doy_cond,
+                    lead_time_cond=self.lead_time_cond,
+                    lead_time_scale_hours=self.lead_time_scale_hours,
                     lon_periodic=self.lon_periodic, lon_encoding=self.lon_encoding,
                 )
                 for n in target_atmos_vars
             }
         )
 
-        # Per-variable running residual-std buffers used by the FM z-score
-        # (see ``residual_zscore``). Registered as buffers so they are saved in
+        # Per-variable (and, for configured atmospheric targets, per-level)
+        # running residual-std buffers used by the FM z-score. Registered so
+        # they are saved in
         # the checkpoint, moved with ``.to(device)`` and (best-effort) synced by
         # DDP. Initialised to 0.0 = "uninitialised": the first training update
         # seeds the buffer directly with the batch std, thereafter it tracks an
@@ -649,7 +737,13 @@ class AuroraFlowRefine(nn.Module):
         for kind, names in (("surf", self.target_surf_vars), ("atmos", self.target_atmos_vars)):
             for n in names:
                 bufname = f"_res_std__{kind}__{_sanitize_buffer_name(n)}"
-                self.register_buffer(bufname, torch.zeros(()))
+                level_count = (
+                    len(self._atmos_loss_level_indices.get(n, ()))
+                    if kind == "atmos"
+                    else 1
+                )
+                shape = (level_count,) if level_count > 1 else ()
+                self.register_buffer(bufname, torch.zeros(shape))
                 self._res_std_keys[(kind, n)] = bufname
 
         # Norm stats (physical-space mean/std per variable). For atmos the
@@ -772,6 +866,39 @@ class AuroraFlowRefine(nn.Module):
         feats = lon_cyclic_features(lon_t, h, device=device, dtype=dtype)  # (2, H, W)
         return feats.unsqueeze(0).expand(int(n), 2, int(h), int(w))
 
+    def _lead_hours_for_batch(
+        self,
+        lead_time_hours: float | torch.Tensor | None,
+        batch_size: int,
+        device: torch.device,
+    ) -> torch.Tensor | None:
+        # Validate and expand cumulative forecast lead hours to shape (B,).
+        # Flow interpolation time and forecast age are distinct quantities.
+        if not self.lead_time_cond:
+            return None
+        if lead_time_hours is None:
+            raise ValueError(
+                "Lead-conditioned refinement requires forecast_lead_time_hours. "
+                "Pass cumulative hours from initialization, not a rollout index."
+            )
+        lead = torch.as_tensor(
+            lead_time_hours, device=device, dtype=torch.float32,
+        ).reshape(-1)
+        if lead.numel() == 1 and int(batch_size) != 1:
+            lead = lead.expand(int(batch_size))
+        if lead.numel() != int(batch_size):
+            raise ValueError(
+                f"Expected {batch_size} forecast lead values, got {lead.numel()}."
+            )
+        if not torch.all(torch.isfinite(lead)) or torch.any(lead <= 0):
+            raise ValueError("Forecast lead hours must be finite and strictly positive.")
+        if torch.any(lead > self.lead_time_scale_hours + 1.0e-6):
+            raise ValueError(
+                f"Forecast lead exceeds the trained support of "
+                f"{self.lead_time_scale_hours:g} hours."
+            )
+        return lead
+
     # --- Flow-matching z-score (residual standardisation) ------------------
 
     def _residual_std(
@@ -781,12 +908,14 @@ class AuroraFlowRefine(nn.Module):
         ref: torch.Tensor,
         *,
         update: bool = True,
+        valid_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Per-variable residual std σ_r used to standardise the FM target.
 
-        Returns a scalar tensor (on ``ref``'s device/dtype). When
-        :attr:`residual_zscore` is off, or the variable has no buffer, returns
-        ``1.0`` so the flow operates on the raw residual (legacy behaviour).
+        Returns a scalar for a surface variable or a vector for configured
+        atmospheric loss levels. When :attr:`residual_zscore` is off, or the
+        variable has no buffer, returns ``1.0`` so the flow operates on the raw
+        residual (legacy behaviour).
 
         During training, when ``update=True``, the running EMA buffer is updated
         in-place from the batch residual std (``ref`` is the detached residual
@@ -804,28 +933,87 @@ class AuroraFlowRefine(nn.Module):
 
         if self.training and update:
             with torch.no_grad():
-                cur = ref.detach().float().std(unbiased=False).clamp_min(self.sigma_min)
-                # Under DDP each rank sees a different shard, so average the
-                # batch std across ranks before the EMA update. This keeps the
-                # σ_r buffer identical on every rank (strict cross-rank
-                # consistency); without it ranks would drift apart. The reduce
-                # runs on the buffer's device — gloo (CPU) in this project.
-                if dist.is_available() and dist.is_initialized():
-                    world = dist.get_world_size()
-                    if world > 1:
-                        cur = cur.clone()
-                        dist.all_reduce(cur, op=dist.ReduceOp.SUM)
-                        cur = cur / world
-                if float(buf) <= 0.0:
-                    buf.copy_(cur)
+                values = ref.detach().float()
+                finite = torch.isfinite(values)
+                if valid_mask is not None:
+                    finite = finite & valid_mask.bool()
+                if kind == "atmos" and buf.ndim == 1 and buf.numel() > 1:
+                    level_count = int(buf.numel())
+                    if values.ndim != 4:
+                        raise ValueError(
+                            "Atmospheric residual statistics require a 4-D tensor."
+                        )
+                    if values.shape[1] == level_count:
+                        by_level = values
+                        mask_by_level = finite
+                    elif values.shape[1] == 1 and values.shape[0] % level_count == 0:
+                        by_level = values.reshape(
+                            -1, level_count, *values.shape[-2:]
+                        )
+                        mask_by_level = finite.reshape_as(by_level)
+                    else:
+                        raise ValueError(
+                            f"Cannot map residual shape {tuple(values.shape)} to "
+                            f"{level_count} atmospheric loss levels."
+                        )
+                    clean = torch.where(
+                        mask_by_level, by_level, torch.zeros_like(by_level)
+                    )
+                    reduce_dims = (0, 2, 3)
+                    stats = torch.stack(
+                        [
+                            clean.sum(dim=reduce_dims),
+                            (clean * clean).sum(dim=reduce_dims),
+                            mask_by_level.sum(dim=reduce_dims).to(clean.dtype),
+                        ]
+                    )
                 else:
-                    m = self.res_std_momentum
-                    buf.copy_(m * buf + (1.0 - m) * cur)
+                    selected = values[finite]
+                    if selected.numel() == 0:
+                        return torch.where(
+                            buf.to(device=ref.device) > 0,
+                            buf.to(device=ref.device, dtype=ref.dtype),
+                            torch.ones_like(
+                                buf, device=ref.device, dtype=ref.dtype
+                            ),
+                        )
+                    stats = torch.stack(
+                        [
+                            selected.sum(),
+                            (selected * selected).sum(),
+                            selected.new_tensor(float(selected.numel())),
+                        ]
+                    )
+                # Reduce sufficient statistics, rather than averaging
+                # per-rank standard deviations, so unequal masks/shards still
+                # produce the exact global scale.
+                if dist.is_available() and dist.is_initialized():
+                    if dist.get_world_size() > 1:
+                        if str(dist.get_backend()).lower() == "gloo":
+                            stats = stats.cpu()
+                        dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+                count = stats[2]
+                mean = stats[0] / count.clamp_min(1.0)
+                variance = stats[1] / count.clamp_min(1.0) - mean.square()
+                cur = variance.clamp_min(0.0).sqrt().clamp_min(
+                    self.sigma_min
+                ).to(device=buf.device, dtype=buf.dtype)
+                valid_levels = count.to(device=buf.device) > 0
+                first = buf <= 0
+                updated = torch.where(
+                    first,
+                    cur,
+                    self.res_std_momentum * buf
+                    + (1.0 - self.res_std_momentum) * cur,
+                )
+                buf.copy_(torch.where(valid_levels, updated, buf))
 
-        sigma = float(buf)
-        if sigma <= 0.0:
-            return one
-        return buf.to(device=ref.device, dtype=ref.dtype).clamp_min(self.sigma_min)
+        sigma = buf.to(device=ref.device, dtype=ref.dtype)
+        return torch.where(
+            sigma > 0,
+            sigma.clamp_min(self.sigma_min),
+            torch.ones_like(sigma),
+        )
 
     # --- Flow-matching loss (called by supervised-loss code) ---------------
 
@@ -837,6 +1025,8 @@ class AuroraFlowRefine(nn.Module):
         kind: str,
         doy: torch.Tensor | None = None,
         lon: torch.Tensor | None = None,
+        valid_mask: torch.Tensor | None = None,
+        lead_time_hours: float | torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Conditional residual regression at a sampled noise level.
 
@@ -849,11 +1039,10 @@ class AuroraFlowRefine(nn.Module):
           * **Identity-at-init.** The output layer is zero-initialised so
             r̂ = 0 → fine-tune output = Aurora pred at init.
           * **Stable.** No 1/(1-t) division; loss is bounded for all t.
-          * **Single-step deterministic eval.** At ``t = 1`` and ``x₀ = 0``
-            the model is exactly E[r | ŷ] (ridge regression of the
-            residual on the conditioning), the same target a deterministic
-            conv-refine learns. Multi-step refinement is a strict
-            generalisation and can be enabled later.
+          * **Single-step deterministic eval.** At ``t = 0`` the source
+            ``x_t=x₀`` is independent of the target residual. Evaluating at
+            the source mean ``x₀=0`` therefore estimates E[r | ŷ], the same
+            target as a deterministic residual regressor.
           * **Mathematically equivalent to v-pred.** The FM velocity
             v* = x₁ − x₀ is recoverable as r̂ − (x_t − t·r̂)/(1-t).
 
@@ -865,6 +1054,12 @@ class AuroraFlowRefine(nn.Module):
           doy:         Optional per-sample fractional day-of-year (B,).
           lon:         Optional longitude vector (W,) in degrees for the cyclic
                        ``lon_encoding`` input (ignored when the feature is off).
+          valid_mask:  Optional boolean mask in the same shape as ``pred_norm``.
+                       Invalid points do not contribute to the regression or
+                       degradation losses.
+          lead_time_hours: Cumulative physical forecast hours, scalar or (B,).
+                       Required when lead conditioning is enabled and repeated
+                       across atmospheric levels after flattening.
 
         Returns:
           Scalar tensor — mean residual MSE.
@@ -879,14 +1074,37 @@ class AuroraFlowRefine(nn.Module):
             B, L, H, W = pred_norm.shape
             cond = pred_norm.reshape(B * L, 1, H, W)
             r = (target_norm - pred_norm).reshape(B * L, 1, H, W)
+            mask_flat = (
+                valid_mask.reshape(B * L, 1, H, W)
+                if valid_mask is not None
+                else None
+            )
         else:
             assert pred_norm.dim() == 3, f"surf pred must be (B,H,W), got {pred_norm.shape}"
             B, H, W = pred_norm.shape
             cond = pred_norm.reshape(B, 1, H, W)
             r = (target_norm - pred_norm).reshape(B, 1, H, W)
+            mask_flat = valid_mask.reshape(B, 1, H, W) if valid_mask is not None else None
+
+        lead_b = self._lead_hours_for_batch(
+            lead_time_hours, B, pred_norm.device,
+        )
+        lead_n = (
+            lead_b.repeat_interleave(L)
+            if lead_b is not None and kind == "atmos"
+            else lead_b
+        )
 
         cond = cond.detach()
         r = r.detach()
+        finite = torch.isfinite(cond) & torch.isfinite(r)
+        mask_flat = finite if mask_flat is None else (mask_flat.bool() & finite)
+        if not torch.any(mask_flat):
+            return torch.zeros((), device=pred_norm.device, dtype=pred_norm.dtype)
+        # Prevent invalid values from propagating through convolutions. They
+        # remain excluded from scalar losses by mask_flat.
+        cond = torch.where(mask_flat, cond, torch.zeros_like(cond))
+        r = torch.where(mask_flat, r, torch.zeros_like(r))
 
         N = cond.shape[0]
         device = cond.device
@@ -909,7 +1127,11 @@ class AuroraFlowRefine(nn.Module):
         # FM z-score: standardise the target residual so it is ~unit-variance,
         # scale-matched to the unit-variance noise x0. σ_r = 1 when the feature
         # is disabled, recovering the original residual-MSE objective exactly.
-        sigma_r = self._residual_std(kind, var_name, r)
+        sigma_r = self._residual_std(
+            kind, var_name, r, valid_mask=mask_flat,
+        )
+        if kind == "atmos" and sigma_r.ndim == 1:
+            sigma_r = sigma_r.repeat(B).view(B * L, 1, 1, 1)
         r_std = r / sigma_r
         # Log-normal t sampling: concentrates training on informative
         # mid-noise levels (t ≈ 0.3–0.7) rather than near-pure-noise (t ≈ 0,
@@ -921,8 +1143,42 @@ class AuroraFlowRefine(nn.Module):
         t_b = t.view(N, 1, 1, 1).to(dtype)
 
         x_t = (1.0 - t_b) * x0 + t_b * r_std
-        r_pred = head(x_t, t, cond, doy=doy_n, coords=coords)
-        base_loss = F.mse_loss(r_pred, r_std)
+        r_pred = head(
+            x_t, t, cond, doy=doy_n, lead_hours=lead_n, coords=coords,
+        )
+        base_loss = ((r_pred - r_std) ** 2)[mask_flat].mean()
+
+        cfg = self.aux_loss_cfg
+        aux_enabled = bool(cfg.get("enabled", True))
+        deterministic_weight = float(
+            cfg.get("deterministic_reconstruction_weight", 0.0)
+        ) if aux_enabled else 0.0
+        degradation_weight = (
+            float(cfg.get("degradation_weight", 0.0)) if aux_enabled else 0.0
+        )
+        aux_on_deterministic = (
+            bool(cfg.get("aux_on_deterministic", False)) if aux_enabled else False
+        )
+        need_deterministic = (
+            deterministic_weight > 0.0
+            or degradation_weight > 0.0
+            or aux_on_deterministic
+        )
+        r_deterministic: torch.Tensor | None = None
+        if need_deterministic:
+            r_deterministic = self._deterministic_residual(
+                cond, head, doy=doy_n, lead_hours=lead_n, coords=coords,
+            )
+        if deterministic_weight > 0.0 and r_deterministic is not None:
+            deterministic_loss = (
+                (r_deterministic - r_std) ** 2
+            )[mask_flat].mean()
+            base_loss = base_loss + deterministic_weight * deterministic_loss
+        if degradation_weight > 0.0 and r_deterministic is not None:
+            remaining_sq = (r_deterministic - r_std) ** 2
+            baseline_sq = r_std**2
+            degradation = torch.relu(remaining_sq - baseline_sq)[mask_flat].mean()
+            base_loss = base_loss + degradation_weight * degradation
 
         # --- Structural auxiliary losses ------------------------------------
         # The head's x₁-prediction r_pred is its clean *standardised* residual
@@ -931,12 +1187,23 @@ class AuroraFlowRefine(nn.Module):
         # i.e. the structural terms operate in the real normalised-field space
         # (un-standardised), so they penalise the *structured* error
         # (r_pred·σ_r − r) rather than only its per-pixel magnitude.
-        aux = self._aux_structural_loss(
-            refined_flat=cond + r_pred * sigma_r,
-            target_flat=cond + r,
-            kind=kind,
-            group=(B, L) if kind == "atmos" else (B, 1),
-        )
+        # Structural terms require complete spatial fields. If an explicit
+        # missing-value mask is active, skip them instead of treating filled
+        # zeros as observations and creating artificial gradients.
+        if bool(torch.all(mask_flat)):
+            structural_residual = (
+                r_deterministic
+                if aux_on_deterministic and r_deterministic is not None
+                else r_pred
+            )
+            aux = self._aux_structural_loss(
+                refined_flat=cond + structural_residual * sigma_r,
+                target_flat=cond + r,
+                kind=kind,
+                group=(B, L) if kind == "atmos" else (B, 1),
+            )
+        else:
+            aux = torch.zeros((), device=base_loss.device, dtype=base_loss.dtype)
         return base_loss + aux
 
     # --- Structural auxiliary losses ---------------------------------------
@@ -1009,16 +1276,45 @@ class AuroraFlowRefine(nn.Module):
 
     # --- Column / profile coherence ----------------------------------------
 
+    def _deterministic_residual(
+        self,
+        cond_norm: torch.Tensor,
+        head: ResidualFlowUNet,
+        doy: torch.Tensor | None = None,
+        lead_hours: torch.Tensor | None = None,
+        coords: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Predict the conditional-mean residual at the source endpoint.
+
+        The training interpolant is ``x_t=(1-t)x0+t*r`` with source noise
+        independent of ``r``. At ``t=0`` the squared-error-optimal x1
+        prediction is therefore ``E[r | cond]``. We evaluate at the source
+        mean ``x0=0`` for deterministic bias correction.
+        """
+        n, _, h, w = cond_norm.shape
+        x_source_mean = torch.zeros(
+            n, 1, h, w, device=cond_norm.device, dtype=cond_norm.dtype,
+        )
+        t_source = torch.zeros(n, device=cond_norm.device, dtype=torch.float32)
+        return head(
+            x_source_mean,
+            t_source,
+            cond_norm,
+            doy=doy,
+            lead_hours=lead_hours,
+            coords=coords,
+        )
+
     def refine_norm_deterministic(
         self, pred_norm: torch.Tensor, var_name: str, kind: str,
         lon: torch.Tensor | None = None,
+        lead_time_hours: float | torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Deterministic refined estimate E[r|ŷ] added to ``pred_norm``.
 
-        Runs the head once at the clean limit (``x_t = 0``, ``t = 1``) — the
-        same single-step regression :meth:`_sample_residual` uses — but **with
-        gradients enabled** so it can drive the coherence loss. Returns the
-        refined field in normalised space, same shape as ``pred_norm``.
+        Runs the head once at the source mean (``x_t = 0``, ``t = 0``) — the
+        same single-step regression :meth:`_sample_residual` uses — but with
+        gradients enabled. Returns the refined field in normalised space.
         """
         heads = self.surf_flow if kind == "surf" else self.atmos_flow
         if var_name not in heads:
@@ -1033,12 +1329,20 @@ class AuroraFlowRefine(nn.Module):
             cond = pred_norm.reshape(B, 1, H, W)
 
         N = cond.shape[0]
-        x_t = torch.zeros(N, 1, H, W, device=cond.device, dtype=cond.dtype)
-        t = torch.ones(N, device=cond.device, dtype=torch.float32)
+        lead_b = self._lead_hours_for_batch(lead_time_hours, B, cond.device)
+        lead_n = (
+            lead_b.repeat_interleave(L)
+            if lead_b is not None and kind == "atmos"
+            else lead_b
+        )
         coords = self._lon_coords(lon, N, H, W, cond.device, cond.dtype)
-        r_hat = head(x_t, t, cond, coords=coords)
+        r_hat = self._deterministic_residual(
+            cond, head, lead_hours=lead_n, coords=coords,
+        )
         # Un-standardise the predicted residual (σ_r = 1 when z-score is off).
         sigma_r = self._residual_std(kind, var_name, cond, update=False)
+        if kind == "atmos" and sigma_r.ndim == 1:
+            sigma_r = sigma_r.repeat(B).view(B * L, 1, 1, 1)
         refined = (cond + r_hat * sigma_r).reshape(pred_norm.shape)
         return refined
 
@@ -1173,6 +1477,7 @@ class AuroraFlowRefine(nn.Module):
         profile_var: str,
         column_var: str,
         lon: torch.Tensor | None = None,
+        lead_time_hours: float | torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Column ↔ profile coherence penalty.
 
@@ -1192,9 +1497,11 @@ class AuroraFlowRefine(nn.Module):
         """
         refined_prof = self.refine_norm_deterministic(
             profile_pred_norm, profile_var, "atmos", lon=lon,
+            lead_time_hours=lead_time_hours,
         )
         refined_col = self.refine_norm_deterministic(
             column_pred_norm, column_var, "surf", lon=lon,
+            lead_time_hours=lead_time_hours,
         )
 
         w = _pressure_thickness_weights(
@@ -1216,6 +1523,7 @@ class AuroraFlowRefine(nn.Module):
         cond_norm: torch.Tensor,
         head: ResidualFlowUNet,
         doy: torch.Tensor | None = None,
+        lead_hours: torch.Tensor | None = None,
         coords: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Iterative refinement of the residual prediction.
@@ -1223,8 +1531,8 @@ class AuroraFlowRefine(nn.Module):
         Uses the **data (x₁) parameterisation**: at each step the head
         predicts r̂ from a noise-perturbed input ``x_t`` (with decreasing
         noise level), and the result is re-noised at the next lower level
-        and re-predicted. With ``sampling_steps == 1`` and a clean input
-        (``x_t = 0, t = 1``) this reduces to a single deterministic
+        and re-predicted. With ``sampling_steps == 1`` and the source mean
+        (``x_t = 0, t = 0``) this reduces to a single deterministic
         regression; with more steps the model can express multi-modal
         residual distributions.
 
@@ -1232,6 +1540,7 @@ class AuroraFlowRefine(nn.Module):
           cond_norm: (N, 1, H, W) — normalised Aurora prediction (cond).
           head: per-variable :class:`ResidualFlowUNet`.
           doy: optional per-sample day-of-year conditioning.
+          lead_hours: optional cumulative forecast age for every flattened item.
           coords: optional (N, 2, H, W) cyclic longitude channels.
 
         Returns:
@@ -1246,10 +1555,10 @@ class AuroraFlowRefine(nn.Module):
 
         if steps == 1:
             # Single-step deterministic regression E[r | ŷ]:
-            # x_t = 0, t = 1 → head predicts residual from conditioning alone.
-            x_t = torch.zeros(N, 1, H, W, device=device, dtype=dtype)
-            t = torch.ones(N, device=device, dtype=torch.float32)
-            return head(x_t, t, cond_norm, doy=doy, coords=coords)
+            # x_t = E[x0] = 0 at t=0, where source noise is independent of r.
+            return self._deterministic_residual(
+                cond_norm, head, doy=doy, lead_hours=lead_hours, coords=coords,
+            )
 
         # Multi-step DDIM-style Euler ODE from t=0 (pure noise) toward t=1
         # (clean residual) using the x₁-prediction parameterisation.
@@ -1270,7 +1579,9 @@ class AuroraFlowRefine(nn.Module):
             t_curr = float(t_schedule[i].item())
             t_next = float(t_schedule[i + 1].item())
             t = torch.full((N,), t_curr, device=device, dtype=torch.float32)
-            r_hat = head(x, t, cond_norm, doy=doy, coords=coords)
+            r_hat = head(
+                x, t, cond_norm, doy=doy, lead_hours=lead_hours, coords=coords,
+            )
             if t_curr > 0.0:
                 # Estimate x₀ from x_t and r̂, then interpolate to t_next.
                 x0_est = (x - t_curr * r_hat) / (1.0 - t_curr)
@@ -1282,7 +1593,11 @@ class AuroraFlowRefine(nn.Module):
 
     # --- Forward -----------------------------------------------------------
 
-    def forward(self, batch: Batch) -> Batch:
+    def forward(
+        self,
+        batch: Batch,
+        forecast_lead_time_hours: float | torch.Tensor | None = None,
+    ) -> Batch:
         pred = self.base(batch)
 
         # Training: return Aurora's prediction unchanged. The FM head is
@@ -1291,6 +1606,44 @@ class AuroraFlowRefine(nn.Module):
         # decoupled from the FM head's gradient, which is desirable.
         if self.training:
             return pred
+        return self.refine_prediction(
+            pred,
+            deterministic=False,
+            forecast_lead_time_hours=forecast_lead_time_hours,
+        )
+
+    def refine_prediction(
+        self,
+        pred: Batch,
+        *,
+        deterministic: bool = True,
+        forecast_lead_time_hours: float | torch.Tensor | None = None,
+    ) -> Batch:
+        """Apply refinement to an already-computed Aurora prediction.
+
+        ``deterministic=True`` always uses the source-mean correction,
+        independent of ``sampling_steps``. Training uses this method under
+        ``no_grad`` to feed the same kind of corrected state back into the
+        autoregressive trajectory that inference will consume, while retaining
+        the unrefined prediction as the residual-loss reference.
+        ``forecast_lead_time_hours`` is cumulative from initialization and is
+        distinct from rectified-flow interpolation time.
+        """
+        def sample(
+            cond: torch.Tensor,
+            head: ResidualFlowUNet,
+            *,
+            doy: torch.Tensor | None,
+            lead_hours: torch.Tensor | None,
+            coords: torch.Tensor | None,
+        ) -> torch.Tensor:
+            if deterministic:
+                return self._deterministic_residual(
+                    cond, head, doy=doy, lead_hours=lead_hours, coords=coords,
+                )
+            return self._sample_residual(
+                cond, head, doy=doy, lead_hours=lead_hours, coords=coords,
+            )
 
         # Eval / inference: integrate the FM ODE and add the sampled
         # residual to Aurora's prediction in physical space.
@@ -1319,9 +1672,15 @@ class AuroraFlowRefine(nn.Module):
             mean, std = self._norm_for(name, flat, kind="surf")
             cond = ((flat - mean) / std).unsqueeze(1)  # (N, 1, H, W)
             doy_n = base_doy.repeat_interleave(T) if base_doy is not None else None
+            lead_b = self._lead_hours_for_batch(
+                forecast_lead_time_hours, B, cond.device,
+            )
+            lead_n = lead_b.repeat_interleave(T) if lead_b is not None else None
             coords = self._lon_coords(base_lon, cond.shape[0], H, W, cond.device, cond.dtype)
-            r = self._sample_residual(cond, head, doy=doy_n, coords=coords).squeeze(1)
-            sigma_r = self._residual_std("surf", name, flat)
+            r = sample(
+                cond, head, doy=doy_n, lead_hours=lead_n, coords=coords,
+            ).squeeze(1)
+            sigma_r = self._residual_std("surf", name, flat, update=False)
             refined = flat + r * sigma_r * std  # un-standardise + de-normalise
             new_surf[name] = refined.reshape(orig_shape)
 
@@ -1339,6 +1698,10 @@ class AuroraFlowRefine(nn.Module):
                 T = 1
                 flat = tensor
             doy_bt = base_doy.repeat_interleave(T) if base_doy is not None else None
+            lead_b = self._lead_hours_for_batch(
+                forecast_lead_time_hours, B, flat.device,
+            )
+            lead_bt = lead_b.repeat_interleave(T) if lead_b is not None else None
 
             # Only refine loss_levels (if specified); other levels pass through.
             level_idx = self._atmos_loss_level_indices.get(name)
@@ -1350,13 +1713,18 @@ class AuroraFlowRefine(nn.Module):
                 N, Lsub = cond_norm.shape[0], cond_norm.shape[1]
                 cond_in = cond_norm.reshape(N * Lsub, 1, H, W)
                 doy_in = doy_bt.repeat_interleave(Lsub) if doy_bt is not None else None
+                lead_in = lead_bt.repeat_interleave(Lsub) if lead_bt is not None else None
                 coords = self._lon_coords(
                     base_lon, cond_in.shape[0], H, W, cond_in.device, cond_in.dtype,
                 )
-                r = self._sample_residual(
-                    cond_in, head, doy=doy_in, coords=coords,
+                r = sample(
+                    cond_in, head, doy=doy_in, lead_hours=lead_in, coords=coords,
                 ).reshape(N, Lsub, H, W)
-                sigma_r = self._residual_std("atmos", name, flat_subset)
+                sigma_r = self._residual_std(
+                    "atmos", name, flat_subset, update=False,
+                )
+                if sigma_r.ndim == 1:
+                    sigma_r = sigma_r.view(1, Lsub, 1, 1)
                 refined_subset = flat_subset + r * sigma_r * std
                 # Scatter refined levels back; unrefined levels stay as-is.
                 result = flat.clone()
@@ -1368,13 +1736,16 @@ class AuroraFlowRefine(nn.Module):
                 N = cond_norm.shape[0]
                 cond_in = cond_norm.reshape(N * L, 1, H, W)
                 doy_in = doy_bt.repeat_interleave(L) if doy_bt is not None else None
+                lead_in = lead_bt.repeat_interleave(L) if lead_bt is not None else None
                 coords = self._lon_coords(
                     base_lon, cond_in.shape[0], H, W, cond_in.device, cond_in.dtype,
                 )
-                r = self._sample_residual(
-                    cond_in, head, doy=doy_in, coords=coords,
+                r = sample(
+                    cond_in, head, doy=doy_in, lead_hours=lead_in, coords=coords,
                 ).reshape(N, L, H, W)
-                sigma_r = self._residual_std("atmos", name, flat)
+                sigma_r = self._residual_std("atmos", name, flat, update=False)
+                if sigma_r.ndim == 1:
+                    sigma_r = sigma_r.view(1, L, 1, 1)
                 refined = flat + r * sigma_r * std
                 new_atmos[name] = refined.reshape(orig_shape)
 

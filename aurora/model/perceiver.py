@@ -61,6 +61,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
+try:
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+except ImportError:  # PyTorch < 2.5
+    SDPBackend = None
+    sdpa_kernel = None
+
 from aurora.model.util import fp16_safe_scaled_dot_product_attention
 
 __all__ = ["MLP", "PerceiverResampler"]
@@ -158,13 +164,17 @@ class PerceiverAttention(nn.Module):
             # Perceiver cross-attention shapes. Restrict only this call to the
             # math backend so other attention blocks can still use efficient
             # CUDA kernels.
-            with torch.backends.cuda.sdp_kernel(
-                enable_flash=False,
-                enable_math=True,
-                enable_mem_efficient=False,
-                enable_cudnn=False,
-            ):
-                out = F.scaled_dot_product_attention(q, k, v)
+            if sdpa_kernel is not None and SDPBackend is not None:
+                with sdpa_kernel(SDPBackend.MATH):
+                    out = F.scaled_dot_product_attention(q, k, v)
+            else:
+                with torch.backends.cuda.sdp_kernel(
+                    enable_flash=False,
+                    enable_math=True,
+                    enable_mem_efficient=False,
+                    enable_cudnn=False,
+                ):
+                    out = F.scaled_dot_product_attention(q, k, v)
         else:
             out = F.scaled_dot_product_attention(q, k, v)
         out = rearrange(out, "B H L1 D -> B L1 (H D)")  # (B, L1, D)

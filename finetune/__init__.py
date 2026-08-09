@@ -11,6 +11,8 @@ from typing import Any
 __all__ = [
     "VariableSpec",
     "ResolvedVariableSpecs",
+    "validate_config",
+    "validate_dataset_contract",
     "load_config",
     "set_seed",
     "open_dataset",
@@ -36,6 +38,7 @@ __all__ = [
     "save_predictions",
     "maybe_wrap_conv_refine",
     "maybe_wrap_flow_refine",
+    "maybe_wrap_stochastic_refine",
 ]
 
 

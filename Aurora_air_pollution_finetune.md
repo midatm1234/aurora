@@ -62,7 +62,7 @@ Pretrained Aurora is already near-optimal on the CAMS dates we fine-tune on. A d
 
 Per refined variable (`no2`, `tcno2`):
 
-* A 3-level UNet (`ResidualFlowUNet`) with FiLM time conditioning, ~1.2 M params at `flow_refine_hidden=64`.
+* A 3-level UNet (`ResidualFlowUNet`) with separate FiLM embeddings for flow interpolation time and cumulative forecast lead, ~1.2 M params at `flow_refine_hidden=64`.
 * **Output layer is zero-init** so `r̂ ≡ 0` at step 0 → wrapper output equals Aurora's prediction unchanged before any training happens. This is the identity-at-init guarantee that x₁-prediction (not v-prediction) gives you for free.
 * For atmospheric variables, the level axis is collapsed into batch (per-level independent refinement) — keeps the head light while sharing the time/conditioning embedding across levels.
 
@@ -71,27 +71,36 @@ Per refined variable (`no2`, `tcno2`):
 Sampling a noise level `t ∈ [σ_min, 1 − σ_min]` and noise `x₀ ~ N(0, I)`, the head sees
 
 ```
-x_t   = (1 − t) · x₀ + t · r          # interpolant
+x_t   = (1 − t) · x₀ + t · r          # flow interpolant
 cond  = (ŷ − μ) / σ                   # Aurora prediction in normalised space
-r̂    = head(x_t, t, cond)
+lead  = valid_time − initialization_time  # cumulative forecast hours
+r̂    = head(x_t, t, cond, lead)
 loss = MSE(r̂, r)                      # x₁-prediction
 ```
 
 Equivalent to velocity-prediction but with two practical wins:
 
 1. **Identity-at-init** (above) — the model never produces noise as residuals before training.
-2. **Single-step deterministic eval is principled.** At `sampling_steps = 1` the head reduces to a regression of `E[r | ŷ]`, exactly what a deterministic conv-refine learns, but trained over **all** noise levels — strong stochastic regularisation for free.
+2. **Single-step deterministic eval is principled.** At `sampling_steps = 1`
+   the head is queried at `t=0, x₀=0`. Source noise is independent of the
+   target, so the squared-error optimum is `E[r | ŷ]`. The training loss
+   explicitly supervises this exact query; querying `t=1, x_t=0` is invalid
+   because the training interpolant equals `r` at `t=1`.
 
 ### Eval / inference
 
-`AuroraFlowRefine.forward` in `eval()` mode iterates the FM ODE for `sampling_steps` steps and returns `aurora_pred + denorm(r̂)`. We use a **progressive sampling schedule**:
+`AuroraFlowRefine.forward` in `eval()` mode returns
+`aurora_pred + denorm(r̂)`. For deterministic bias correction, use:
 
-* Phase 1 (`epoch < num_epochs × phase_fraction`, default ⅓): `sampling_steps = 1` — deterministic regression, learn the residual mean fast.
-* Phase 2 (rest): `sampling_steps = flow_refine_sampling_steps_late` (default 8) — multi-step stochastic refinement; lets the head model the conditional residual *distribution* (multi-modal corrections, calibrated spread).
+* `sampling_steps = 1`: query the source mean once, with no artificial
+  ensemble spread.
+* `sampling_steps > 1`: opt-in stochastic sampling from a Gaussian source.
+  Use this only when ensemble calibration is part of the objective and
+  validation; it is not a drop-in replacement for deterministic correction.
 
 ### Loss-path integration
 
-`compute_supervised_loss` auto-detects an `AuroraFlowRefine` wrapper and, in training mode, calls `flow_loss(pred_norm, target_norm, var, kind)` — replacing the standard MSE on Aurora's prediction with the FM regression on the *residual*. The displayed train-loss number is therefore residual-MSE at random `t`, NOT directly comparable to a baseline MSE on the prediction.
+`compute_supervised_loss` auto-detects an `AuroraFlowRefine` wrapper and, in training mode, calls `flow_loss(pred_norm, target_norm, var, kind, lead_time_hours=...)` — replacing the standard MSE on Aurora's prediction with the FM regression on the *residual*. The displayed train-loss number is therefore residual-MSE at random `t`, NOT directly comparable to a baseline MSE on the prediction.
 
 ### Structural auxiliary losses (`training.flow_aux_loss` block)
 
@@ -104,6 +113,8 @@ The base flow loss is a **per-pixel / per-level residual MSE**. That objective i
 | Distributional | `dist_var_weight`, `dist_wasserstein_weight` | Spatial-std mismatch + sorted-value (1-D Wasserstein-2) distance — matches the value distribution. |
 | Vertical-profile | `vertical_weight` | Level-to-level finite-difference MSE on the atmospheric profile — enforces a coherent vertical shape (the head is otherwise per-level independent). |
 | First-moment / bias | `bias_weight` | Per-sample spatial-**mean** match `MSE(mean(refined), mean(target))`. The *only* term that pins the field's absolute level — ACC subtracts the mean and the variance/Wasserstein terms constrain only spread/shape, so without this nothing penalises a domain-wide offset (e.g. the systematic column-O₃ low bias). |
+| Deterministic reconstruction | `deterministic_reconstruction_weight` | Direct MSE between the true residual and the exact inference correction at `t=0, x₀=0`. This closes the random-`t`/inference-point gap. |
+| Degradation hinge | `degradation_weight` | `relu((r̂-r)²-r²)`, zero when correction is no worse than leaving the baseline unchanged and positive when it degrades a point. |
 | Column/profile coherence | `coherence_weight` | Ties the column var (`gtco3`) to the pressure-weighted vertical integral of the profile var (`go3`): `MSE(D(refined), D(truth))` with `D = col − Σ_l w_l · prof_l`. Computed cross-variable in `compute_supervised_loss`. **Caveat:** total-column O₃ is stratosphere-dominated (~10–50 hPa), *above* the `loss_levels` used here, so the integral is a poor proxy and can drag `gtco3` toward a low bias — disable it (`coherence_weight: 0.0`) for the column-O₃ fine-tune. Note it is inert for the NO₂ case anyway (its hard-coded `gtco3`/`go3` pair never resolves against `no2`/`tcno2` targets). |
 
 All weights default to `0.0` (pure residual MSE → backward compatible), and a single `enabled` flag toggles the whole feature on/off without re-zeroing weights. The block is exposed in every flow-refine config. Example block:
@@ -121,6 +132,9 @@ training:
     dist_var_weight: 0.25
     dist_wasserstein_weight: 0.25
     bias_weight: 0.5              # spatial-mean match — counters systematic bias
+    deterministic_reconstruction_weight: 1.0
+    degradation_weight: 1.0
+    aux_on_deterministic: true
     vertical_weight: 0.5
     coherence_weight: 0.25
     coherence_column_var: gtco3   # empty => auto-detect first surf target
@@ -135,13 +149,30 @@ When `enabled: false` (or the block is absent), `flow_loss` is exactly the origi
 model:
   flow_refine_enabled: true
   flow_refine_hidden: 64               # UNet base channels
-  flow_refine_sampling_steps: 1        # phase-1 (eval) sampling steps
-  flow_refine_sampling_steps_late: 8   # phase-2 (eval) sampling steps
-  flow_refine_phase_fraction: 0.3333   # epoch fraction at which phase 2 begins
+  flow_refine_sampling_steps: 1        # deterministic source-mean correction
+  flow_refine_sampling_steps_late: 1   # keep validation/inference deterministic
+  flow_refine_lead_time_cond: true     # distinct 12/24/... h correction regimes
+  flow_refine_lead_time_scale_hours: 72  # normalized scale and trained support
   flow_refine_doy_cond: false          # seasonal (day-of-year) conditioning
 ```
 
 Mutually exclusive with `conv_refine_enabled: true` (the deterministic conv-refine head in `conv_refine.py`); the wrappers in `aurora_finetune_utils.maybe_wrap_*` self-gate on these flags.
+
+### Forecast-lead conditioning (`flow_refine_lead_time_cond`)
+
+Flow interpolation time `t` is not forecast lead: it says how far `x_t` lies
+between source noise and the clean residual. Forecast lead says how old the
+Aurora rollout is. Training computes exact cumulative hours from each sample
+initialization and valid time, validates the 12-hour cadence, and repeats the
+case lead across pressure levels after flattening the level axis. Inference
+passes `step * rollout_step_hours` and refuses to exceed
+`flow_refine_lead_time_scale_hours` for a lead-conditioned checkpoint.
+
+The head encodes scaled linear, `log1p`, and square-root lead features with a
+separate MLP, then adds that embedding to the FiLM context. The final MLP layer
+is zero-initialized, preserving identity-at-initialization. This lets the head
+learn larger or structurally different corrections at longer leads from the
+true residual; it deliberately does not force magnitude to be monotonic.
 
 ### Seasonal (day-of-year) conditioning (`flow_refine_doy_cond`)
 
