@@ -81,21 +81,16 @@ def test_rectified_flow_path_regresses_the_velocity() -> None:
     refiner = model.refiner
     assert refiner.predicts_velocity is True
 
-    # With a zero-output network the Euler integration keeps the initial state,
-    # so the residual equals the drawn source sample exactly.
+    # The public correction interface is identity-safe even though a zero
+    # velocity field would leave the private flow latent at its random source.
     conditioning = torch.zeros(1, model.conditioning_channels(), 16, 16)
-    generator = torch.Generator().manual_seed(5)
-    residual = refiner.sample_residual(
+    correction = refiner.sample_correction_normalized(
         conditioning,
         forecast_lead_time=torch.tensor([24.0]),
-        generator=generator,
+        generator=torch.Generator().manual_seed(5),
         num_steps=4,
     )
-    expected = torch.randn(
-        (1, model.packing.num_channels, 16, 16),
-        generator=torch.Generator().manual_seed(5),
-    )
-    assert torch.allclose(residual, expected)
+    assert torch.count_nonzero(correction) == 0
 
 
 @pytest.mark.parametrize("solver", ["euler", "midpoint", "heun"])
@@ -113,7 +108,7 @@ def test_flow_solvers_run(solver: str) -> None:
 
 
 def test_single_step_data_parameterisation_is_the_source_mean_query() -> None:
-    """``integration_steps == 1`` reproduces the existing deterministic query."""
+    """A one-step innovation still composes with the supervised mean."""
     model = build_refiner_model(
         "flow_matching_transformer",
         flow_matching={"integration_steps": 1},
@@ -123,7 +118,12 @@ def test_single_step_data_parameterisation_is_the_source_mean_query() -> None:
     lead = torch.tensor([24.0, 48.0])
     sampled = model.refiner.sample_residual(conditioning, forecast_lead_time=lead)
     deterministic = model.refiner.deterministic_residual(conditioning, forecast_lead_time=lead)
-    assert torch.equal(sampled, deterministic)
+    innovation = model.refiner.sample_innovation_normalized(
+        conditioning,
+        forecast_lead_time=lead,
+        mean_correction_normalized=deterministic,
+    )
+    assert torch.equal(sampled, deterministic + innovation)
 
 
 # --------------------------------------------------------------------------
@@ -229,9 +229,20 @@ def test_ddim_eta_zero_is_deterministic_for_a_fixed_initial_state() -> None:
 
 
 def test_ddim_eta_one_injects_noise() -> None:
+    """``eta=1`` must add ancestral noise that ``eta=0`` does not.
+
+    The refiners are identity-at-initialization: a zero output collapses the
+    whole DDIM trajectory to zero under the default ``sample`` parameterisation,
+    so both samplers would trivially agree. Perturbing the output projection
+    first makes the comparison meaningful.
+    """
     deterministic = build_refiner_model(
         "diffusion_unet", height=16, width=16, diffusion={"eta": 0.0}
     )
+    with torch.no_grad():
+        deterministic.refiner.net.out_proj.weight.add_(
+            torch.randn_like(deterministic.refiner.net.out_proj.weight) * 0.1
+        )
     stochastic = build_refiner_model(
         "diffusion_unet", height=16, width=16, diffusion={"eta": 1.0, "sampler": "ddpm"}
     )

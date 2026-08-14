@@ -1,5 +1,7 @@
 paths:
-  project_root: .
+  # This file now lives two directories below finetune/. Keep relative paths
+  # resolving to the repository root as they did before archival.
+  project_root: ../..
   data_dir: ../data
   train_data_path: ../data/train.nc
   val_data_path: ../data/test.nc

@@ -1,4 +1,6 @@
-"""Compatibility contracts for regional NO2 and global O3 workflows."""
+"""Copyright (c) Microsoft Corporation. Licensed under the MIT license.
+
+Compatibility contracts for regional NO2 and global O3 workflows."""
 
 from __future__ import annotations
 
@@ -20,6 +22,10 @@ from finetune import aurora_finetune_utils as ft
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG_DIR = ROOT / "finetune"
 NO2_CONFIG = CONFIG_DIR / "aurora_NO2_finetune_US-WEST_3day_lead_config.yaml"
+NO2_DT_CONFIG = (
+    CONFIG_DIR
+    / "aurora_NO2_finetune_US-WEST_3day_lead_diffusion_transformer_config.yaml"
+)
 O3_CONFIG = CONFIG_DIR / "aurora_O3_global_finetune_3day_lead_config.yaml"
 
 
@@ -102,7 +108,7 @@ def _synthetic_dataset(config: dict) -> xr.Dataset:
     return xr.Dataset(variables, coords=coords)
 
 
-@pytest.mark.parametrize("path", [NO2_CONFIG, O3_CONFIG])
+@pytest.mark.parametrize("path", [NO2_CONFIG, NO2_DT_CONFIG, O3_CONFIG])
 def test_repository_configs_pass_shared_schema_and_dataset_contract(path: Path) -> None:
     config = _raw_config(path)
     ft.validate_config(config, path)

@@ -5,8 +5,8 @@ Generate overall spatial-difference maps for CAMS rollout evaluation.
 The aggregation streams matched forecast cases and requested lead times. For
 each configured target variable and level it writes:
 
-* mean ground truth, baseline, and fine-tuned fields;
-* baseline and fine-tuned mean signed error;
+* mean CAMS, Aurora, and fine-tuned fields;
+* Aurora and fine-tuned bias (mean signed forecast-minus-CAMS error);
 * spatial MAE improvement, defined as baseline MAE minus fine-tuned MAE.
 
 Positive MAE improvement therefore means that fine-tuning reduced local
@@ -17,18 +17,21 @@ from __future__ import annotations
 
 import argparse
 import re
+import sys
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
-import cartopy.crs as ccrs
-import cartopy.feature as cfeature
-import matplotlib.pyplot as plt
 import numpy as np
 import xarray as xr
 import yaml
 from tqdm import tqdm
+
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from finetune.refinement.io import resolve_forecast_variable
 
 
 @dataclass(frozen=True)
@@ -112,8 +115,8 @@ class Accumulator:
             "mean_ground_truth": divide(self.truth_sum),
             "mean_baseline": divide(self.baseline_sum),
             "mean_finetuned": divide(self.finetuned_sum),
-            "baseline_mean_error": divide(self.baseline_error_sum),
-            "finetuned_mean_error": divide(self.finetuned_error_sum),
+            "aurora_bias": divide(self.baseline_error_sum),
+            "finetuned_bias": divide(self.finetuned_error_sum),
             "baseline_mae": baseline_mae,
             "finetuned_mae": finetuned_mae,
             "mae_improvement": baseline_mae - finetuned_mae,
@@ -220,7 +223,10 @@ def load_settings(config_path: Path) -> dict[str, Any]:
         project_dir = project_dir.resolve()
 
     data_dir = resolve_from_base(paths.get("data_dir", project_dir / "data"), project_dir)
-    case_data_dir = data_dir if data_dir.name == case_name else data_dir / case_name
+    data_case_name = str(paths.get("data_case_name") or case_name).strip()
+    case_data_dir = (
+        data_dir if data_dir.name == data_case_name else data_dir / data_case_name
+    )
     output_base = resolve_from_base(
         paths.get("output_dir", project_dir / "outputs"), project_dir
     )
@@ -341,6 +347,14 @@ def match_coordinate_indices(
     name: str,
 ) -> np.ndarray:
     """Match every candidate coordinate to one reference coordinate."""
+    reference = np.asarray(reference, dtype=float)
+    candidate = np.asarray(candidate, dtype=float)
+    if not np.isfinite(reference).all() or not np.isfinite(candidate).all():
+        raise ValueError(f"{name} coordinates must be finite.")
+    if np.unique(reference).size != reference.size:
+        raise ValueError(f"Reference {name} coordinates contain duplicate values.")
+    if np.unique(candidate).size != candidate.size:
+        raise ValueError(f"Candidate {name} coordinates contain duplicate values.")
     indices: list[int] = []
     for value in candidate:
         matches = np.flatnonzero(np.isclose(reference, value, atol=tolerance, rtol=0))
@@ -359,6 +373,146 @@ def select_level_index(values: np.ndarray, level: float, tolerance: float) -> in
     if len(matches) != 1:
         raise ValueError(f"Level {level:g} matched {len(matches)} values in {values.tolist()}.")
     return int(matches[0])
+
+
+def assert_same_coordinate(
+    expected: np.ndarray,
+    observed: np.ndarray,
+    tolerance: float,
+    *,
+    name: str,
+    context: str,
+) -> None:
+    """Require a coordinate to have the same values in the same order."""
+    expected = np.asarray(expected, dtype=float)
+    observed = np.asarray(observed, dtype=float)
+    if not np.isfinite(expected).all() or not np.isfinite(observed).all():
+        raise ValueError(f"{context} {name} coordinates must be finite.")
+    if np.unique(expected).size != expected.size or np.unique(observed).size != observed.size:
+        raise ValueError(f"{context} {name} coordinates contain duplicate values.")
+    if expected.shape != observed.shape or not np.allclose(
+        expected, observed, atol=tolerance, rtol=0
+    ):
+        raise ValueError(
+            f"{context} {name} coordinates do not match the evaluation grid in "
+            f"value and order: expected shape {expected.shape}, observed "
+            f"{observed.shape}."
+        )
+
+
+def rollout_valid_times(dataset: xr.Dataset, *, context: str) -> tuple[np.ndarray, str]:
+    """Return a unique one-dimensional valid-time coordinate and its step dim."""
+    if "time" not in dataset:
+        raise KeyError(f"{context} has no forecast valid-time coordinate 'time'.")
+    coordinate = dataset["time"]
+    if coordinate.ndim != 1 or len(coordinate.dims) != 1:
+        raise ValueError(
+            f"{context} time must be one-dimensional, got dims {coordinate.dims}."
+        )
+    try:
+        values = np.asarray(coordinate.values).astype("datetime64[ns]")
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{context} time contains invalid datetimes.") from exc
+    if np.isnat(values).any():
+        raise ValueError(f"{context} time contains NaT.")
+    if np.unique(values).size != values.size:
+        raise ValueError(f"{context} time contains duplicate valid times.")
+    return values, str(coordinate.dims[0])
+
+
+def _datetime_candidates(dataset: xr.Dataset) -> list[tuple[str, np.datetime64]]:
+    candidates: list[tuple[str, np.datetime64]] = []
+    for name in ("forecast_reference_time", "init_time"):
+        if name not in dataset:
+            continue
+        raw = np.asarray(dataset[name].values).reshape(-1)
+        try:
+            parsed = raw.astype("datetime64[ns]")
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{name} contains invalid datetimes.") from exc
+        if np.isnat(parsed).any() or np.unique(parsed).size != 1:
+            raise ValueError(f"{name} must contain one non-NaT initialization time.")
+        candidates.append((name, parsed[0]))
+    if dataset.attrs.get("initialization_time") not in (None, ""):
+        try:
+            value = np.datetime64(dataset.attrs["initialization_time"], "ns")
+        except (TypeError, ValueError) as exc:
+            raise ValueError("initialization_time attribute is not a datetime.") from exc
+        if np.isnat(value):
+            raise ValueError("initialization_time attribute is NaT.")
+        candidates.append(("initialization_time attribute", value))
+    return candidates
+
+
+def validate_rollout_time_metadata(
+    dataset: xr.Dataset,
+    expected_initialization: np.datetime64,
+    *,
+    context: str,
+) -> tuple[np.ndarray, str]:
+    """Validate init + lead = valid time and return valid times / step dim."""
+    expected_initialization = np.datetime64(expected_initialization, "ns")
+    candidates = _datetime_candidates(dataset)
+    if not candidates:
+        raise ValueError(
+            f"{context} has no forecast_reference_time, init_time, or "
+            "initialization_time metadata."
+        )
+    for name, value in candidates:
+        if value != expected_initialization:
+            raise ValueError(
+                f"{context} {name}={value} disagrees with filename initialization "
+                f"{expected_initialization}."
+            )
+    valid_times, step_dim = rollout_valid_times(dataset, context=context)
+    derived_hours = (
+        valid_times - expected_initialization
+    ) / np.timedelta64(1, "h")
+    for lead_name in ("lead_time_hours", "lead_time"):
+        if lead_name not in dataset:
+            continue
+        raw = np.asarray(dataset[lead_name].values).reshape(-1)
+        if np.issubdtype(raw.dtype, np.timedelta64):
+            stored_hours = raw / np.timedelta64(1, "h")
+        else:
+            stored_hours = raw.astype(float)
+        if stored_hours.size != valid_times.size or not np.allclose(
+            stored_hours, derived_hours, atol=1.0e-6, rtol=0
+        ):
+            raise ValueError(
+                f"{context} violates valid_time = initialization_time + forecast_lead: "
+                f"stored {lead_name}={stored_hours.tolist()}, derived="
+                f"{derived_hours.tolist()}."
+            )
+    return valid_times, step_dim
+
+
+def match_valid_time_index(
+    valid_times: np.ndarray,
+    requested: np.datetime64,
+    *,
+    context: str,
+) -> int:
+    """Return the unique exact index of ``requested`` in a rollout."""
+    requested = np.datetime64(requested, "ns")
+    matches = np.flatnonzero(valid_times == requested)
+    if len(matches) != 1:
+        raise ValueError(
+            f"{context} valid time {requested} matched {len(matches)} entries; "
+            "forecast steps must be matched by valid time, never by array position."
+        )
+    return int(matches[0])
+
+
+def aligned_2d_values(data_array: xr.DataArray, *, context: str) -> np.ndarray:
+    """Require an already selected field to be exactly latitude x longitude."""
+    required = {"latitude", "longitude"}
+    if set(data_array.dims) != required:
+        raise ValueError(
+            f"{context} must have only latitude/longitude dimensions after time, "
+            f"level, and member selection; got {data_array.dims}."
+        )
+    return np.asarray(data_array.transpose("latitude", "longitude").values, dtype=float)
 
 
 def robust_limits(arrays: Iterable[np.ndarray]) -> tuple[float, float]:
@@ -385,53 +539,63 @@ def plot_overall(
     path: Path,
 ) -> None:
     """Plot globally or within the configured regional YAML domain."""
+    try:
+        import cartopy.crs as ccrs
+        import cartopy.feature as cfeature
+        import matplotlib.pyplot as plt
+    except ImportError as exc:  # pragma: no cover - depends on optional plotting stack.
+        raise RuntimeError(
+            "Matplotlib and Cartopy are required only to render overall map PNGs. "
+            "Install the plotting extras or use the metric/NetCDF evaluation helpers "
+            "without plotting."
+        ) from exc
     field_limits = robust_limits(
         [fields["mean_ground_truth"], fields["mean_baseline"], fields["mean_finetuned"]]
     )
     error_limit = max(
         abs(value)
         for value in robust_limits(
-            [fields["baseline_mean_error"], fields["finetuned_mean_error"]]
+            [fields["aurora_bias"], fields["finetuned_bias"]]
         )
     )
-    improvement_limit = max(
-        abs(value) for value in robust_limits([fields["mae_improvement"]])
-    )
     error_limit = error_limit or 1.0
-    improvement_limit = improvement_limit or 1.0
     panels = [
-        ("Mean ground truth", fields["mean_ground_truth"], "viridis", field_limits),
-        ("Mean baseline", fields["mean_baseline"], "viridis", field_limits),
+        ("Mean CAMS", fields["mean_ground_truth"], "viridis", field_limits),
+        ("Mean Aurora", fields["mean_baseline"], "viridis", field_limits),
         ("Mean fine-tuned", fields["mean_finetuned"], "viridis", field_limits),
         (
-            "Baseline mean error",
-            fields["baseline_mean_error"],
+            "Aurora bias (Aurora − CAMS)",
+            fields["aurora_bias"],
             "RdBu_r",
             (-error_limit, error_limit),
         ),
         (
-            "Fine-tuned mean error",
-            fields["finetuned_mean_error"],
+            "Fine-tuned bias (fine-tuned − CAMS)",
+            fields["finetuned_bias"],
             "RdBu_r",
             (-error_limit, error_limit),
-        ),
-        (
-            "MAE improvement: baseline − fine-tuned",
-            fields["mae_improvement"],
-            "RdBu",
-            (-improvement_limit, improvement_limit),
         ),
     ]
     data_crs = ccrs.PlateCarree()
-    fig, axes = plt.subplots(
-        2,
-        3,
-        figsize=(17, 8.5),
-        constrained_layout=True,
-        subplot_kw={"projection": data_crs},
+    fig = plt.figure(figsize=(17, 10), constrained_layout=True)
+    grid = fig.add_gridspec(
+        4,
+        6,
+        height_ratios=(1.0, 0.06, 1.0, 0.06),
     )
+    # The two bias maps are centered in the gaps between the three field maps.
+    axes = [
+        fig.add_subplot(grid[0, 0:2], projection=data_crs),
+        fig.add_subplot(grid[0, 2:4], projection=data_crs),
+        fig.add_subplot(grid[0, 4:6], projection=data_crs),
+        fig.add_subplot(grid[2, 1:3], projection=data_crs),
+        fig.add_subplot(grid[2, 3:5], projection=data_crs),
+    ]
+    top_colorbar_axis = fig.add_subplot(grid[1, 1:5])
+    bottom_colorbar_axis = fig.add_subplot(grid[3, 1:5])
+    meshes = []
     for panel_index, (axis, (title, values, cmap, limits)) in enumerate(
-        zip(axes.flat, panels)
+        zip(axes, panels)
     ):
         # These features remain visible wherever the evaluated field is missing,
         # while coastlines and borders are drawn above the data for orientation.
@@ -459,6 +623,7 @@ def plot_overall(
             rasterized=True,
             zorder=1,
         )
+        meshes.append(mesh)
         axis.coastlines(
             resolution="110m", color="#202020", linewidth=0.55, zorder=2
         )
@@ -481,18 +646,29 @@ def plot_overall(
         gridlines.top_labels = False
         gridlines.right_labels = False
         gridlines.bottom_labels = panel_index >= 3
-        gridlines.left_labels = panel_index % 3 == 0
-        fig.colorbar(mesh, ax=axis, shrink=0.8, label=units or None)
-        axis.set_title(title)
+        gridlines.left_labels = panel_index in {0, 3}
+        axis.set_title(title, fontsize=16)
         if extent is None:
             axis.set_global()
         else:
             axis.set_extent(extent, crs=data_crs)
+    fig.colorbar(
+        meshes[0],
+        cax=top_colorbar_axis,
+        orientation="horizontal",
+        label=units or None,
+    )
+    fig.colorbar(
+        meshes[3],
+        cax=bottom_colorbar_axis,
+        orientation="horizontal",
+        label=units or None,
+    )
     level = "surface" if selection.level is None else f"{selection.level:g} hPa"
     fig.suptitle(
         f"Overall CAMS differences: {selection.variable} ({level})\n"
-        f"{forecast_count} matched forecast cases across configured leads; "
-        "positive MAE improvement is better"
+        f"{forecast_count} matched forecast cases across configured leads",
+        fontsize=18,
     )
     fig.savefig(path, dpi=160)
     plt.close(fig)
@@ -524,10 +700,11 @@ def generate_overall_maps(config_path: Path) -> list[Path]:
     truth = xr.open_dataset(settings["truth_path"], decode_times=True)
     try:
         truth_times = np.asarray(truth["time"].values).astype("datetime64[ns]")
+        if np.isnat(truth_times).any() or np.unique(truth_times).size != truth_times.size:
+            raise ValueError("CAMS truth time must contain unique, non-NaT valid times.")
         truth_lookup = {
             int(value.astype(np.int64)): index for index, value in enumerate(truth_times)
         }
-        first_baseline = xr.open_dataset(baseline_files[common_initializations[0]])
         first_finetuned = xr.open_dataset(finetuned_files[common_initializations[0]])
         try:
             tolerance = settings["coordinate_tolerance"]
@@ -545,21 +722,19 @@ def generate_overall_maps(config_path: Path) -> list[Path]:
                 tolerance,
                 name="longitude",
             )
-            baseline_latitude_indices = match_coordinate_indices(
-                np.asarray(first_baseline["latitude"].values, dtype=float),
-                latitude,
-                tolerance,
-                name="latitude",
-            )
-            baseline_longitude_indices = match_coordinate_indices(
-                np.asarray(first_baseline["longitude"].values, dtype=float),
-                longitude,
-                tolerance,
-                name="longitude",
-            )
         finally:
-            first_baseline.close()
             first_finetuned.close()
+
+        missing_truth_variables = [
+            selection.variable
+            for selection in selections
+            if selection.variable not in truth.data_vars
+        ]
+        if missing_truth_variables:
+            raise KeyError(
+                "CAMS truth is missing configured target variable(s): "
+                + ", ".join(sorted(set(missing_truth_variables)))
+            )
 
         accumulators = {
             selection: Accumulator.create((len(latitude), len(longitude)))
@@ -567,6 +742,7 @@ def generate_overall_maps(config_path: Path) -> list[Path]:
         }
         lead_tolerance = 1.0e-6
         requested_leads = settings["lead_hours"]
+        skipped_without_truth = 0
         for initialization_ns in tqdm(
             common_initializations,
             desc="Aggregate overall maps",
@@ -579,9 +755,46 @@ def generate_overall_maps(config_path: Path) -> list[Path]:
                 finetuned_files[initialization_ns], decode_times=True
             )
             try:
-                valid_times = np.asarray(finetuned["time"].values).astype("datetime64[ns]")
                 initialization = np.datetime64(initialization_ns, "ns")
-                for time_index, valid_time in enumerate(valid_times):
+                baseline_context = str(baseline_files[initialization_ns])
+                finetuned_context = str(finetuned_files[initialization_ns])
+                valid_times, finetuned_step_dim = validate_rollout_time_metadata(
+                    finetuned,
+                    initialization,
+                    context=finetuned_context,
+                )
+                baseline_valid_times, baseline_step_dim = validate_rollout_time_metadata(
+                    baseline,
+                    initialization,
+                    context=baseline_context,
+                )
+                assert_same_coordinate(
+                    latitude,
+                    np.asarray(finetuned["latitude"].values, dtype=float),
+                    tolerance,
+                    name="latitude",
+                    context=finetuned_context,
+                )
+                assert_same_coordinate(
+                    longitude,
+                    np.asarray(finetuned["longitude"].values, dtype=float),
+                    tolerance,
+                    name="longitude",
+                    context=finetuned_context,
+                )
+                baseline_latitude_indices = match_coordinate_indices(
+                    np.asarray(baseline["latitude"].values, dtype=float),
+                    latitude,
+                    tolerance,
+                    name=f"{baseline_context} latitude",
+                )
+                baseline_longitude_indices = match_coordinate_indices(
+                    np.asarray(baseline["longitude"].values, dtype=float),
+                    longitude,
+                    tolerance,
+                    name=f"{baseline_context} longitude",
+                )
+                for finetuned_time_index, valid_time in enumerate(valid_times):
                     lead = float((valid_time - initialization) / np.timedelta64(1, "h"))
                     if not any(
                         np.isclose(lead, requested, atol=lead_tolerance, rtol=0)
@@ -590,33 +803,58 @@ def generate_overall_maps(config_path: Path) -> list[Path]:
                         continue
                     truth_index = truth_lookup.get(int(valid_time.astype(np.int64)))
                     if truth_index is None:
+                        skipped_without_truth += 1
                         continue
+                    baseline_time_index = match_valid_time_index(
+                        baseline_valid_times,
+                        valid_time,
+                        context=baseline_context,
+                    )
                     for selection in selections:
                         variable = selection.variable
+                        if variable not in baseline.data_vars:
+                            raise KeyError(
+                                f"{baseline_context} is missing configured variable "
+                                f"{variable!r}."
+                            )
+                        finetuned_variable = resolve_forecast_variable(
+                            finetuned, variable
+                        )
+                        if finetuned_step_dim not in finetuned_variable.dims:
+                            raise ValueError(
+                                f"{finetuned_context} forecast variable "
+                                f"{finetuned_variable.name!r} does not use time step "
+                                f"dimension {finetuned_step_dim!r}; dims are "
+                                f"{finetuned_variable.dims}."
+                            )
                         truth_field = truth[variable].isel(
                             time=truth_index,
                             latitude=truth_latitude_indices,
                             longitude=truth_longitude_indices,
                         )
                         baseline_field = baseline[variable].isel(
-                            time=time_index,
-                            latitude=baseline_latitude_indices,
-                            longitude=baseline_longitude_indices,
+                            {
+                                baseline_step_dim: baseline_time_index,
+                                "latitude": baseline_latitude_indices,
+                                "longitude": baseline_longitude_indices,
+                            }
                         )
-                        finetuned_field = finetuned[variable].isel(time=time_index)
+                        finetuned_field = finetuned_variable.isel(
+                            {finetuned_step_dim: finetuned_time_index}
+                        )
                         if selection.level is not None:
                             truth_level = select_level_index(
-                                np.asarray(truth["level"].values, dtype=float),
+                                np.asarray(truth_field["level"].values, dtype=float),
                                 selection.level,
                                 settings["level_tolerance"],
                             )
                             baseline_level = select_level_index(
-                                np.asarray(baseline["level"].values, dtype=float),
+                                np.asarray(baseline_field["level"].values, dtype=float),
                                 selection.level,
                                 settings["level_tolerance"],
                             )
                             finetuned_level = select_level_index(
-                                np.asarray(finetuned["level"].values, dtype=float),
+                                np.asarray(finetuned_field["level"].values, dtype=float),
                                 selection.level,
                                 settings["level_tolerance"],
                             )
@@ -627,14 +865,44 @@ def generate_overall_maps(config_path: Path) -> list[Path]:
                         # backend reads only the requested 2-D member slices.
                         if "member" in finetuned_field.dims:
                             finetuned_field = finetuned_field.mean("member", skipna=True)
+                        truth_values = aligned_2d_values(
+                            truth_field,
+                            context=f"CAMS {variable!r} at {valid_time}",
+                        )
+                        baseline_values = aligned_2d_values(
+                            baseline_field,
+                            context=f"Aurora {variable!r} at {valid_time}",
+                        )
+                        finetuned_values = aligned_2d_values(
+                            finetuned_field,
+                            context=f"refined {variable!r} at {valid_time}",
+                        )
+                        expected_shape = (len(latitude), len(longitude))
+                        for field_name, values in (
+                            ("CAMS", truth_values),
+                            ("Aurora", baseline_values),
+                            ("refined", finetuned_values),
+                        ):
+                            if values.shape != expected_shape:
+                                raise ValueError(
+                                    f"{field_name} {variable!r} at {valid_time} has "
+                                    f"shape {values.shape}; expected {expected_shape}."
+                                )
                         accumulators[selection].update(
-                            np.asarray(truth_field.values, dtype=float),
-                            np.asarray(baseline_field.values, dtype=float),
-                            np.asarray(finetuned_field.values, dtype=float),
+                            truth_values,
+                            baseline_values,
+                            finetuned_values,
                         )
             finally:
                 baseline.close()
                 finetuned.close()
+
+        if skipped_without_truth:
+            print(
+                "Skipped "
+                f"{skipped_without_truth} requested forecast steps outside the CAMS "
+                "truth valid-time range; no nearest-time matching was attempted."
+            )
 
         normalized_longitude = ((longitude + 180.0) % 360.0) - 180.0
         longitude_order = np.argsort(normalized_longitude)
@@ -670,8 +938,12 @@ def generate_overall_maps(config_path: Path) -> list[Path]:
                     "longitude": normalized_longitude,
                 },
                 attrs={
+                    "bias_definition": (
+                        "mean signed forecast minus CAMS error; negative values are "
+                        "low biases and positive values are high biases"
+                    ),
                     "mae_improvement_definition": (
-                        "baseline spatial MAE minus fine-tuned spatial MAE; positive is better"
+                        "Aurora spatial MAE minus fine-tuned spatial MAE; positive is better"
                     ),
                 },
             )

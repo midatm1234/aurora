@@ -37,6 +37,8 @@ from typing import Any, Iterable, Mapping
 
 import torch
 
+from finetune.refinement.config import CORRECTION_CONVENTION
+
 __all__ = [
     "CHECKPOINT_KIND_AURORA",
     "CHECKPOINT_KIND_COMBINED",
@@ -59,7 +61,7 @@ __all__ = [
 CHECKPOINT_KIND_AURORA = "aurora"
 CHECKPOINT_KIND_REFINEMENT = "refinement"
 CHECKPOINT_KIND_COMBINED = "combined"
-CHECKPOINT_SCHEMA_VERSION = 1
+CHECKPOINT_SCHEMA_VERSION = 2
 
 #: Wrapper prefixes historically produced by DDP / FSDP / ``torch.compile``.
 _WRAPPER_PREFIXES = ("module.", "_orig_mod.")
@@ -215,7 +217,10 @@ def aurora_state_fingerprint(state: Mapping[str, torch.Tensor]) -> str:
         digest.update(key.encode("utf-8"))
         digest.update(str(value.dtype).encode("utf-8"))
         digest.update(str(tuple(value.shape)).encode("utf-8"))
-        digest.update(value.detach().to("cpu").contiguous().view(torch.uint8).numpy().tobytes())
+        raw = value.detach().to("cpu").contiguous()
+        # Flatten first because dtype views reject zero-dimensional tensors.
+        # This preserves exactly the same raw bytes for non-scalar parameters.
+        digest.update(raw.reshape(-1).view(torch.uint8).numpy().tobytes())
     return digest.hexdigest()
 
 
@@ -273,7 +278,11 @@ def load_aurora_state_dict(
             f"e.g. {sorted(report.unexpected)[:8]}"
         )
 
-    unexplained = [k for k in report.missing if not k.startswith("refiner.")]
+    unexplained = [
+        k
+        for k in report.missing
+        if not (k.startswith("refiner.") or k.startswith("temporal."))
+    ]
     unexplained = [k for k in unexplained if not any(part in k for part in skip)]
     if unexplained:
         raise RuntimeError(
@@ -297,16 +306,22 @@ def load_refinement_state_dict(
     checkpoint: Any,
     *,
     prefix: str = "refiner.",
+    temporal_prefix: str = "temporal.",
     aurora_prefix: str = "aurora.",
 ) -> StateDictReport:
     """Load Phase-2 weights without touching Aurora weights.
 
-    Only keys under ``prefix`` are applied; the Aurora sub-module is left
-    exactly as it was, which is verified after the load.
+    Only keys under the spatial or temporal refinement prefixes are applied;
+    the Aurora sub-module is left exactly as it was, which is verified after
+    the load.
     """
     raw = extract_model_state(checkpoint)
     stripped = strip_wrapper_prefixes(raw)
-    incoming = {k: v for k, v in stripped.items() if k.startswith(prefix)}
+    incoming = {
+        k: v
+        for k, v in stripped.items()
+        if k.startswith(prefix) or k.startswith(temporal_prefix)
+    }
     if not incoming:
         legacy = {k: v for k, v in stripped.items() if _is_legacy_refinement_key(k)}
         if legacy:
@@ -317,6 +332,28 @@ def load_refinement_state_dict(
 
     model_state = model.state_dict()
     report = StateDictReport()
+    version_key = prefix + "innovation_parameterization_version"
+    legacy_process_checkpoint = (
+        version_key in model_state
+        and version_key not in incoming
+        and any(key.startswith(prefix + "net.") for key in incoming)
+        and not any(key.startswith(prefix + "mean_net.") for key in incoming)
+    )
+    if legacy_process_checkpoint:
+        # Schema-v1 unified refiners modeled the complete correction and had no
+        # dedicated mean head. Fill only the newly introduced keys explicitly
+        # and set version=0, so every historical key is still checked strictly.
+        compatibility_keys = {
+            key
+            for key in model_state
+            if key == version_key or key.startswith(prefix + "mean_net.")
+        }
+        for key in compatibility_keys:
+            incoming[key] = (
+                torch.zeros_like(model_state[key])
+                if key == version_key
+                else model_state[key]
+            )
     aurora_before = {k: v for k, v in model_state.items() if k.startswith(aurora_prefix)}
 
     for key, value in incoming.items():
@@ -330,7 +367,11 @@ def load_refinement_state_dict(
         model_state[key] = value
         report.loaded += 1
 
-    refiner_keys = {key for key in model_state if key.startswith(prefix)}
+    refiner_keys = {
+        key
+        for key in model_state
+        if key.startswith(prefix) or key.startswith(temporal_prefix)
+    }
     report.missing = sorted(refiner_keys - set(incoming))
 
     if report.shape_mismatched:
@@ -401,6 +442,7 @@ def build_refinement_checkpoint(
     scaler: Any = None,
     extra: Mapping[str, Any] | None = None,
     refiner_prefix: str = "refiner.",
+    temporal_prefix: str = "temporal.",
     aurora_prefix: str = "aurora.",
 ) -> dict[str, Any]:
     """Assemble a checkpoint payload recording everything needed for resume.
@@ -413,9 +455,23 @@ def build_refinement_checkpoint(
     if kind not in {CHECKPOINT_KIND_AURORA, CHECKPOINT_KIND_REFINEMENT, CHECKPOINT_KIND_COMBINED}:
         raise ValueError(f"Unsupported checkpoint kind {kind!r}")
 
+    resolved = dict(resolved_config or {})
+    correction_convention = resolved.get(
+        "correction_convention", CORRECTION_CONVENTION
+    )
+    if correction_convention != CORRECTION_CONVENTION:
+        raise ValueError(
+            "Unsupported checkpoint correction convention "
+            f"{correction_convention!r}; expected {CORRECTION_CONVENTION!r}."
+        )
+
     full_state = model.state_dict()
     if kind == CHECKPOINT_KIND_REFINEMENT:
-        model_state = {k: v for k, v in full_state.items() if k.startswith(refiner_prefix)}
+        model_state = {
+            k: v
+            for k, v in full_state.items()
+            if k.startswith(refiner_prefix) or k.startswith(temporal_prefix)
+        }
     elif kind == CHECKPOINT_KIND_AURORA:
         model_state = {k: v for k, v in full_state.items() if k.startswith(aurora_prefix)}
     else:
@@ -425,12 +481,18 @@ def build_refinement_checkpoint(
         "checkpoint_kind": kind,
         "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
         "model_state_dict": model_state,
+        "correction_convention": correction_convention,
+        "scientific_contract": {
+            "correction_convention": correction_convention,
+            "correction_target": "cams_target - aurora_forecast",
+            "application": "aurora_forecast + predicted_correction_physical",
+        },
         "refinement_type": str(refinement_type),
         "epoch": int(epoch),
         "global_step": int(global_step),
         "aurora_checkpoint": aurora_checkpoint,
         "aurora_fingerprint": aurora_fingerprint,
-        "resolved_config": dict(resolved_config or {}),
+        "resolved_config": resolved,
         "field_packing": packing.to_dict() if hasattr(packing, "to_dict") else packing,
         "precision": dict(precision or {}),
         "rng_state": {
@@ -438,6 +500,9 @@ def build_refinement_checkpoint(
             "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
         },
     }
+    temporal_config = getattr(model, "temporal_config", None)
+    if isinstance(temporal_config, Mapping):
+        payload["resolved_temporal_config"] = dict(temporal_config)
     if optimizer is not None:
         payload["optimizer_state_dict"] = optimizer.state_dict()
     if scheduler is not None:

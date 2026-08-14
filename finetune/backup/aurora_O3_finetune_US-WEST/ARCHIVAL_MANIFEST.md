@@ -25,16 +25,16 @@ These files are **retained indefinitely** for reproducibility and historical ref
 
 - ✓ They are **no longer** used as active training examples
 - ✓ They are **not** included in automatic configuration discovery
-- ✓ They will **not** be run by CI smoke tests or batch launchers
+- ✓ They are not selected by CI smoke tests or automated batch enumeration
 - ✓ They **can** still be explicitly loaded by their backup path if needed for historical reproduction
 
-### Loading a Archived Configuration
+### Loading an Archived Configuration
 
 To reproduce a legacy O3 US-WEST fine-tuning run:
 
 ```bash
-python /data/aurora/finetune/aurora_finetune_distributed.py \
-  --config /data/aurora/finetune/backup/aurora_O3_finetune_US-WEST/aurora_O3_finetune_US-WEST_3day_lead_config_v4.yaml
+python finetune/aurora_finetune_distributed.py \
+  --config finetune/backup/aurora_O3_finetune_US-WEST/aurora_O3_finetune_US-WEST_3day_lead_config_v4.yaml
 ```
 
 Or in a notebook:
@@ -64,6 +64,15 @@ with open(config_path) as f:
 
 ## Update History
 
+### Post-move path repairs (2026-08-10)
+
+- Changed `paths.project_root` from `.` to `../..` in all four files so paths
+  still resolve from the repository root after the two-directory move.
+- Removed the stale `go3` quicklook entry from v3 because that version has only
+  `gtco3` enabled as a target. No scientific training setting was changed.
+- Earlier, byte-different historical snapshots remain in
+  `finetune/yaml_backups_20260619/`; they were neither overwritten nor deleted.
+
 ### Moves & References Updated (2026-08-09)
 
 The following files and references were updated to point to the backup location:
@@ -83,7 +92,8 @@ The following files and references were updated to point to the backup location:
 
 ## No Automatic Discovery
 
-Code that automatically discovers YAML files for training excludes `backup/` directories:
+Active example discovery is scoped to the explicit stochastic-example folder,
+so it never descends into this case-specific archive:
 
 - ✓ `finetune/refinement_smoke_test.py` does not enumerate archived YAMLs
 - ✓ Configuration-validation matrices skip `backup/` subdirectories

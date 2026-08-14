@@ -1,4 +1,6 @@
-"""Convolutional refinement heads for Aurora fine-tuning.
+"""Copyright (c) Microsoft Corporation. Licensed under the MIT license.
+
+Convolutional refinement heads for Aurora fine-tuning.
 
 The patch-based ViT decoder (``unpatchify``) produces outputs that are
 piecewise-constant within each P×P patch, creating visible blocky artifacts.

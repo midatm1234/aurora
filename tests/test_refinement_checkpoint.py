@@ -146,19 +146,54 @@ def test_shape_mismatch_raises() -> None:
 
 def test_refinement_only_checkpoint_never_touches_aurora() -> None:
     model = build_model()
-    before = aurora_only_state(model)
     payload = build_refinement_checkpoint(
         model, kind=CHECKPOINT_KIND_REFINEMENT, refinement_type="diffusion_unet"
     )
     assert all(key.startswith("refiner.") for key in payload["model_state_dict"])
 
     target = build_model()
+    before = aurora_only_state(target)
     report = load_refinement_state_dict(target, payload)
     assert report.missing == []
     assert report.unexpected == []
     for key, value in before.items():
-        assert torch.equal(target.state_dict()[f"aurora.{key}"], value) or True
+        assert torch.equal(target.state_dict()[f"aurora.{key}"], value)
     # Refiner weights actually transferred.
+    for key, value in payload["model_state_dict"].items():
+        assert torch.equal(target.state_dict()[key], value)
+
+
+def test_refinement_only_checkpoint_includes_optional_temporal_state() -> None:
+    config = refinement_config("diffusion_transformer")
+    config["model"].update(
+        {
+            "mamba_temporal_enabled": True,
+            "mamba_temporal_channels": 4,
+            "mamba_temporal_state": 2,
+            "mamba_temporal_layers": 1,
+            "mamba_temporal_conv": 2,
+            "mamba_temporal_expand": 1,
+        }
+    )
+    model = build_two_phase_refiner(DummyAurora(), build_packing(8, 8), config)
+    model.initialize_refiner(model.conditioning_channels())
+    payload = build_refinement_checkpoint(
+        model,
+        kind=CHECKPOINT_KIND_REFINEMENT,
+        refinement_type="diffusion_transformer",
+    )
+    assert any(key.startswith("refiner.") for key in payload["model_state_dict"])
+    assert any(key.startswith("temporal.") for key in payload["model_state_dict"])
+    assert all(
+        key.startswith(("refiner.", "temporal."))
+        for key in payload["model_state_dict"]
+    )
+
+    target = build_two_phase_refiner(DummyAurora(), build_packing(8, 8), config)
+    target.initialize_refiner(target.conditioning_channels())
+    report = load_refinement_state_dict(target, payload)
+    assert report.missing == []
+    assert report.unexpected == []
     for key, value in payload["model_state_dict"].items():
         assert torch.equal(target.state_dict()[key], value)
 

@@ -1,3 +1,5 @@
+"""Copyright (c) Microsoft Corporation. Licensed under the MIT license."""
+
 from pathlib import Path
 import sys
 from tempfile import TemporaryDirectory
@@ -64,7 +66,10 @@ def _check_case_specific_prepare_finetune_and_inference_paths(tmp_path: Path) ->
 
     cfg = ft.load_config(config_path)
     assert Path(cfg["paths"]["train_data_path"]) == train_path
-    assert Path(cfg["paths"]["val_data_path"]) == test_path
+    # Configured validation resolves only to val.nc; it must never silently use
+    # the held-out test split when that file is absent.
+    assert Path(cfg["paths"]["val_data_path"]) == case_data_dir / "val.nc"
+    assert Path(cfg["paths"]["val_data_path"]) != test_path
     assert Path(cfg["paths"]["test_data_path"]) == test_path
 
     train_ds = ft.open_dataset(cfg["paths"]["train_data_path"], cfg)
@@ -117,6 +122,33 @@ paths:
         ft.load_config(config_path)
 
 
+def _check_shared_data_case_name(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        _config_text().replace(
+            "  data_dir: data\n",
+            "  data_dir: data\n  data_case_name: shared_prepared_data\n",
+        )
+    )
+    cfg_raw = prep._read_config(config_path)
+    train_path, _val_path, test_path, case_data_dir = prep._resolve_case_data_paths(
+        cfg_raw,
+        config_path,
+        train_out=None,
+        val_out=None,
+        test_out=None,
+    )
+    assert case_data_dir == tmp_path / "data" / "shared_prepared_data"
+    ds = _tiny_dataset()
+    prep._write_netcdf(ds, train_path, compression_level=0)
+    prep._write_netcdf(ds, test_path, compression_level=0)
+
+    cfg = ft.load_config(config_path)
+    assert cfg["case_name"] == "smoke_case"
+    assert cfg["paths"]["data_case_name"] == "shared_prepared_data"
+    assert Path(cfg["paths"]["train_data_path"]) == train_path
+
+
 class CaseDataPathSmokeTest(unittest.TestCase):
     def test_case_specific_prepare_finetune_and_inference_paths(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -130,6 +162,10 @@ class CaseDataPathSmokeTest(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             _check_mismatched_out_path_is_redirected_into_case_dir(Path(tmp))
 
+    def test_shared_data_case_name(self) -> None:
+        with TemporaryDirectory() as tmp:
+            _check_shared_data_case_name(Path(tmp))
+
 
 def test_case_specific_prepare_finetune_and_inference_paths(tmp_path: Path) -> None:
     _check_case_specific_prepare_finetune_and_inference_paths(tmp_path)
@@ -141,6 +177,77 @@ def test_missing_case_name_and_missing_prepared_files_are_clear(tmp_path: Path) 
 
 def test_mismatched_out_path_is_redirected_into_case_dir(tmp_path: Path) -> None:
     _check_mismatched_out_path_is_redirected_into_case_dir(tmp_path)
+
+
+def test_shared_data_case_name(tmp_path: Path) -> None:
+    _check_shared_data_case_name(tmp_path)
+
+
+def test_train_tail_validation_uses_train_never_test(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        _config_text()
+        + "\ntraining:\n  validation_source: train_tail\n"
+    )
+    cfg_raw = prep._read_config(config_path)
+    train_path, _val_path, test_path, _case_data_dir = prep._resolve_case_data_paths(
+        cfg_raw,
+        config_path,
+        train_out=None,
+        val_out=None,
+        test_out=None,
+    )
+    dataset = _tiny_dataset()
+    prep._write_netcdf(dataset, train_path, compression_level=0)
+    prep._write_netcdf(dataset, test_path, compression_level=0)
+
+    # This fixture intentionally exercises only load_config path resolution; the
+    # minimal preparation recipe omits the full model/training schema.
+    monkeypatch.setattr(ft, "validate_config", lambda *_args, **_kwargs: None)
+    cfg = ft.load_config(config_path)
+    assert Path(cfg["paths"]["val_data_path"]) == train_path
+    assert Path(cfg["paths"]["val_data_path"]) != test_path
+
+
+def test_atmospheric_missing_mask_is_matched_by_pressure_value() -> None:
+    dataset = xr.Dataset(
+        {
+            "no2_valid": (
+                ("time", "level", "latitude", "longitude"),
+                np.asarray([[[[0]], [[0]], [[1]]]], dtype=np.int8),
+            )
+        },
+        coords={
+            "time": np.asarray(["2024-01-01T12"], dtype="datetime64[h]"),
+            # Deliberately opposite to the configured Aurora level order.
+            "level": np.asarray([850.0, 925.0, 1000.0]),
+            "latitude": np.asarray([40.0]),
+            "longitude": np.asarray([240.0]),
+        },
+    )
+    config = {
+        "data": {
+            "time_dim": "time",
+            "lat_dim": "latitude",
+            "lon_dim": "longitude",
+            "level_dim": "level",
+            "atmos_levels": [1000.0, 925.0, 850.0],
+            "extra_dim_indexers": {},
+            "optional_masks_for_missing_values": {"no2": "no2_valid"},
+        }
+    }
+    result = ft._target_missing_mask(
+        dataset,
+        ft.VariableSpec("no2", "no2", "atmos"),
+        {"target_indices": {1: 0}},
+        lead=1,
+        config=config,
+    )
+
+    assert result is not None
+    np.testing.assert_array_equal(result[:, 0, 0].numpy(), [True, False, False])
 
 
 if __name__ == "__main__":

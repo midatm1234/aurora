@@ -262,9 +262,20 @@ def test_unknown_attention_implementation_raises() -> None:
 
 
 def test_windowed_attention_is_local_but_shifted_windows_widen_the_receptive_field() -> None:
-    """Windowed attention must stay strictly spatial and strictly local."""
+    """Windowed attention must stay strictly spatial and strictly local.
+
+    ``local_refinement`` is disabled here so the test measures the *attention*
+    receptive field alone: the convolutional stem and head deliberately add one
+    pixel of spatial support on each side to remove patch-boundary blocking, and
+    that would otherwise be indistinguishable from attention leaking out of its
+    window.
+    """
     unshifted = build_transformer(
-        attention_mode="windowed_2d", window_size=(2, 2), num_blocks=1, patch_size=(4, 4)
+        attention_mode="windowed_2d",
+        window_size=(2, 2),
+        num_blocks=1,
+        patch_size=(4, 4),
+        local_refinement=False,
     )
     x = torch.zeros(1, 2, 16, 16)
     cond = torch.zeros(1, 3, 16, 16)
@@ -280,6 +291,27 @@ def test_windowed_attention_is_local_but_shifted_windows_widen_the_receptive_fie
     # far corner must not, because attention never leaves the window.
     assert float(delta[8:, 8:].max()) == 0.0
     assert float(delta[:8, :8].max()) > 0.0
+
+
+def test_local_refinement_adds_exactly_one_pixel_of_support() -> None:
+    """The conv stem/head must widen the receptive field by one pixel, no more."""
+    model = build_transformer(
+        attention_mode="windowed_2d",
+        window_size=(2, 2),
+        num_blocks=1,
+        patch_size=(4, 4),
+        local_refinement=True,
+    )
+    x = torch.zeros(1, 2, 16, 16)
+    cond = torch.zeros(1, 3, 16, 16)
+    t = torch.tensor([1.0])
+    lead = torch.tensor([24.0])
+    baseline = run(model, x, cond, t, lead)
+    perturbed = x.clone()
+    perturbed[0, :, 0:4, 0:4] = 5.0
+    delta = (run(model, perturbed, cond, t, lead) - baseline).abs().sum(dim=(0, 1))
+    # One extra pixel of leakage past the 8x8 window is expected; two are not.
+    assert float(delta[9:, 9:].max()) == 0.0
 
 
 def test_shifted_windows_are_configured_on_alternating_blocks() -> None:

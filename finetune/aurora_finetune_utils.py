@@ -1,10 +1,13 @@
-"""Utilities for config-driven Aurora fine-tuning and rollout workflows."""
+"""Copyright (c) Microsoft Corporation. Licensed under the MIT license.
+
+Utilities for config-driven Aurora fine-tuning and rollout workflows."""
 
 from __future__ import annotations
 
 import contextlib
 import csv
 import dataclasses
+import hashlib
 import json
 import logging
 import math
@@ -12,13 +15,19 @@ import pickle
 import random
 import warnings
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
 import numpy as np
 import torch
 import xarray as xr
+
+from finetune.checkpoint_selection import (
+    refinement_checkpoint_status,
+    select_refinement_checkpoint,
+    validate_checkpoint_validation_provenance,
+)
 
 from aurora import Batch, Metadata
 
@@ -38,6 +47,7 @@ __all__ = [
     "validate_dataset_contract",
     "load_config",
     "set_seed",
+    "derive_refinement_seed",
     "open_dataset",
     "validate_longitude_consistency",
     "merge_external_static_vars",
@@ -54,13 +64,17 @@ __all__ = [
     "run_validation",
     "run_rollout",
     "save_checkpoint",
+    "refinement_checkpoint_status",
     "select_refinement_checkpoint",
+    "validate_checkpoint_validation_provenance",
     "load_checkpoint_if_available",
     "validate_checkpoint_longitude",
     "validate_checkpoint_refinement_contract",
     "write_training_history",
     "write_run_manifest",
     "save_predictions",
+    "build_finetune_model",
+    "load_model_from_checkpoint",
     "maybe_wrap_conv_refine",
     "maybe_wrap_flow_refine",
     "maybe_wrap_stochastic_refine",
@@ -75,6 +89,7 @@ class VariableSpec:
     aurora_name: str
     kind: str  # surf | atmos | static
     loss_levels: tuple[float, ...] | None = None
+    units: str = ""
 
 
 @dataclass(frozen=True)
@@ -204,6 +219,11 @@ def validate_config(
                 kind_value = item.get("kind")
                 kind = None if kind_value is None else str(kind_value).strip().lower()
                 loss_levels = item.get("loss_levels")
+                units_value = item.get("units", "")
+                if not isinstance(units_value, str):
+                    raise ValueError(
+                        f"{label}.units must be a string, got {units_value!r}."
+                    )
             else:
                 raise TypeError(f"{label} must be a string or mapping, got {type(item).__name__}.")
             if not dataset_name or not aurora_name:
@@ -259,6 +279,28 @@ def validate_config(
     if len(set(target_leads)) != len(target_leads):
         raise ValueError("data.target_lead_times must not contain duplicates.")
     positive_integer(data_cfg.get("input_time_steps", 2), "data.input_time_steps")
+    if target_leads != sorted(target_leads):
+        raise ValueError(
+            f"data.target_lead_times must be strictly increasing, got {target_leads}."
+        )
+    target_type = str(data_cfg.get("target_type", "rollout")).strip().lower()
+    if target_type not in {"next-step", "multi-step", "rollout"}:
+        raise ValueError(
+            "data.target_type must be next-step, multi-step, or rollout; "
+            f"got {data_cfg.get('target_type')!r}."
+        )
+    nonnegative = data_cfg.get("nonnegative_target_variables", []) or []
+    if not isinstance(nonnegative, (list, tuple)):
+        raise ValueError("data.nonnegative_target_variables must be a list of target names.")
+    target_names = {entry["dataset_name"] for entry in targets} | {
+        entry["aurora_name"] for entry in targets
+    }
+    unknown_nonnegative = sorted({str(name) for name in nonnegative} - target_names)
+    if unknown_nonnegative:
+        raise ValueError(
+            "data.nonnegative_target_variables contains names that are not configured "
+            f"targets: {unknown_nonnegative}; expected a subset of {sorted(target_names)}."
+        )
 
     for entry in targets:
         loss_levels_raw = entry["loss_levels"]
@@ -348,6 +390,9 @@ def validate_config(
     for stats_key in ("input_stats", "target_stats"):
         if not isinstance(normalization.get(stats_key, {}), dict):
             raise ValueError(f"data.normalization.{stats_key} must be a mapping.")
+
+    if not isinstance(model_cfg.get("model_kwargs", {}), dict):
+        raise ValueError("model.model_kwargs must be a mapping.")
 
     if not str(model_cfg.get("model_variant", "")).strip():
         raise ValueError("model.model_variant must be a non-empty model registry name.")
@@ -464,16 +509,57 @@ def validate_config(
                 f"supervised lead ({expected_scale:g} hours)."
             )
 
-    temporal_enabled = bool(model_cfg.get("mamba_temporal_enabled", False))
-    if temporal_enabled:
-        if not legacy_flow_selected:
+    temporal_enabled_value = model_cfg.get("mamba_temporal_enabled", False)
+    if not isinstance(temporal_enabled_value, bool):
+        raise ValueError(
+            "model.mamba_temporal_enabled must be true or false, got "
+            f"{temporal_enabled_value!r}."
+        )
+    temporal_enabled = temporal_enabled_value
+    if "mamba_temporal_weight" in training_cfg:
+        configured_temporal_weight = finite_number(
+            training_cfg["mamba_temporal_weight"],
+            "training.mamba_temporal_weight",
+        )
+        if configured_temporal_weight < 0:
             raise ValueError(
-                "model.mamba_temporal_enabled requires flow_refine_enabled=true or "
-                "model.refinement.type: flow_matching_unet."
+                "training.mamba_temporal_weight must be >= 0, got "
+                f"{training_cfg['mamba_temporal_weight']!r}."
+            )
+    if temporal_enabled:
+        supported_temporal_backend = (
+            legacy_flow_selected or refinement_cfg.backend == "unified"
+        )
+        if not supported_temporal_backend:
+            raise ValueError(
+                "model.mamba_temporal_enabled requires an active refinement backend "
+                "(legacy flow_matching_unet or a unified flow/diffusion refiner); "
+                f"actual model.refinement.type={refinement_cfg.type!r}."
             )
         if len(target_leads) < 2:
             raise ValueError(
-                "model.mamba_temporal_enabled requires at least two data.target_lead_times."
+                "model.mamba_temporal_enabled requires at least two "
+                f"data.target_lead_times; actual value is {target_leads!r}."
+            )
+        expected_temporal_leads = list(range(1, max(target_leads) + 1))
+        if target_leads != expected_temporal_leads:
+            raise ValueError(
+                "data.target_lead_times must be consecutive rollout indices "
+                "[1, ..., max] when model.mamba_temporal_enabled=true, because "
+                "Mamba is applied at every inference step; expected "
+                f"{expected_temporal_leads!r}, got {target_leads!r}."
+            )
+        if rollout_steps > max(target_leads):
+            raise ValueError(
+                "rollout.rollout_num_steps exceeds the trained temporal-Mamba "
+                "horizon from data.target_lead_times when "
+                "model.mamba_temporal_enabled=true; expected 0 or a value <= "
+                f"{max(target_leads)}, got {rollout_steps}."
+            )
+        if step_hours is None:
+            raise ValueError(
+                "model.mamba_temporal_enabled requires a positive "
+                f"rollout.rollout_step_hours; actual value is {step_value!r}."
             )
         for key, default in (
             ("mamba_temporal_channels", 16),
@@ -483,13 +569,13 @@ def validate_config(
             ("mamba_temporal_expand", 2),
         ):
             positive_integer(model_cfg.get(key, default), f"model.{key}")
-        temporal_weight = finite_number(
-            training_cfg.get("mamba_temporal_weight", 1.0),
-            "training.mamba_temporal_weight",
-        )
+        temporal_weight = configured_temporal_weight if (
+            "mamba_temporal_weight" in training_cfg
+        ) else 1.0
         if temporal_weight <= 0:
             raise ValueError(
-                "A training.mamba_temporal_weight > 0 is required when the temporal module is enabled."
+                "A training.mamba_temporal_weight > 0 is required when the "
+                "temporal module is enabled."
             )
 
     if (
@@ -507,6 +593,29 @@ def validate_config(
     finite_number(training_cfg.get("learning_rate", 0), "training.learning_rate", positive=True)
     positive_integer(training_cfg.get("accumulation_steps", 1), "training.accumulation_steps")
     positive_integer(training_cfg.get("validation_frequency", 1), "training.validation_frequency")
+    positive_integer(
+        training_cfg.get("validation_refinement_ensemble_size", 1),
+        "training.validation_refinement_ensemble_size",
+    )
+    checkpoint_metric = str(
+        training_cfg.get("checkpoint_metric", "validation_loss")
+    ).strip().lower()
+    if checkpoint_metric not in {
+        "validation_loss",
+        "val_loss",
+        "mean_physical_rmse_ratio",
+    }:
+        raise ValueError(
+            "training.checkpoint_metric must be validation_loss or "
+            "mean_physical_rmse_ratio."
+        )
+    for boolean_key in (
+        "require_refinement_improvement",
+        "require_all_physical_channels_improve",
+    ):
+        if boolean_key in training_cfg and not isinstance(training_cfg[boolean_key], bool):
+            raise ValueError(f"training.{boolean_key} must be true or false.")
+
     validation_source = str(
         training_cfg.get("validation_source", "configured")
     ).strip().lower()
@@ -706,6 +815,26 @@ def validate_dataset_contract(
             f"Global longitude width {width} is not divisible by model.patch_size={patch_size}; "
             "periodic longitude cannot be cropped safely."
         )
+
+
+
+    from finetune.refinement.config import resolve_refinement_config
+
+    refinement = resolve_refinement_config(config)
+    if refinement.is_active and refinement.uses_transformer:
+        patch_h, patch_w = refinement.transformer.patch_size
+        tokens_h = math.ceil(height / patch_h)
+        tokens_w = math.ceil(width / patch_w)
+        max_h = refinement.transformer.max_tokens_lat
+        max_w = refinement.transformer.max_tokens_lon
+        if tokens_h > max_h or tokens_w > max_w:
+            raise ValueError(
+                "Dataset/refinement Transformer token geometry is incompatible: "
+                f"spatial grid={(height, width)}, "
+                f"refinement.transformer.patch_size={(patch_h, patch_w)} gives "
+                f"token grid={(tokens_h, tokens_w)}, but configured maxima are "
+                f"max_tokens_lat={max_h}, max_tokens_lon={max_w}."
+            )
 
 
 def _dim_names(config: dict[str, Any]) -> tuple[str, str, str, str]:
@@ -983,12 +1112,43 @@ def load_config(config_path: str | Path, overrides: dict[str, Any] | None = None
         paths_cfg[key] = _resolve_path(str(value), project_root)
 
     data_dir = Path(paths_cfg.get("data_dir", project_root / "data"))
-    case_data_dir = data_dir if data_dir.name == case_name else data_dir / case_name
+    data_case_name = str(paths_cfg.get("data_case_name", case_name)).strip()
+    if not data_case_name:
+        raise ValueError(
+            "paths.data_case_name must be a non-empty prepared-data folder name when set."
+        )
+    paths_cfg["data_case_name"] = data_case_name
+    case_data_dir = data_dir if data_dir.name == data_case_name else data_dir / data_case_name
     paths_cfg["data_dir"] = str(data_dir.resolve())
     paths_cfg["case_data_dir"] = str(case_data_dir.resolve())
     paths_cfg["train_data_path"] = str((case_data_dir / "train.nc").resolve())
-    paths_cfg["val_data_path"] = str((case_data_dir / "test.nc").resolve())
     paths_cfg["test_data_path"] = str((case_data_dir / "test.nc").resolve())
+
+    # Never use the held-out test split for checkpoint selection. Older
+    # versions silently assigned test.nc to both roles, which made a finite
+    # validation loss look like held-out evidence. A real val.nc is used when
+    # present; train-tail validation deliberately points at train.nc because
+    # the trainer constructs a grouped, purged tail split in memory. Keeping
+    # the (possibly absent) val.nc path for ``validation_source=configured``
+    # makes an unsafe/missing split fail when training attempts to open it.
+    training_cfg = config.setdefault("training", {})
+    validation_source = str(
+        training_cfg.get("validation_source", "configured")
+    ).strip().lower()
+    skip_validation = bool(training_cfg.get("skip_validation", False))
+    prepared_val_path = (case_data_dir / "val.nc").resolve()
+    if prepared_val_path.exists():
+        paths_cfg["val_data_path"] = str(prepared_val_path)
+    elif validation_source == "train_tail" or skip_validation:
+        paths_cfg["val_data_path"] = paths_cfg["train_data_path"]
+    else:
+        paths_cfg["val_data_path"] = str(prepared_val_path)
+        logger.warning(
+            "Configured validation requires %s, which does not exist. The held-out "
+            "test split will not be substituted. Prepare val.nc or set "
+            "training.validation_source=train_tail.",
+            prepared_val_path,
+        )
 
     required_data_paths = [
         Path(paths_cfg["train_data_path"]),
@@ -1042,6 +1202,29 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def derive_refinement_seed(
+    base_seed: int,
+    initialization_time: Any,
+    member_index: int = 0,
+) -> int:
+    """Derive a stable RNG seed for one forecast initialization and member.
+
+    Reusing ``base_seed + member_index`` for every initialization replays the
+    same spatial diffusion latent in every forecast. Fixed grid artifacts then
+    survive aggregation over hundreds of cases. This SHA-256 based mapping is
+    stable across Python processes (unlike :func:`hash`) while retaining exact
+    reproducibility for a given ``(base seed, initialization, member)`` tuple.
+    """
+    if int(member_index) < 0:
+        raise ValueError(
+            f"member_index must be non-negative, got {member_index!r}."
+        )
+    initialization_ns = np.datetime64(initialization_time, "ns").astype("int64")
+    payload = f"{int(base_seed)}|{int(initialization_ns)}|{int(member_index)}".encode()
+    # torch.Generator.manual_seed accepts a signed 64-bit-compatible integer.
+    return int.from_bytes(hashlib.sha256(payload).digest()[:8], "little") & 0x7FFF_FFFF_FFFF_FFFF
 
 
 def open_dataset(path: str | Path, config: dict[str, Any]) -> xr.Dataset:
@@ -1303,6 +1486,7 @@ def _parse_variable_specs(
                 if loss_levels_raw is not None
                 else None
             )
+            units = str(item.get("units") or ds[dataset_name].attrs.get("units") or "")
         else:
             raise TypeError(f"Unsupported variable spec type: {type(item)}")
 
@@ -1312,6 +1496,7 @@ def _parse_variable_specs(
 
         if not isinstance(item, dict):
             loss_levels = None
+            units = str(ds[dataset_name].attrs.get("units") or "")
 
         specs.append(
             VariableSpec(
@@ -1319,6 +1504,7 @@ def _parse_variable_specs(
                 aurora_name=aurora_name,
                 kind=kind,
                 loss_levels=loss_levels,
+                units=units,
             )
         )
 
@@ -1973,6 +2159,7 @@ def _target_missing_mask(
         )
         arr = da.isel({time_dim: target_index}).transpose(lat_dim, lon_dim).values
     else:
+        da = _select_levels_if_needed(da, config=config, level_dim=level_dim)
         da = _prepare_data_array(
             da,
             allowed_dims={time_dim, level_dim, lat_dim, lon_dim},
@@ -2134,6 +2321,44 @@ def _autocast_context(device: torch.device, mixed_precision: str):
     return contextlib.nullcontext()
 
 
+def _make_refinement_generator(
+    device: torch.device | str,
+    seed: int | None,
+) -> torch.Generator | None:
+    """Create one persistent refinement RNG for an entire causal rollout."""
+    if seed is None:
+        return None
+    generator = torch.Generator(device=torch.device(device))
+    generator.manual_seed(int(seed))
+    return generator
+
+
+def _validation_refinement_generator(
+    model: torch.nn.Module,
+    device: torch.device | str,
+    *,
+    stream: int = 0,
+) -> torch.Generator | None:
+    """Create one reproducible RNG stream for a unified validation loop.
+
+    The generator is intentionally owned by the validation loop rather than by
+    each batch loss call. This keeps repeated validation runs reproducible while
+    ensuring consecutive batches do not all reuse the first stochastic draw.
+    Distributed ranks use distinct deterministic streams.
+    """
+    from finetune.refinement.two_phase import AuroraTwoPhaseRefiner
+
+    inner = model.module if hasattr(model, "module") else model
+    if not isinstance(inner, AuroraTwoPhaseRefiner):
+        return None
+    if not inner.refinement_config.is_active:
+        return None
+    seed = inner.refinement_config.seed
+    if seed is None:
+        return None
+    return _make_refinement_generator(device, int(seed) + int(stream))
+
+
 def _advance_batch_with_prediction(
     batch: Batch,
     pred: Batch,
@@ -2212,6 +2437,8 @@ def compute_supervised_loss(
     resolved_specs: ResolvedVariableSpecs,
     device: str | torch.device,
     norm_stats: dict[str, dict[str, torch.Tensor]] | None = None,
+    *,
+    refinement_generator: torch.Generator | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """Run autoregressive forward passes and compute supervised multi-lead loss."""
     sample_list = _sample_list(samples)
@@ -2230,8 +2457,9 @@ def compute_supervised_loss(
     coherence_col_var = str(aux_cfg.get("coherence_column_var", "") or "")
     coherence_prof_var = str(aux_cfg.get("coherence_profile_var", "") or "")
 
-    # Mamba temporal loss weight. Active only when the flow-refine wrapper has
-    # the temporal module enabled (see end of this function). 0 → disabled.
+    # Mamba temporal loss weight. Active when either refinement wrapper has the
+    # optional temporal module enabled (see end of this function). 0 disables
+    # the loss for legacy compatibility.
     temporal_weight = float(training_cfg.get("mamba_temporal_weight", 1.0))
 
     batch = build_aurora_batch(ds, sample_list, config, resolved_specs=resolved_specs)
@@ -2267,7 +2495,11 @@ def compute_supervised_loss(
     current_batch = batch
     base_for_fm = model.module if hasattr(model, "module") else model
     from finetune.flow_refine import AuroraFlowRefine as _AFR
-    from finetune.refinement.integration import LeadStepBuffer
+    from finetune.refinement.integration import (
+        LeadStepBuffer,
+        pack_refinement_conditioning,
+        refine_batch_prediction,
+    )
     from finetune.refinement.two_phase import AuroraTwoPhaseRefiner as _ATP
 
     is_flow_refine = isinstance(base_for_fm, _AFR)
@@ -2277,13 +2509,21 @@ def compute_supervised_loss(
         and unified_refiner.refinement_config.is_active
         and unified_refiner.training
     )
+    unified_eval_active = (
+        unified_refiner is not None
+        and unified_refiner.refinement_config.is_active
+        and not unified_refiner.training
+    )
     lead_buffer = (
         LeadStepBuffer(unified_refiner.packing) if unified_active else None
     )
+    unified_input_batches: dict[int, Batch] = {}
     lead_conditioned_flow = (
         is_flow_refine and getattr(base_for_fm, "lead_time_cond", False)
     )
-    needs_lead_hours = lead_conditioned_flow or unified_active
+    needs_lead_hours = (
+        lead_conditioned_flow or unified_active or unified_eval_active or not model.training
+    )
     lead_hours_by_step: dict[int, torch.Tensor] = {}
     if needs_lead_hours:
         forecast_step_hours = _resolve_rollout_step_hours(ds, config)
@@ -2306,30 +2546,75 @@ def compute_supervised_loss(
     # temporal loss. Populated inside the lead loop only when a flow-refine
     # wrapper with the temporal module enabled is in training mode.
     temporal_seq: dict[str, dict[str, Any]] = {}
+    unified_eval_temporal_history: list[torch.Tensor] | None = (
+        []
+        if unified_eval_active and getattr(unified_refiner, "has_temporal", False)
+        else None
+    )
+    unified_eval_generator = None
+    if unified_eval_active:
+        # Validation loops pass one persistent generator so stochastic draws
+        # advance across batches instead of restarting from the same seed for
+        # every batch. Direct callers retain the historical deterministic
+        # per-call behavior when they do not supply a generator.
+        unified_eval_generator = (
+            refinement_generator
+            if refinement_generator is not None
+            else _make_refinement_generator(
+                device,
+                unified_refiner.refinement_config.seed,
+            )
+        )
+    validation_refinement_ensemble_size = int(
+        training_cfg.get("validation_refinement_ensemble_size", 1)
+    )
     with _autocast_context(device=device, mixed_precision=mixed_precision):
         for lead in range(1, max_lead + 1):
             lead_hours = lead_hours_by_step.get(lead)
-            pred = (
-                model(
-                    current_batch,
+            if unified_active:
+                # Preserve the exact pre-forecast state for optional input-state
+                # and static conditioning. Later autoregressive updates must not
+                # overwrite which state conditioned this forecast valid time.
+                unified_input_batches[lead] = current_batch
+            if unified_eval_active:
+                assert unified_refiner is not None
+                deterministic_pred = unified_refiner.aurora(current_batch)
+                pred = refine_batch_prediction(
+                    unified_refiner,
+                    deterministic_pred,
+                    aurora_input_batch=current_batch,
                     forecast_lead_time_hours=lead_hours,
+                    ensemble_size=validation_refinement_ensemble_size,
+                    generator=unified_eval_generator,
+                    temporal_history=unified_eval_temporal_history,
                 )
-                if (is_flow_refine or unified_refiner is not None)
-                else model(current_batch)
-            )
-            preds_by_lead[lead] = pred
-            feedback_pred = pred
-            if flow_feedback_enabled:
-                # Match inference-state provenance without backpropagating
-                # through the full rollout. The residual loss below still uses
-                # `pred` as its unrefined baseline, while the next Aurora step
-                # consumes the deterministic corrected target fields.
-                with torch.no_grad():
-                    feedback_pred = base_for_fm.refine_prediction(
-                        pred,
-                        deterministic=True,
+                feedback_pred = (
+                    pred
+                    if unified_refiner.refinement_config.feedback_to_rollout
+                    else deterministic_pred
+                )
+            else:
+                pred = (
+                    model(
+                        current_batch,
                         forecast_lead_time_hours=lead_hours,
                     )
+                    if (is_flow_refine or unified_refiner is not None)
+                    else model(current_batch)
+                )
+                feedback_pred = pred
+                if flow_feedback_enabled:
+                    # Match inference-state provenance without backpropagating
+                    # through the full rollout. The residual loss below still uses
+                    # `pred` as its unrefined baseline, while the next Aurora step
+                    # consumes the deterministic corrected target fields.
+                    with torch.no_grad():
+                        feedback_pred = base_for_fm.refine_prediction(
+                            pred,
+                            deterministic=True,
+                            forecast_lead_time_hours=lead_hours,
+                        )
+            preds_by_lead[lead] = pred
 
             # Build next autoregressive input:
             # - Target variables: use model prediction (autoregressive)
@@ -2386,6 +2671,7 @@ def compute_supervised_loss(
     total_loss = torch.zeros((), device=device)
     total_weight = 0.0
 
+    physical_error_sums: dict[str, dict[str, float]] = {}
     for lead in lead_times:
         pred = preds_by_lead[lead]
         target_map = targets[lead]
@@ -2445,6 +2731,8 @@ def compute_supervised_loss(
             target_tensor = target_tensor.float()
 
             # Normalize pred and target to ~O(1) so that MSE gradients are
+            pred_physical_tensor = pred_tensor
+            target_physical_tensor = target_tensor
             # meaningful even for variables with tiny physical magnitudes
             # (e.g. NO2 ~1e-10 kg/kg).
             if norm_stats is not None and aurora_name in norm_stats:
@@ -2477,6 +2765,60 @@ def compute_supervised_loss(
                 spatial_mask=spatial_mask,
                 missing_mask=missing_mask,
             )
+
+            if not model.training:
+                metric_lead_hours = lead_hours_by_step.get(lead)
+                if metric_lead_hours is None or metric_lead_hours.numel() == 0:
+                    raise RuntimeError("Physical validation metrics require forecast lead hours.")
+                if not torch.allclose(
+                    metric_lead_hours, metric_lead_hours[:1].expand_as(metric_lead_hours)
+                ):
+                    raise ValueError("A validation batch mixes physical hours for one lead index.")
+                lead_suffix = f"@lead{float(metric_lead_hours[0]):g}h"
+                if target_spec.kind == "surf":
+                    channel_views = [
+                        (
+                            f"{target_spec.dataset_name}@surface{lead_suffix}",
+                            pred_physical_tensor,
+                            target_physical_tensor,
+                            valid_mask,
+                        )
+                    ]
+                else:
+                    levels_for_metrics = list(var_levels or ())
+                    if len(levels_for_metrics) != pred_physical_tensor.shape[1]:
+                        levels_for_metrics = list(range(pred_physical_tensor.shape[1]))
+                    channel_views = [
+                        (
+                            f"{target_spec.dataset_name}@{float(level):g}hPa{lead_suffix}",
+                            pred_physical_tensor[:, index],
+                            target_physical_tensor[:, index],
+                            valid_mask[:, index],
+                        )
+                        for index, level in enumerate(levels_for_metrics)
+                    ]
+                for channel_name, physical_pred, physical_target, channel_mask in channel_views:
+                    selected = (
+                        channel_mask
+                        & torch.isfinite(physical_pred)
+                        & torch.isfinite(physical_target)
+                    )
+                    if not bool(selected.any().item()):
+                        continue
+                    error = (physical_pred[selected] - physical_target[selected]).double()
+                    slot = physical_error_sums.setdefault(
+                        channel_name,
+                        {
+                            "count": 0.0,
+                            "error_sum": 0.0,
+                            "abs_error_sum": 0.0,
+                            "sq_error_sum": 0.0,
+                        },
+                    )
+                    slot["count"] += float(error.numel())
+                    slot["error_sum"] += float(error.sum().detach().cpu())
+                    slot["abs_error_sum"] += float(error.abs().sum().detach().cpu())
+                    slot["sq_error_sum"] += float(error.square().sum().detach().cpu())
 
             # If the model is a flow-matching refine wrapper AND we're in
             # training mode, replace the deterministic MSE with the
@@ -2658,18 +3000,34 @@ def compute_supervised_loss(
     total_loss = total_loss / total_weight
 
     # ---- Unified stochastic residual refinement (Phase 2) ----
-    # The deterministic Aurora rollout above is frozen input; this term trains
-    # only the refiner. Rollout steps are folded into the effective batch
-    # dimension in ascending order, each carrying its own physical forecast lead
-    # time, so lead times never interact inside the model.
+    # The deterministic Aurora rollout above is frozen input; the generative
+    # term trains the spatial refiner on folded steps. When enabled, Mamba then
+    # unfolds those steps into [batch, lead, channel, lat, lon] and adds a
+    # separate cross-lead loss without leaking target-conditioned diffusion
+    # states into its input.
     refinement_metrics: dict[str, float] = {}
     if lead_buffer is not None and lead_buffer.is_complete():
         assert unified_refiner is not None
         rollout_n, target_n, mask_n, lead_hours_n, lead_index_n = lead_buffer.pack(device)
+        for position, lead in enumerate(lead_buffer.leads):
+            selected_rollout = rollout_n[lead_index_n == position]
+            packed_inputs = pack_refinement_conditioning(
+                unified_refiner,
+                selected_rollout,
+                aurora_input_batch=unified_input_batches[lead],
+            )
+            lead_buffer.set_conditioning(
+                lead,
+                input_state_normalized=packed_inputs.input_state_normalized,
+                static_fields=packed_inputs.static_fields,
+            )
+        packed_inputs = lead_buffer.pack_conditioning(device)
         refinement_weight = float(training_cfg.get("refinement_loss_weight", 1.0))
         step_out = unified_refiner.training_step(
             rollout_n,
             target_n,
+            input_state_normalized=packed_inputs.input_state_normalized,
+            static_fields=packed_inputs.static_fields,
             valid_mask=mask_n,
             forecast_lead_time=lead_hours_n,
             lead_index=lead_index_n,
@@ -2678,12 +3036,32 @@ def compute_supervised_loss(
             name: float(value.detach()) for name, value in step_out.losses.items()
         }
         total_loss = total_loss + refinement_weight * step_out.losses["total_loss"]
+        if temporal_weight > 0.0 and unified_refiner.has_temporal:
+            temporal_loss, unified_temporal_metrics = (
+                unified_refiner.temporal_training_loss(
+                    rollout_n,
+                    target_n,
+                    valid_mask=mask_n,
+                    forecast_lead_time=lead_hours_n,
+                    lead_index=lead_index_n,
+                    conditioning=step_out.conditioning,
+                )
+            )
+            total_loss = total_loss + temporal_weight * temporal_loss
+            temporal_metrics.update(
+                {
+                    name: float(value.detach())
+                    for name, value in unified_temporal_metrics.items()
+                }
+            )
 
     metrics = {
         "batch_size": len(sample_list),
         "lead_times": lead_times,
         "spatial_shape": batch.spatial_shape,
     }
+    if physical_error_sums:
+        metrics["physical_error_sums"] = physical_error_sums
     if temporal_metrics:
         metrics["temporal"] = temporal_metrics
     if refinement_metrics:
@@ -2913,6 +3291,7 @@ def maybe_wrap_stochastic_refine(
     lon: Any | None = None,
     lat: Any | None = None,
     norm_stats: dict[str, dict[str, torch.Tensor]] | None = None,
+    nonnegative_variables: Sequence[str] = (),
 ) -> torch.nn.Module:
     """Optionally wrap *model* with the unified stochastic residual refiner.
 
@@ -2945,11 +3324,53 @@ def maybe_wrap_stochastic_refine(
         lat=lat_values,
         lon=lon_values,
         lon_periodic=lon_periodic,
+        nonnegative_variables=nonnegative_variables,
     )
     if wrapper is None:
         return model
     wrapper.longitude_grid_signature = model_cfg.get("longitude_grid_signature")
     return wrapper
+
+
+def build_finetune_model(
+    config: dict[str, Any],
+    resolved_specs: ResolvedVariableSpecs,
+    *,
+    lon: Any | None = None,
+    lat: Any | None = None,
+    norm_stats: dict[str, dict[str, torch.Tensor]] | None = None,
+    load_pretrained: bool = False,
+    autocast: bool | None = None,
+) -> torch.nn.Module:
+    """Build Aurora and its configured refinement through the shared factory."""
+    from finetune.model_factory import build_finetune_model as _build
+
+    return _build(
+        config,
+        resolved_specs,
+        lon=lon,
+        lat=lat,
+        norm_stats=norm_stats,
+        load_pretrained=load_pretrained,
+        autocast=autocast,
+    )
+
+
+def load_model_from_checkpoint(
+    config: dict[str, Any],
+    resolved_specs: ResolvedVariableSpecs,
+    checkpoint_path: str | Path,
+    **kwargs: Any,
+) -> tuple[torch.nn.Module, dict[str, Any]]:
+    """Strictly reconstruct and load a combined training checkpoint."""
+    from finetune.model_factory import load_model_from_checkpoint as _load
+
+    return _load(
+        config,
+        resolved_specs,
+        checkpoint_path,
+        **kwargs,
+    )
 
 
 def configure_trainable_parameters(
@@ -2966,11 +3387,18 @@ def configure_trainable_parameters(
     except Exception:
         AuroraFlowRefine = None  # type: ignore[assignment]
 
+    from finetune.refinement.two_phase import AuroraTwoPhaseRefiner
+
     is_conv_refine = isinstance(model, AuroraConvRefine)
     is_flow_refine = (
         AuroraFlowRefine is not None and isinstance(model, AuroraFlowRefine)
     )
-    base = model.base if (is_conv_refine or is_flow_refine) else model
+    is_stochastic_refine = isinstance(model, AuroraTwoPhaseRefiner)
+    base = (
+        model.aurora if is_stochastic_refine
+        else model.base if (is_conv_refine or is_flow_refine)
+        else model
+    )
 
     for param in base.parameters():
         param.requires_grad = True
@@ -3030,6 +3458,19 @@ def configure_trainable_parameters(
             param.requires_grad = True
         # Mamba temporal module (when enabled) is always trainable.
         if getattr(model, "temporal", None) is not None:
+            for param in model.temporal.parameters():
+                param.requires_grad = True
+
+    if is_stochastic_refine:
+        if model.refinement_config.freeze_aurora:
+            for param in model.aurora.parameters():
+                param.requires_grad = False
+            model.aurora_frozen = True
+            model.aurora.eval()
+        if model.refiner is not None:
+            for param in model.refiner.parameters():
+                param.requires_grad = True
+        if model.temporal is not None:
             for param in model.temporal.parameters():
                 param.requires_grad = True
 
@@ -3121,11 +3562,13 @@ def run_validation(
 
     batch_size = int(config.get("training", {}).get("batch_size", 1))
     model.eval()
+    refinement_generator = _validation_refinement_generator(model, device)
 
     losses: list[float] = []
     with torch.inference_mode():
-        batch_count = 0
-        for i in range(0, len(val_samples), batch_size):
+        for batch_count, i in enumerate(
+            range(0, len(val_samples), batch_size), start=1
+        ):
             sample_batch = val_samples[i : i + batch_size]
             loss, _ = compute_supervised_loss(
                 model=model,
@@ -3135,9 +3578,9 @@ def run_validation(
                 resolved_specs=resolved_specs,
                 device=device,
                 norm_stats=norm_stats,
+                refinement_generator=refinement_generator,
             )
             losses.append(float(loss.detach().cpu().item()))
-            batch_count += 1
             if max_batches is not None and batch_count >= max_batches:
                 break
 
@@ -3196,6 +3639,9 @@ def run_rollout(
     config: dict[str, Any],
     resolved_specs: ResolvedVariableSpecs,
     device: str | torch.device,
+    *,
+    refinement_seed: int | None = None,
+    refinement_ensemble_size: int | None = None,
 ) -> list[Batch]:
     """Run rollout from a starting sample using a fine-tuned model."""
     rollout_cfg = config.get("rollout", {})
@@ -3274,6 +3720,23 @@ def run_rollout(
         flow_refine_active
         and getattr(base_for_fm, "has_temporal", False)
     )
+    unified_temporal_active = (
+        unified_refiner is not None
+        and getattr(unified_refiner, "has_temporal", False)
+    )
+    trained_leads = sorted(
+        int(value)
+        for value in config.get("data", {}).get("target_lead_times", ())
+    )
+    if (temporal_active or unified_temporal_active) and (
+        not trained_leads or steps > max(trained_leads)
+    ):
+        trained_horizon = max(trained_leads) if trained_leads else None
+        raise ValueError(
+            "rollout.rollout_num_steps exceeds the trained temporal-Mamba "
+            "horizon from data.target_lead_times; expected a value <= "
+            f"{trained_horizon!r}, got {steps}."
+        )
     step_hours = (
         _resolve_rollout_step_hours(ds, config)
         if (lead_conditioned_flow or unified_refiner is not None)
@@ -3290,7 +3753,42 @@ def run_rollout(
             f"{float(getattr(base_for_fm, "lead_time_scale_hours")):g} h. "
             "Retrain with the longer lead range instead of extrapolating silently."
         )
-    temporal_history: dict[tuple[str, str], list[torch.Tensor]] = {}
+    anchor_idx = int(start_sample["anchor_index"])
+    resolved_refinement_seed: int | None = None
+    resolved_refinement_ensemble_size = 1
+    if unified_refiner is not None:
+        configured_seed = unified_refiner.refinement_config.seed
+        if refinement_seed is not None:
+            resolved_refinement_seed = int(refinement_seed)
+        elif configured_seed is not None:
+            time_dim = _dim_names(config)[0]
+            resolved_refinement_seed = derive_refinement_seed(
+                int(configured_seed), ds[time_dim].values[anchor_idx]
+            )
+        resolved_refinement_ensemble_size = int(
+            refinement_ensemble_size
+            if refinement_ensemble_size is not None
+            else (
+                1
+                if unified_refiner.refinement_config.deterministic_inference
+                else unified_refiner.refinement_config.ensemble_size
+            )
+        )
+        if resolved_refinement_ensemble_size < 1:
+            raise ValueError("refinement_ensemble_size must be at least one.")
+
+    legacy_temporal_history: dict[tuple[str, str], list[torch.Tensor]] = {}
+    unified_temporal_history: list[torch.Tensor] | None = (
+        [] if unified_temporal_active else None
+    )
+    unified_refinement_generator = (
+        _make_refinement_generator(
+            device,
+            resolved_refinement_seed,
+        )
+        if unified_refiner is not None
+        else None
+    )
     verbose_provenance = bool(rollout_cfg.get("verbose_provenance", True))
 
     current = build_aurora_batch(
@@ -3301,7 +3799,6 @@ def run_rollout(
     ).to(device)
 
     predictor_by_aurora = resolved_specs.predictor_by_aurora
-    anchor_idx = int(start_sample["anchor_index"])
     spatial_h, spatial_w = current.spatial_shape
 
     predictions: list[Batch] = []
@@ -3318,9 +3815,11 @@ def run_rollout(
                 pred = refine_batch_prediction(
                     unified_refiner,
                     deterministic_pred,
+                    aurora_input_batch=current,
                     forecast_lead_time_hours=forecast_lead_time_hours,
-                    ensemble_size=1,
-                    seed=unified_refiner.refinement_config.seed,
+                    ensemble_size=resolved_refinement_ensemble_size,
+                    generator=unified_refinement_generator,
+                    temporal_history=unified_temporal_history,
                 )
                 feedback_pred = pred if refinement_feedback else deterministic_pred
             else:
@@ -3337,7 +3836,9 @@ def run_rollout(
             # Mamba temporal correction (causal): refine the flow-corrected
             # target fields using their evolution across the rollout so far.
             if temporal_active:
-                pred = base_for_fm.apply_temporal_rollout(pred, temporal_history)
+                pred = base_for_fm.apply_temporal_rollout(
+                    pred, legacy_temporal_history
+                )
                 feedback_pred = pred
             predictions.append(pred.to("cpu"))
 
@@ -3467,8 +3968,10 @@ def save_checkpoint(
     best_val_loss: float,
     config: dict[str, Any],
     norm_stats: dict[str, dict[str, torch.Tensor]] | None = None,
+    validation: dict[str, Any] | None = None,
+    validated_for_inference: bool | None = None,
 ) -> None:
-    """Save training checkpoint."""
+    """Save training checkpoint and lightweight validation provenance."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -3489,6 +3992,13 @@ def save_checkpoint(
         "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
         "config": config,
     }
+    if validation is not None:
+        payload["validation"] = dict(validation)
+    if validated_for_inference is None:
+        validated_for_inference = bool(
+            path.stem == "best" and np.isfinite(float(best_val_loss))
+        )
+    payload["validated_for_inference"] = bool(validated_for_inference)
     if flow_sampling_steps is not None:
         payload["flow_sampling_steps"] = flow_sampling_steps
 
@@ -3507,6 +4017,7 @@ def save_checkpoint(
     resolved = describe_refinement(config)
     payload["checkpoint_schema_version"] = CHECKPOINT_SCHEMA_VERSION
     payload["resolved_refinement_config"] = resolved["refinement"]
+    payload["resolved_temporal_config"] = resolved["temporal"]
     payload["resolved_performance_config"] = resolved["performance"]
     payload["refinement_backend"] = resolved["backend"]
     payload["refinement_type"] = resolved["refinement"]["type"]
@@ -3544,105 +4055,22 @@ def save_checkpoint(
                 "require_refinement_improvement", False
             )
         ),
+        "validated_for_inference": bool(validated_for_inference),
     }
+    if validation is not None:
+        json_validation: dict[str, Any] = {}
+        for key, value in validation.items():
+            if isinstance(value, np.generic):
+                value = value.item()
+            elif torch.is_tensor(value) and value.numel() == 1:
+                value = value.detach().cpu().item()
+            if not isinstance(value, (str, int, float, bool, type(None))):
+                value = str(value)
+            json_validation[str(key)] = value
+        metadata["validation"] = json_validation
     path.with_suffix(path.suffix + ".metadata.json").write_text(
         json.dumps(metadata, indent=2, allow_nan=True) + "\n"
     )
-
-
-def select_refinement_checkpoint(
-    checkpoint_dir: str | Path,
-    *,
-    require_validated: bool = False,
-) -> Path:
-    """Select a current-run validated checkpoint without accepting stale best.
-
-    New training runs write lightweight metadata sidecars. A ``best.ckpt`` is
-    selected only when its run identifier matches ``last.ckpt`` and its
-    validation loss is finite. This prevents a fresh run that never improves
-    the baseline from silently reusing an older case folder's ``best.ckpt``.
-    """
-    checkpoint_dir = Path(checkpoint_dir)
-    best = checkpoint_dir / "best.ckpt"
-    last = checkpoint_dir / "last.ckpt"
-
-    def metadata(path: Path) -> dict[str, Any] | None:
-        sidecar = path.with_suffix(path.suffix + ".metadata.json")
-        if not sidecar.exists():
-            return None
-        value = json.loads(sidecar.read_text())
-        return value if isinstance(value, dict) else None
-
-    best_meta = metadata(best)
-    last_meta = metadata(last)
-    run_marker_path = checkpoint_dir / "training_run.metadata.json"
-    run_marker = (
-        json.loads(run_marker_path.read_text())
-        if run_marker_path.exists()
-        else None
-    )
-    current_run_id = (
-        run_marker.get("training_run_id")
-        if isinstance(run_marker, dict)
-        else None
-    )
-    if current_run_id:
-        current_best = (
-            best.exists()
-            and best_meta is not None
-            and best_meta.get("training_run_id") == current_run_id
-            and np.isfinite(float(best_meta.get("best_val_loss", math.inf)))
-        )
-        if current_best:
-            return best
-        current_last = (
-            last.exists()
-            and last_meta is not None
-            and last_meta.get("training_run_id") == current_run_id
-        )
-        if require_validated:
-            raise ValueError(
-                "The latest training run has no validated best checkpoint. "
-                "Its refinement did not pass validation. Do not fall back to "
-                "a stale best.ckpt; retrain or inspect validation metrics."
-            )
-        if current_last:
-            return last
-        raise FileNotFoundError(
-            "The current training-run marker has no matching checkpoint."
-        )
-
-    if last.exists() and last_meta is not None:
-        run_id = last_meta.get("training_run_id")
-        same_run_best = (
-            best.exists()
-            and best_meta is not None
-            and run_id
-            and best_meta.get("training_run_id") == run_id
-            and np.isfinite(float(best_meta.get("best_val_loss", math.inf)))
-        )
-        if same_run_best:
-            return best
-        if require_validated:
-            raise ValueError(
-                "The latest training run has no matching validated best "
-                "checkpoint. Its refinement did not pass validation, or its "
-                "checkpoint metadata are incomplete. Do not fall back to a "
-                "stale best.ckpt; retrain or inspect validation metrics."
-            )
-        return last
-
-    if require_validated:
-        raise ValueError(
-            "Checkpoint metadata sidecars are missing. These are legacy "
-            "checkpoints whose run provenance cannot be verified. Retrain with "
-            "the current pipeline before production inference."
-        )
-    if best.exists():
-        return best
-    if last.exists():
-        return last
-    raise FileNotFoundError(f"No best.ckpt or last.ckpt under {checkpoint_dir}.")
 
 
 def validate_checkpoint_longitude(
@@ -3720,6 +4148,7 @@ def validate_checkpoint_refinement_contract(
     resolved_specs: ResolvedVariableSpecs,
     *,
     allow_temporal_migration: bool = False,
+    require_validated: bool | None = None,
 ) -> None:
     """Validate target, architecture, statistics, and validation provenance.
 
@@ -3729,8 +4158,32 @@ def validate_checkpoint_refinement_contract(
     explicit before any refinement weights are used. Training may explicitly
     allow a temporal-only warm-start migration; inference remains strict.
     """
+    if require_validated is None:
+        require_validated = bool(
+            config.get("inference", {}).get(
+                "require_validated_checkpoint", False
+            )
+        )
+    validate_checkpoint_validation_provenance(
+        checkpoint,
+        require_validated=bool(require_validated),
+    )
+
     inner = model.module if hasattr(model, "module") else model
     from finetune.flow_refine import AuroraFlowRefine
+    from finetune.refinement.two_phase import AuroraTwoPhaseRefiner
+
+    if isinstance(inner, AuroraTwoPhaseRefiner):
+        from finetune.model_factory import validate_unified_checkpoint_contract
+
+        validate_unified_checkpoint_contract(
+            inner,
+            checkpoint,
+            config,
+            allow_temporal_migration=allow_temporal_migration,
+        )
+        return
+
     if not isinstance(inner, AuroraFlowRefine):
         return
 
@@ -3970,16 +4423,6 @@ def validate_checkpoint_refinement_contract(
                 "contains a non-positive scale."
             )
 
-    require_validated = bool(
-        config.get("inference", {}).get("require_validated_checkpoint", False)
-    )
-    best_val_loss = float(checkpoint.get("best_val_loss", math.inf))
-    if require_validated and not np.isfinite(best_val_loss):
-        raise ValueError(
-            "Checkpoint has no finite validation score. Enable validation, "
-            "select a non-degrading best checkpoint, and rerun training."
-        )
-
 
 def load_checkpoint_if_available(
     model: torch.nn.Module,
@@ -4055,11 +4498,17 @@ def write_run_manifest(
     manifest = {
         "config": config,
         "extras": extras or {},
-        "created_at_utc": datetime.utcnow().isoformat() + "Z",
+        "created_at_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     }
 
     path = output_dir / "run_manifest.json"
     path.write_text(json.dumps(manifest, indent=2, default=str))
+    resolved_path = output_dir / "resolved_config.yaml"
+    if yaml is None:
+        raise RuntimeError("PyYAML is required to record resolved_config.yaml.")
+    resolved_path.write_text(
+        yaml.safe_dump(config, sort_keys=False, default_flow_style=False)
+    )
     return str(path.resolve())
 
 
@@ -4136,6 +4585,7 @@ def save_predictions(
     smooth_sigma: float = 0.0,
     patch_size: int = 3,
     lon_periodic: bool | None = None,
+    initialization_time: Any | None = None,
 ) -> xr.Dataset:
     """Save rollout predictions to NetCDF using original dataset variable names.
 
@@ -4289,15 +4739,28 @@ def save_predictions(
         out_name = atmos_name_map.get(var_name, var_name)
         data_vars[out_name] = (("time", "level", "latitude", "longitude"), arr)
 
+    coordinates: dict[str, Any] = {
+        "time": times,
+        "latitude": lat,
+        "longitude": lon,
+        "level": levels,
+    }
+    if initialization_time is not None:
+        init_time = np.datetime64(initialization_time, "ns")
+        coordinates["forecast_reference_time"] = init_time
+        coordinates["lead_time"] = (
+            "time", np.asarray((times - init_time) / np.timedelta64(1, "h"), dtype=np.float64)
+        )
     ds_out = xr.Dataset(
         data_vars=data_vars,
-        coords={
-            "time": times,
-            "latitude": lat,
-            "longitude": lon,
-            "level": levels,
-        },
+        coords=coordinates,
     )
+    if resolved_specs is not None:
+        for spec in resolved_specs.targets:
+            if spec.dataset_name in ds_out and spec.units:
+                ds_out[spec.dataset_name].attrs["units"] = spec.units
+                ds_out[spec.dataset_name].attrs["long_name"] = spec.dataset_name
+
 
     # CF-compliant coordinate metadata so downstream tools recognise the axes
     # and (for longitude) the periodic wrap convention.
@@ -4329,6 +4792,14 @@ def save_predictions(
                 "axis": "Z",
                 "positive": "down",
             }
+        )
+    if "forecast_reference_time" in ds_out.coords:
+        ds_out["forecast_reference_time"].attrs.update(
+            {"standard_name": "forecast_reference_time"}
+        )
+    if "lead_time" in ds_out.coords:
+        ds_out["lead_time"].attrs.update(
+            {"standard_name": "forecast_period", "long_name": "forecast lead time", "units": "hours"}
         )
     ds_out["time"].attrs.update({"standard_name": "time", "axis": "T"})
     ds_out.attrs["Conventions"] = "CF-1.10"

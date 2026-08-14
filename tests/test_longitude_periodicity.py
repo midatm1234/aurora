@@ -1,4 +1,6 @@
-"""Regression tests for periodic longitude in the Flow Matching pipeline."""
+"""Copyright (c) Microsoft Corporation. Licensed under the MIT license.
+
+Regression tests for periodic longitude in the Flow Matching pipeline."""
 
 from __future__ import annotations
 

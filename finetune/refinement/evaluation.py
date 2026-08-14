@@ -55,11 +55,51 @@ def _weights(
         )
         if area is not None:
             weight = weight * area
-    return weight
+    return torch.where(
+        torch.isfinite(weight) & (weight > 0), weight, torch.zeros_like(weight)
+    )
 
 
 def _weighted_mean(values: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    return (values * weight).sum(dim=(-2, -1)) / weight.sum(dim=(-2, -1)).clamp(min=_EPS)
+    # IEEE-754 defines NaN * 0 as NaN, so masking only through zero weights is
+    # insufficient. Sanitize excluded cells before multiplication and report
+    # NaN (not a misleading zero) when a slice contains no valid cells.
+    safe_values = torch.where(weight > 0, values, torch.zeros_like(values))
+    denominator = weight.sum(dim=(-2, -1))
+    result = (safe_values * weight).sum(dim=(-2, -1)) / denominator.clamp(min=_EPS)
+    return torch.where(
+        denominator > 0,
+        result,
+        torch.full_like(result, float("nan")),
+    )
+
+
+def _require_packed_shape(name: str, value: torch.Tensor, packing: FieldPacking) -> None:
+    if value.ndim != 4:
+        raise ValueError(f"{name} must be [N, C, H, W], got {tuple(value.shape)}.")
+    if value.shape[1] != packing.num_channels:
+        raise ValueError(
+            f"{name} has {value.shape[1]} channels but packing declares "
+            f"{packing.num_channels}."
+        )
+    if packing.lat and len(packing.lat) != value.shape[-2]:
+        raise ValueError(
+            f"{name} height {value.shape[-2]} does not match the packing latitude "
+            f"coordinate ({len(packing.lat)})."
+        )
+    if packing.lon and len(packing.lon) != value.shape[-1]:
+        raise ValueError(
+            f"{name} width {value.shape[-1]} does not match the packing longitude "
+            f"coordinate ({len(packing.lon)})."
+        )
+
+
+def _require_sample_metadata(name: str, value: torch.Tensor | None, batch: int) -> None:
+    if value is not None and value.numel() != batch:
+        raise ValueError(
+            f"{name} must contain one value per sample ({batch}), got "
+            f"shape {tuple(value.shape)}."
+        )
 
 
 def evaluate_packed(
@@ -97,10 +137,54 @@ def evaluate_packed(
             f"prediction {tuple(prediction.shape)} and truth {tuple(truth.shape)} "
             "must have the same shape."
         )
+    if prediction.device != truth.device:
+        raise ValueError(
+            f"prediction is on {prediction.device} but truth is on {truth.device}."
+        )
+    _require_packed_shape("prediction", prediction, packing)
+    _require_packed_shape("truth", truth, packing)
+    batch = prediction.shape[0]
+    _require_sample_metadata("lead_index", lead_index, batch)
+    _require_sample_metadata("lead_hours", lead_hours, batch)
+    if mask is not None and mask.shape != prediction.shape:
+        raise ValueError(
+            f"mask must exactly match prediction shape {tuple(prediction.shape)}, got "
+            f"{tuple(mask.shape)}."
+        )
+    if members is not None:
+        expected_members = (
+            prediction.shape[0],
+            prediction.shape[1],
+            prediction.shape[2],
+            prediction.shape[3],
+        )
+        if members.ndim != 5:
+            raise ValueError(
+                "members must be [N, M, C, H, W], got "
+                f"{tuple(members.shape)}."
+            )
+        observed_members = (
+            members.shape[0],
+            members.shape[2],
+            members.shape[3],
+            members.shape[4],
+        )
+        if observed_members != expected_members or members.shape[1] < 1:
+            raise ValueError(
+                "members must have non-member shape "
+                f"{expected_members} and at least one member, got {tuple(members.shape)}."
+            )
     prediction = prediction.float()
     truth = truth.float()
     finite = torch.isfinite(prediction) & torch.isfinite(truth)
-    valid = finite if mask is None else (finite & mask.to(torch.bool))
+    valid = (
+        finite
+        if mask is None
+        else (
+            finite
+            & mask.to(device=prediction.device, dtype=torch.bool)
+        )
+    )
     weight = _weights(prediction, packing, valid, area_weighted, region_mask)
 
     error = torch.where(valid, prediction - truth, torch.zeros_like(prediction))
@@ -124,27 +208,43 @@ def evaluate_packed(
 
     spread = crps = None
     if members is not None:
-        member_stack = members.float()
+        member_stack = members.to(device=prediction.device, dtype=torch.float32)
         count = member_stack.shape[1]
-        member_mean = member_stack.mean(dim=1)
+        member_finite = torch.isfinite(member_stack).all(dim=1)
+        ensemble_valid = valid & member_finite
+        ensemble_weight = _weights(
+            prediction, packing, ensemble_valid, area_weighted, region_mask
+        )
+        safe_members = torch.where(
+            torch.isfinite(member_stack), member_stack, torch.zeros_like(member_stack)
+        )
+        member_mean = safe_members.mean(dim=1)
         if count > 1:
-            variance = member_stack.var(dim=1, unbiased=True)
-            spread = _weighted_mean(variance.clamp(min=0.0).sqrt(), weight)
+            variance = safe_members.var(dim=1, unbiased=True)
+            spread = _weighted_mean(
+                variance.clamp(min=0.0).sqrt(), ensemble_weight
+            )
             # Fair (unbiased) ensemble CRPS:
             #   E|X - y| - 1/(2 M (M-1)) * sum_{i,j} |X_i - X_j|
-            absolute = (member_stack - truth.unsqueeze(1)).abs().mean(dim=1)
-            pairwise = (member_stack.unsqueeze(1) - member_stack.unsqueeze(2)).abs().sum(dim=(1, 2))
+            absolute = (safe_members - truth.unsqueeze(1)).abs().mean(dim=1)
+            pairwise = (
+                safe_members.unsqueeze(1) - safe_members.unsqueeze(2)
+            ).abs().sum(dim=(1, 2))
             crps_field = absolute - pairwise / (2.0 * count * (count - 1))
             crps = _weighted_mean(
-                torch.where(valid, crps_field, torch.zeros_like(crps_field)), weight
+                torch.where(
+                    ensemble_valid, crps_field, torch.zeros_like(crps_field)
+                ),
+                ensemble_weight,
             )
-        ensemble_error = torch.where(valid, member_mean - truth, torch.zeros_like(member_mean))
-        ensemble_bias = _weighted_mean(ensemble_error, weight)
-        ensemble_mse = _weighted_mean(ensemble_error.pow(2), weight)
+        ensemble_error = torch.where(
+            ensemble_valid, member_mean - truth, torch.zeros_like(member_mean)
+        )
+        ensemble_bias = _weighted_mean(ensemble_error, ensemble_weight)
+        ensemble_mse = _weighted_mean(ensemble_error.pow(2), ensemble_weight)
     else:
         ensemble_bias = ensemble_mse = None
 
-    batch = prediction.shape[0]
     if lead_index is None:
         groups = torch.zeros(batch, dtype=torch.long)
     else:
@@ -155,7 +255,20 @@ def evaluate_packed(
         selection = (groups == lead).nonzero(as_tuple=True)[0]
         hours = None
         if lead_hours is not None:
-            hours = float(lead_hours.reshape(-1)[selection[0]])
+            selected_hours = lead_hours.reshape(-1)[selection].float()
+            if not torch.isfinite(selected_hours).all():
+                raise ValueError(f"lead_hours contains a non-finite value for lead group {lead}.")
+            if not torch.allclose(
+                selected_hours,
+                selected_hours[:1].expand_as(selected_hours),
+                atol=1.0e-6,
+                rtol=0,
+            ):
+                raise ValueError(
+                    f"lead_index group {lead} mixes physical lead times: "
+                    f"{selected_hours.tolist()}."
+                )
+            hours = float(selected_hours[0])
         for spec in packing.channels:
             column = spec.index
             row: dict[str, Any] = {

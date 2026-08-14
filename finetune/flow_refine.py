@@ -1,4 +1,6 @@
-"""Flow-matching residual decoder for Aurora bias correction.
+"""Copyright (c) Microsoft Corporation. Licensed under the MIT license.
+
+Flow-matching residual decoder for Aurora bias correction.
 
 This module adds a small **conditional residual regressor** on top of a
 frozen Aurora backbone.  The decoder learns

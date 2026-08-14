@@ -13,6 +13,7 @@ xr = pytest.importorskip("xarray")
 
 from finetune.refinement.io import (  # noqa: E402
     build_refined_dataset,
+    resolve_forecast_variable,
     write_refined_netcdf,
 )
 
@@ -67,6 +68,16 @@ def test_dataset_preserves_variables_levels_and_coordinates() -> None:
     assert dataset["gtco3"].attrs["units"] == "kg m-2"
     assert dataset["go3"].attrs["units"] == "kg kg-1"
     assert dataset["gtco3_residual"].attrs["units"].startswith("1 (normalized")
+    assert (
+        dataset["gtco3_residual"].attrs["aurora_refinement_role"]
+        == "predicted_correction_normalized"
+    )
+    assert dataset["gtco3_refined"].attrs["aurora_refinement_role"] == "refined_forecast"
+    assert dataset.attrs["correction_target_convention"] == "CAMS - Aurora"
+    assert (
+        dataset.attrs["refined_forecast_convention"]
+        == "Aurora + predicted_correction_physical"
+    )
     assert dataset.attrs["experiment"] == "unit-test"
     assert "refinement_note" in dataset.attrs
 
@@ -90,6 +101,60 @@ def test_values_and_member_order_survive_the_round_trip() -> None:
     assert list(dataset["member"].values) == [0, 1, 2]
 
 
+def test_default_forecast_resolves_refined_physical_field_not_plain_aurora() -> None:
+    packing, dataset, deterministic, members, _, _ = make_dataset()
+    surface_index = packing.index_of("gtco3", None)
+    expected_refined = members.mean(dim=1)[:, surface_index].numpy()
+
+    selected = resolve_forecast_variable(dataset, "gtco3")
+
+    assert selected.name == "gtco3_refined"
+    np.testing.assert_allclose(selected.values, expected_refined)
+    assert not np.allclose(selected.values, deterministic[:, surface_index].numpy())
+    np.testing.assert_allclose(
+        dataset["gtco3_predicted_correction_physical"].values,
+        expected_refined - deterministic[:, surface_index].numpy(),
+    )
+
+
+def test_legacy_plain_forecast_remains_supported() -> None:
+    dataset = xr.Dataset({"tcno2": (("time", "latitude", "longitude"), np.ones((1, 2, 3)))})
+
+    selected = resolve_forecast_variable(dataset, "tcno2")
+
+    assert selected.name == "tcno2"
+
+
+def test_two_phase_dataset_without_refinement_resolves_plain_aurora() -> None:
+    packing = build_packing(4, 4)
+    deterministic = torch.zeros(1, packing.num_channels, 4, 4)
+    dataset = build_refined_dataset(
+        packing=packing,
+        deterministic=deterministic,
+        init_time=np.array(["2024-01-01T00"], dtype="datetime64[h]"),
+        valid_time=np.array(["2024-01-01T06"], dtype="datetime64[h]"),
+        lead_time_hours=[6.0],
+    )
+
+    selected = resolve_forecast_variable(dataset, "gtco3")
+
+    assert selected.name == "gtco3"
+    assert selected.attrs["aurora_refinement_role"] == "aurora_forecast"
+
+
+def test_conventional_refined_suffix_wins_for_legacy_two_phase_file() -> None:
+    dataset = xr.Dataset(
+        {
+            "tcno2": (("time", "latitude", "longitude"), np.zeros((1, 2, 3))),
+            "tcno2_refined": (("time", "latitude", "longitude"), np.ones((1, 2, 3))),
+        }
+    )
+
+    selected = resolve_forecast_variable(dataset, "tcno2")
+
+    assert selected.name == "tcno2_refined"
+
+
 def test_no_unexpected_nan_or_infinite_values() -> None:
     _, dataset, _, _, _, _ = make_dataset()
     for name, variable in dataset.data_vars.items():
@@ -108,6 +173,7 @@ def test_write_and_reread(tmp_path) -> None:
         assert set(reopened.data_vars) == set(dataset.data_vars)
         assert np.allclose(reopened["gtco3"].values, dataset["gtco3"].values)
         assert np.allclose(reopened["go3_members"].values, dataset["go3_members"].values)
+        assert resolve_forecast_variable(reopened, "gtco3").name == "gtco3_refined"
         assert list(reopened["level"].values) == [500.0, 850.0]
         assert list(reopened["rollout_step"].values) == [1, 2, 3]
     finally:
@@ -134,5 +200,30 @@ def test_time_length_mismatch_is_rejected() -> None:
             deterministic=torch.zeros(2, packing.num_channels, 4, 4),
             init_time=["a"],
             valid_time=["c", "d"],
+            lead_time_hours=[6.0, 12.0],
+        )
+
+
+def test_valid_time_must_equal_initialization_plus_lead() -> None:
+    packing = build_packing(4, 4)
+    with pytest.raises(ValueError, match="Forecast-time mismatch"):
+        build_refined_dataset(
+            packing=packing,
+            deterministic=torch.zeros(2, packing.num_channels, 4, 4),
+            init_time=np.array(["2024-01-01T00", "2024-01-01T00"], dtype="datetime64[h]"),
+            valid_time=np.array(["2024-01-01T06", "2024-01-01T13"], dtype="datetime64[h]"),
+            lead_time_hours=[6.0, 12.0],
+        )
+
+
+def test_optional_field_shape_mismatch_is_rejected() -> None:
+    packing = build_packing(4, 4)
+    with pytest.raises(ValueError, match="refined has non-member shape"):
+        build_refined_dataset(
+            packing=packing,
+            deterministic=torch.zeros(2, packing.num_channels, 4, 4),
+            refined=torch.zeros(1, packing.num_channels, 4, 4),
+            init_time=np.array(["2024-01-01T00", "2024-01-01T00"], dtype="datetime64[h]"),
+            valid_time=np.array(["2024-01-01T06", "2024-01-01T12"], dtype="datetime64[h]"),
             lead_time_hours=[6.0, 12.0],
         )

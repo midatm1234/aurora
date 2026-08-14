@@ -1,5 +1,6 @@
-#!/usr/bin/env python3
-"""Prepare Aurora fine-tuning train/validation/test NetCDF files from CAMS-style inputs.
+"""Copyright (c) Microsoft Corporation. Licensed under the MIT license.
+
+Prepare Aurora fine-tuning train/validation/test NetCDF files from CAMS-style inputs.
 
 This script:
 1. Reads `predictor_variables` and `target_variables` from a rollout config YAML.
@@ -278,7 +279,14 @@ def _resolve_case_data_paths(
         project_root = (config_path.parent / project_root).resolve()
 
     data_root = _resolve_path(paths_cfg.get("data_dir", project_root / "data"), project_root)
-    case_data_dir = data_root if data_root.name == case_name else data_root / case_name
+    data_case_name = str(paths_cfg.get("data_case_name", case_name)).strip()
+    if not data_case_name:
+        raise ValueError(
+            "paths.data_case_name must be a non-empty prepared-data folder name when set."
+        )
+    case_data_dir = (
+        data_root if data_root.name == data_case_name else data_root / data_case_name
+    )
     case_data_dir = case_data_dir.resolve()
 
     resolved_train = (case_data_dir / "train.nc").resolve()
@@ -636,6 +644,58 @@ def _snap_spatial_grids(
     return snapped
 
 
+def _align_surface_and_atmospheric_parts(
+    datasets: list[xr.Dataset],
+    cfg: dict[str, Any],
+) -> list[xr.Dataset]:
+    """Require identical valid-time and spatial coordinates before merging.
+
+    Surface and pressure-level CAMS inputs describe the same analysis times.
+    An inner join can turn a missing/shifted timestamp into a plausible but
+    incomplete training set, so timestamp disagreement is a hard error.
+    """
+    if len(datasets) < 2:
+        return datasets
+    data_cfg = cfg.get("data", {})
+    time_dim = str(data_cfg.get("time_dim", "time"))
+    snapped = _snap_spatial_grids(
+        datasets, cfg, label="Surface/atmospheric"
+    )
+    reference_times = np.asarray(snapped[0][time_dim].values)
+    for dataset_index, dataset in enumerate(snapped[1:], start=1):
+        if time_dim not in dataset.coords:
+            raise ValueError(
+                f"Surface/atmospheric dataset {dataset_index} has no {time_dim!r} "
+                "coordinate."
+            )
+        values = np.asarray(dataset[time_dim].values)
+        if values.shape != reference_times.shape or not np.array_equal(
+            values, reference_times
+        ):
+            first_difference = None
+            if values.shape == reference_times.shape:
+                unequal = np.flatnonzero(values != reference_times)
+                if unequal.size:
+                    index = int(unequal[0])
+                    first_difference = (
+                        f"; first difference at index {index}: "
+                        f"{reference_times[index]!r} != {values[index]!r}"
+                    )
+            raise ValueError(
+                "Surface and atmospheric datasets must have exactly matching "
+                f"{time_dim!r} coordinates before target construction; got "
+                f"shapes {reference_times.shape} and {values.shape}"
+                f"{first_difference or ''}."
+            )
+    try:
+        return list(xr.align(*snapped, join="exact", copy=False))
+    except ValueError as exc:
+        raise ValueError(
+            "Surface and atmospheric datasets have mismatched named coordinates; "
+            "refusing to drop or reorder training cells."
+        ) from exc
+
+
 def _load_and_merge_files(
     file_paths: list[Path | str],
     cfg: dict[str, Any],
@@ -760,14 +820,8 @@ def _build_merged_dataset(
         raise ValueError("No variables selected from input datasets.")
 
     if len(parts) > 1:
-        # Equivalent grids can differ by float32 round-off after arriving from
-        # separate surface/atmos files. Snap them to one checked reference
-        # before xarray's exact-label alignment; otherwise `join="inner"` can
-        # silently discard longitude columns.
-        parts = _snap_spatial_grids(parts, cfg, label="Surface/atmospheric")
         with _elapsed_status("Aligning surface and atmospheric datasets"):
-            aligned = xr.align(*parts, join="inner", copy=False)
-            parts = list(aligned)
+            parts = _align_surface_and_atmospheric_parts(parts, cfg)
 
     with _elapsed_status("Merging selected variables"):
         merged = xr.merge(parts, compat="override", combine_attrs="drop_conflicts")

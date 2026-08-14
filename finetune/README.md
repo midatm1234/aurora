@@ -106,12 +106,13 @@ The notebook prints total/trainable/frozen parameter counts before training.
 
 Pretrained Aurora is already near-optimal on dates seen during pretraining; nudging its tiny per-level weights with AdamW is a fast way to *destroy* the model. The recommended path is to **freeze the backbone fully** (`training.scale_aware_lr.pretrained_lr_scale: 0.0`) and attach a small refinement head whose only job is to learn the residual `r = y_true − ŷ`.
 
-Two heads are available, mutually exclusive:
+Two historical convenience heads are available through the top-level
+`model.*_refine_enabled` keys, mutually exclusive:
 
 | Head | File | Behaviour | Best for |
 |------|------|-----------|----------|
 | `AuroraConvRefine` | `conv_refine.py` | Deterministic per-variable 3-conv stack. ~few-hundred-K params. | Cheapest baseline, single forward pass. |
-| `AuroraFlowRefine` | `flow_refine.py` | Rectified-flow / x₁-prediction UNet (separate FiLM flow-time and forecast-lead conditioning), zero-init output layer. ~4 M params. | Deterministic lead-aware residual correction; optional stochastic sampling when it is explicitly validated as an ensemble product. |
+| `AuroraFlowRefine` | `flow_refine.py` | Existing x₁/data-prediction flow UNet (separate FiLM flow-time and forecast-lead conditioning), zero-init output layer. ~4 M params. | Deterministic lead-aware residual correction; optional stochastic sampling when it is explicitly validated as an ensemble product. |
 
 Enable in YAML:
 
@@ -153,20 +154,23 @@ python finetune/diagnose_refinement.py \
 
 ## Mamba Temporal Module (optional, for long-lead rollouts)
 
-The flow-matching head is explicitly aware of cumulative forecast lead but
-still corrects each rollout step *independently* — it has no
+The spatial refinement heads can be explicitly aware of cumulative forecast
+lead but still correct each rollout step *independently* — they have no
 memory of how the field (or Aurora's error in it) evolves through time, which is
 exactly where 2–3 day rollouts drift relative to a 6 h forecast. The optional
 **Mamba temporal module** (`mamba_temporal.py`) adds a selective state-space
-(S6) corrector *on top of* the flow-matching output. For each refined variable
+(S6) corrector *on top of legacy flow matching or any unified diffusion/flow
+output, including `diffusion_transformer`. For each refined variable
 it runs a causal Mamba over the **time / rollout-step axis** at every pixel
 (parameters shared across space and pressure levels) and predicts a temporal
-correction added to the flow-corrected field.
+correction added to the spatially refined field.
 
 ```yaml
 model:
-  flow_refine_enabled: true            # temporal module rides on the flow head
-  mamba_temporal_enabled: true         # default false → flow-matching-only
+  refinement:
+    enabled: true
+    type: diffusion_transformer        # legacy flow matching also remains supported
+  mamba_temporal_enabled: true         # optional; default false
   mamba_temporal_channels: 16          # encoder / SSM feature width
   mamba_temporal_state: 8              # SSM hidden-state dim (N)
   mamba_temporal_layers: 2             # stacked Mamba blocks
@@ -181,19 +185,23 @@ rollout:
 Key properties:
 
 - **Identity-at-init** (zero-init decoder): enabling the module changes nothing
-  until trained, so existing flow-matching-only checkpoints are numerically
-  unchanged and resume cleanly (checkpoint load is tolerant of the added/removed
-  temporal keys).
+  until trained. Training may explicitly warm-start while adding/removing the
+  temporal module; inference requires an exact temporal architecture match.
 - **Trained on sequential samples**: the temporal loss is computed over the
-  *ordered* multi-lead rollout sequence (needs ≥ 2 `target_lead_times`), so the
+  *ordered* multi-lead rollout sequence. This requires at least two consecutive
+  `target_lead_times` starting at 1, a positive rollout interval, and a rollout
+  horizon no longer than the trained temporal sequence, so the
   module learns temporal dependencies and variability rather than per-step
-  behaviour. The flow-corrected frames are detached, so it trains only the Mamba
-  parameters and leaves the flow head/backbone untouched.
+  behaviour. The spatially refined frames are target-independent and detached,
+  so this term trains only Mamba and leaves the spatial head/backbone untouched.
 - **Causal multi-step rollout**: applied step-by-step over the growing history;
   step *s* depends only on steps ≤ *s*. Works for configured leads within
   the support used to train the checkpoint.
 - **Portable**: a pure-PyTorch selective scan runs on CPU/GPU with no extra
-  deps; the `mamba_ssm` CUDA kernel is used automatically when available.
+  dependencies and uses the same eagerly registered parameters on both.
+- **Transformer boundary**: the Transformer itself remains spatial and
+  processes each lead independently. Mamba is the separate sequence wrapper,
+  and inference keeps an independent causal history for each ensemble member.
 
 ### Rollout CAMS-vs-prediction safeguards
 
@@ -210,6 +218,15 @@ Key properties:
 ## Case Folders
 
 Set `case_name: <experiment>` at the top of the YAML and all training artifacts land under `outputs/<experiment>/` and `outputs/checkpoints/<experiment>/`. The inference notebook auto-derives `CHECKPOINT_PATH` and `OUTPUT_DIR` from the same `case_name`, so a single config drives both ends. `resume_from: "best"` resolves relative to the case folder, so chained-stage finetunes don't trample each other.
+
+Production inference accepts only a current-run `best.ckpt` explicitly marked
+`validated_for_inference`; `last.ckpt` remains available for training resume and
+explicit diagnostics, but is not a silent production fallback. Unified
+stochastic validation uses
+`training.validation_refinement_ensemble_size` members and scores their ensemble
+mean against the deterministic baseline. The default is `1` for backward-compatible
+runtime; larger values better match an ensemble inference product but multiply
+refinement validation cost approximately in proportion to the member count.
 
 ## Regional Domains
 
@@ -253,13 +270,49 @@ stochastic **residual** refiner selected with `model.refinement.type`:
 | value | model |
 | --- | --- |
 | `none` | disabled (deterministic Aurora only) |
-| `flow_matching_unet` (alias `flow_matching`) | the existing Aurora rectified-flow UNet heads |
+| `flow_matching_unet` (alias `flow_matching`) | the existing Aurora x₁/data-prediction flow UNet heads |
 | `flow_matching_transformer` | spatial-token Transformer velocity network |
+| `flow_matching_conv_unet` (alias `flow_matching_conv`) | unified packed-field flow objective with a convolutional UNet backbone |
 | `diffusion_unet` | conditional convolutional UNet, DDPM training / DDIM sampling |
 | `diffusion_transformer` | spatial-token Transformer denoiser, DDPM / DDIM |
 
 Configurations that only set the historical `model.flow_refine_*` keys keep
 working unchanged and resolve to `flow_matching_unet`.
+
+`flow_matching_conv_unet` is distinct from the legacy
+`flow_matching_unet`/`AuroraFlowRefine` wrapper. It shares the unified target
+space, losses, residual scaling and checkpoint contract used by the diffusion
+and Transformer refiners; the two flow UNet types are not checkpoint aliases.
+For new NO2 flow-matching U-Net runs, select `flow_matching_conv_unet` in the
+consolidated corrected recipe. Reserve `flow_matching_unet` and the historical
+NO2 YAML for explicit legacy reproduction/checkpoint compatibility.
+
+New options retain legacy-safe omitted-key defaults: residual scaling is
+`none`, diffusion uses `prediction_type: epsilon`, `snr_weighting: none` and
+uniform timestep sampling, Transformer `local_refinement` is `false`, and
+temporal Mamba is disabled. Improved example YAMLs opt in explicitly to choices
+such as per-channel scaling, sample prediction, automatic SNR/timestep policy,
+and the local convolutional Transformer stem/head. Active residual scaling is
+fit only on masked training residuals, inverted before reconstruction, stored
+in checkpoints, and synchronized from globally reduced sufficient statistics
+by the manual distributed trainer.
+
+Unified loss controls include deterministic-endpoint, MAE, extreme/peak,
+quantile, variance, spectral, degradation-hinge and magnitude terms in addition
+to reconstruction, bias, gradient and pattern-correlation losses. All auxiliary
+weights default to zero. See the full schema for the corresponding
+`model.refinement.loss`, `diffusion`, `target_space` and `transformer` keys.
+
+A short real-data execution check can be run from the repository root with:
+
+```bash
+python -m finetune.refinement.benchmark --case no2_uswest --compare \
+  --epochs 8 --max-initializations 24 --output /tmp/no2_refinement_benchmark.json
+```
+
+The built-in cases use raw pretrained Aurora rollouts, not a Stage-1 fine-tuned
+no-refinement baseline. Short runs are smoke checks only; scientific bias claims
+require full-duration case tuning and independent held-out evaluation.
 
 Refinement is postprocessing of each rollout step: the deterministic state that
 produces later rollout steps is not replaced. See

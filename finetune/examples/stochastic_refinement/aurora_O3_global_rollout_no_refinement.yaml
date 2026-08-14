@@ -9,8 +9,10 @@
 #
 # See docs/STOCHASTIC_REFINEMENT.md for the full schema.
 paths:
-  project_root: .
+  # Preserve the finetune-directory project root used by the source config.
+  project_root: ../..
   data_dir: ../data
+  data_case_name: O3_global_3day_lead
   train_data_path: ../data/train.nc
   val_data_path: ../data/test.nc
   test_data_path: ../data/test.nc
@@ -26,7 +28,7 @@ paths:
 #   <output_dir>/<case_name>/  and  <checkpoint_dir>/<case_name>/
 # resume_from="best"/"last" resolves relative to the case folder, so
 # stages chain naturally when you keep case_name fixed across runs.
-case_name: O3_global_3day_lead
+case_name: O3_global_3day_lead_no_refinement
 
 # Evaluation settings consumed by evaluate_finetuned_cams_rollouts.ipynb.
 # Ground truth, fine-tuned output, result paths, targets, levels, and lead

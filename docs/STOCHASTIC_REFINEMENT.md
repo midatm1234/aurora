@@ -47,8 +47,8 @@ configuration field:
                                      |  encode()  (Aurora normalized space)
                                      v
               +----------------- Phase 2 (optional) -----------------------+
- conditioning | flow_matching_unet | flow_matching_transformer              | ---> r_hat
- (section 5)  | diffusion_unet     | diffusion_transformer                  |
+ conditioning | flow_matching_unet | flow_matching_conv_unet                | ---> r_hat
+ (section 5)  | flow_matching_transformer | diffusion_unet / _transformer   |
               +------------------------------------------------------------+
                                      |
        refined_norm = rollout_norm + r_hat  ->  decode once  ->  constraints once
@@ -69,10 +69,11 @@ Selected with `model.refinement.type`:
 | `none` | *(disabled)* | – | – |
 | `flow_matching_unet` (alias `flow_matching`) | the **existing** Aurora `ResidualFlowUNet` per-variable heads | flow time | legacy |
 | `flow_matching_transformer` | spatial-token Transformer velocity network | flow time | unified |
+| `flow_matching_conv_unet` (alias `flow_matching_conv`) | unified packed-field conditional UNet | flow time | unified |
 | `diffusion_unet` | conditional convolutional UNet, DDPM training / DDIM sampling | diffusion timestep | unified |
 | `diffusion_transformer` | spatial-token Transformer denoiser, DDPM/DDIM | diffusion timestep | unified |
 
-The four options are **alternatives**. Diffusion and flow matching are never
+The five options are **alternatives**. Diffusion and flow matching are never
 stacked, and flow matching does not require diffusion to run first.
 Construction goes through a registry
 (`finetune.refinement.base.build_refiner`), so training, validation, inference,
@@ -86,6 +87,12 @@ checkpoints are preserved exactly. It is also exposed through the common
 interface by `finetune.refinement.legacy_flow.LegacyFlowMatchingUNetRefiner`,
 which *delegates* to the same `AuroraFlowRefine` module rather than
 reimplementing it.
+
+`flow_matching_conv_unet` is deliberately a different type. It uses the same
+packed target space, conditioning, residual scaler, unified losses and
+checkpoint contract as the other unified refiners, with a convolutional UNet
+backbone. It is not an alias for, nor checkpoint-compatible with, the legacy
+per-variable `AuroraFlowRefine` wrapper.
 
 ---
 
@@ -142,7 +149,18 @@ predictor assumptions and checkpoint names were **not** copied.
 
 ## 4. Residual target and reconstruction
 
-Refinement happens entirely in **Aurora's normalized target space**
+The repository uses one correction sign and one output meaning everywhere:
+
+```python
+correction_target_physical = cams_target - aurora_forecast
+predicted_correction_physical = refinement.predict_correction(...)
+refined_forecast = aurora_forecast + predicted_correction_physical
+```
+
+A refiner never returns a complete atmospheric field, diffusion epsilon, flow
+velocity, normalized tensor, or latent state through the forecast interface. It
+returns the explicitly denormalized physical correction shown above. Internally,
+training and sampling happen in **Aurora's normalized target space**
 (`finetune.refinement.target_space.NormalizedTargetSpace`), which is derived
 from the same statistics the supervised loss already uses
 (`compute_target_normalization_stats`, i.e. `aurora.normalisation` locations and
@@ -174,6 +192,103 @@ Because the Aurora supervised loss already normalizes the prediction and the
 target with the same statistics, the training path uses
 `residual_target_from_normalized`, which avoids a redundant decode/encode round
 trip and therefore any risk of double normalization.
+
+### Optional residual scaling
+
+Unified refiners can map that normalized residual into a better-conditioned
+generative space with `target_space.residual_scaling`: `none` is an exact
+identity, `global` uses one scale, and `per_channel` uses one scale for each
+packed variable/pressure-level channel. `auto` currently resolves to
+`per_channel`. The transform is inverted before reconstruction, so the refiner
+still returns an Aurora-normalized residual.
+
+The legacy-safe default is `none`; existing YAMLs and checkpoints therefore do
+not silently gain scaler state. New experiments must opt in explicitly. Active
+scalers estimate masked, finite training-only statistics, preserve channels
+with no observations, and store their calibration state in checkpoints.
+Validation and inference never update it.
+
+The production distributed trainer calibrates before optimizer step 1 with a
+deterministic pass over the complete training split. Ranks consume disjoint,
+unpadded sample shards, accumulate finite/masked per-channel count, sum and
+sum-of-squares locally, and perform one final sufficient-statistic all-reduce.
+The resulting transform is frozen and checkpointed together with the logical
+sample count and a SHA-256 split/coordinate/channel fingerprint. Resume and
+inference reject missing, partial or mismatched calibration. The
+`residual_scaling_warmup_batches` and momentum keys remain only for standalone
+legacy compatibility; production calibration does not select the first N
+shuffled optimization batches and never trains under a moving transform.
+
+### NO2 Diffusion Transformer failure: root cause and migration
+
+The pre-audit US-WEST NO2 Diffusion Transformer run is not a scientifically
+valid checkpoint. Its repeated speckle and horizontal bands were systematic,
+not plausible stochastic uncertainty. The same configured seed replayed the
+same initial diffusion latent for every forecast initialization, so fixed-grid
+noise survived the mean over 1,083 cases. Four additional configuration and
+selection problems amplified that failure:
+
+* it combined an epsilon-prediction objective with a zero-initialized output
+  projection. A zero epsilon estimate is not a zero correction: converting it
+  to x0 divides the retained Gaussian latent by `sqrt(alpha_bar)`, creating a
+  large random correction before the head has learned anything;
+* it mixed a small CAMS-minus-Aurora correction with unit-variance diffusion
+  noise without centered per-channel correction scaling, strongly imbalancing
+  `tcno2` and the pressure-level `no2` channels;
+* all direct deterministic, bias, structure, tail, and degradation loss weights
+  were zero, while temporal Mamba was enabled at full weight, so the deployed
+  forecast field was not the quantity principally supervised;
+* checkpoint acceptance used an aggregate validation loss that could hide
+  physical-space degradation in individual variable/level/lead channels.
+
+That diagnosis is consistent with the saved pre-audit held-out artifacts: the
+reported RMSE improvement relative to Aurora was -42.451% for `tcno2`, -83.769%
+for `no2` at 1000 hPa, -52.376% for `no2` at 925 hPa, and -61.229%
+for `no2` at 850 hPa (negative means worse), despite checkpoint metadata reporting a
+positive aggregate validation improvement. Those numbers are a failure
+baseline, not post-fix results.
+
+For a new unified refinement run, the shipped YAMLs now require the following
+migration profile:
+
+1. keep `train_on_residual: true` under the explicit
+   `correction_target = CAMS - Aurora` contract and form the refined forecast
+   by addition;
+2. fit centered `per_channel` correction scaling on masked finite training data
+   and restore its checkpointed mean and scale exactly once;
+3. use clean-sample/x0 prediction for diffusion with zero-initialized heads;
+4. deploy the deterministic conditional mean by default (`ensemble_size: 1`),
+   and use initialization- and member-specific seeds with at least two members
+   only for an explicitly stochastic uncertainty product;
+5. keep temporal Mamba disabled unless its separate causal objective is
+   explicitly trained and validated;
+6. select checkpoints by `mean_physical_rmse_ratio`, require improvement over
+   matched Aurora, and require every physical variable/level/lead channel to
+   improve on the purged training-tail validation split.
+
+Do not resume the former NO2 epsilon checkpoint: prediction type, residual
+scaler state, deployed estimator, temporal architecture, and checkpoint metric
+are part of the scientific contract. Start a clean run. The known-good legacy
+flow-matching YAMLs and checkpoints retain their old defaults and are not
+silently migrated.
+
+For US-WEST NO2, use one consolidated unified file for new runs. Keep the
+known-good old flow file only when reproducing its legacy checkpoint contract:
+
+| requested head | safe NO2 recipe |
+| --- | --- |
+| flow-matching convolutional U-Net (new unified default) | consolidated file below with `model.refinement.type: flow_matching_conv_unet` |
+| flow-matching Transformer | consolidated file below with `model.refinement.type: flow_matching_transformer` |
+| diffusion U-Net | consolidated file below with `model.refinement.type: diffusion_unet` |
+| Diffusion Transformer | `finetune/aurora_NO2_finetune_US-WEST_3day_lead_diffusion_transformer_config.yaml` with its fresh `_corrected` case name |
+| legacy flow-matching U-Net (compatibility only) | `finetune/aurora_NO2_finetune_US-WEST_3day_lead_config.yaml`; do not treat this as the unified safe default |
+
+The consolidated file contains explicit `flow_matching`, `diffusion`, `unet`,
+and `transformer` blocks; its correction convention, scaler, deterministic
+mean, losses, conditioning, physical constraints, seeding, and checkpoint gate
+are shared by the four unified heads. Each head is a distinct checkpoint
+contract: give switched runs a fresh `case_name`, keep `resume_training: false`,
+and never load weights produced by another type.
 
 ---
 
@@ -220,7 +335,7 @@ target.
 `flow_matching_unet` type accepts *only* `existing_aurora` (any other value is a
 configuration error), so a legacy configuration or checkpoint can never be
 silently switched to the Prithvi formulation. `rectified_flow` is available on
-`flow_matching_transformer` as an explicit, documented choice.
+the unified flow refiners as an explicit, documented choice.
 
 ---
 
@@ -242,7 +357,19 @@ noisy_residual = sqrt(alpha_bar_k) * residual_target
   update;
 * schedule coefficients are non-persistent buffers built once per configuration
   and kept on the target device, so nothing is rebuilt inside a sampling loop
-  and nothing stale can be restored from a checkpoint.
+  and nothing stale can be restored from a checkpoint;
+* `snr_weighting` supports `none`, `min_snr`, `snr`, `truncated_snr` and
+  `auto`; `timestep_distribution` supports `uniform`, `low_noise`,
+  `high_noise` and `auto`, with `timestep_bias` controlling the bias strength;
+* `deterministic_estimator` selects `ode`, `posterior_mean` or `auto`, and
+  `deterministic_training_steps` bounds the differentiable trajectory used by
+  `loss.deterministic_weight`; epsilon prediction with `posterior_mean` is
+  rejected because the clean-sample conversion is ill-conditioned there;
+* backward-compatible omitted-key defaults are `prediction_type: epsilon`,
+  `snr_weighting: none`, and `timestep_distribution: uniform`. The example
+  configurations opt in explicitly to improved settings such as sample
+  prediction and automatic weighting/sampling; these are scientific choices,
+  not migrations applied to old checkpoints.
 
 Nothing is silently reduced: the configured step count, schedule, prediction
 type, `eta` and stochastic initialization are used verbatim
@@ -272,6 +399,11 @@ type, `eta` and stochastic initialization are used verbatim
 12. unpatchify;
 13. crop exactly to the original `(H, W)`.
 
+`transformer.local_refinement: true` adds an overlapping 3-by-3 convolutional
+stem before patchification and a zero-initialized local residual head after
+unpatchification. It defaults to `false` so older Transformer checkpoints keep
+their original architecture.
+
 ### Attention modes
 
 | mode | behaviour |
@@ -299,6 +431,54 @@ processed completely independently.
 `scaled_dot_product_attention` (`sdpa`) and an explicit reference implementation
 (`math`). Both compute the *same* operation; no sparse, local or linearised
 approximation is ever substituted for a requested exact mode.
+
+### Optional temporal Mamba wrapper
+
+The spatial Transformer itself remains per-lead. Setting the existing top-level
+`model.mamba_temporal_enabled: true` adds `PackedMambaTemporalAdapter` around an
+active refiner, including `diffusion_transformer`. The same wrapper also works
+with the unified diffusion/flow UNets, `flow_matching_transformer`, and the
+legacy `flow_matching_unet` path. It does not turn the Transformer tokens into a
+temporal attention sequence: it applies a separate causal selective state-space
+model over the ordered rollout-lead axis at every pixel after spatial
+refinement.
+
+```yaml
+model:
+  refinement:
+    enabled: true
+    type: diffusion_transformer
+  mamba_temporal_enabled: true         # optional; default false
+  mamba_temporal_channels: 16
+  mamba_temporal_state: 8
+  mamba_temporal_layers: 2
+  mamba_temporal_conv: 3
+  mamba_temporal_expand: 2
+
+training:
+  mamba_temporal_weight: 1.0
+```
+
+Temporal training consumes target-independent spatial-refiner outputs in
+lead-major order. Those frames are evaluated with the same deterministic or
+stochastic inference mode configured for rollout and detached, so the temporal
+loss updates Mamba without back-propagating into the spatial refiner. Inference
+maintains a growing causal history separately for every ensemble member before
+forming ensemble statistics.
+
+Enabling Mamba requires at least two consecutive `data.target_lead_times`
+starting at 1, a positive `rollout.rollout_step_hours`, a rollout horizon no
+longer than the trained temporal horizon, and
+`training.mamba_temporal_weight > 0`. Its decoder is zero-initialized, so a new
+module starts as an identity correction. The enabled flag and all architecture
+values are part of the checkpoint contract; inference must reconstruct the
+same temporal architecture. With `mamba_temporal_enabled: false` (the default),
+the spatial head retains its existing per-lead behavior and checkpoint state.
+
+Forecast-lead-time conditioning and temporal Mamba solve different problems:
+the former tells one spatial pass which physical lead it represents, whereas
+the latter explicitly models dependencies among the sequence of predicted
+leads.
 
 ---
 
@@ -329,6 +509,10 @@ total_loss = generative_loss
            + bias_weight                  * bias_loss
            + gradient_weight              * gradient_loss
            + pattern_correlation_weight   * pattern_correlation_loss
+           + deterministic_weight     * deterministic_endpoint_loss
+           + mae/extreme/peak/quantile/variance/spectral terms
+           + degradation_weight       * over-correction_hinge
+           + magnitude_weight         * residual_magnitude
 ```
 
 * all weights default to `0.0`, so an existing configuration keeps its exact
@@ -343,7 +527,15 @@ total_loss = generative_loss
   pressure level, forecast lead time) and only then aggregated, so unrelated
   errors cannot cancel;
 * cosine-latitude area weighting is applied when a latitude vector is available;
-* every component is returned and logged separately.
+* every component is returned and logged separately;
+* `mae_weight` targets absolute error; `extreme_weight`/`extreme_quantile`/
+  `extreme_intensity`, `peak_weight`, `quantile_weight`, `variance_weight` and
+  `spectral_weight` expose complementary tail, distribution and structure
+  objectives;
+* `degradation_weight` penalizes corrections that make a valid cell worse than
+  the unchanged rollout, while `magnitude_weight` regularizes correction size;
+  `aux_on_deterministic` applies structural terms to the deterministic endpoint
+  that inference emits.
 
 ---
 
@@ -391,24 +583,37 @@ per-variable losses slightly differently.
 
 ## 12. Configuration schema
 
+The block below is the recommended safe profile for a **new unified run**, not
+a statement of omitted-key defaults. Backward-compatible defaults are listed
+after the block and remain unchanged for legacy configurations/checkpoints.
+
 ```yaml
 model:
   refinement:
     enabled: true
-    type: flow_matching_transformer   # none | flow_matching_unet | flow_matching |
+    type: diffusion_transformer       # none | flow_matching_unet | flow_matching_conv_unet |
                                       # flow_matching_transformer | diffusion_unet |
-                                      # diffusion_transformer
+                                      # diffusion_transformer (aliases also accepted)
+    correction_convention: cams_minus_aurora_add
     checkpoint: null
     freeze_aurora: true
     joint_finetuning: false
+    # correction_target = CAMS - Aurora
+    # refined_forecast = Aurora + predicted_correction
     train_on_residual: true
     feedback_to_rollout: false        # EXPERIMENTAL when true
     seed: 1234
-    ensemble_size: 10
+    ensemble_size: 1                  # deterministic default product
+    deterministic_inference: true
 
     target_space:
       use_existing_normalization: true
       residual_space: normalized
+      residual_scaling: per_channel   # none | global | per_channel | auto
+      residual_scaling_center: true
+      residual_scaling_momentum: 0.05
+      residual_scaling_warmup_batches: 32
+      residual_scaling_target_std: 1.0
 
     conditioning:
       aurora_rollout: true
@@ -421,10 +626,22 @@ model:
     loss:
       generative: mse                 # mse | l1 | huber
       reconstruction_weight: 0.0
-      bias_weight: 0.0
-      gradient_weight: 0.0
-      pattern_correlation_weight: 0.0
+      bias_weight: 1.0
+      gradient_weight: 0.25
+      pattern_correlation_weight: 0.5
       area_weighted: true
+      deterministic_weight: 1.0      # directly supervise deployed mean correction
+      mae_weight: 0.0
+      extreme_weight: 1.0
+      extreme_quantile: 0.95
+      extreme_intensity: 4.0
+      peak_weight: 0.0
+      quantile_weight: 1.0
+      variance_weight: 2.0
+      spectral_weight: 0.0
+      degradation_weight: 1.0
+      magnitude_weight: 0.0
+      aux_on_deterministic: true
       separate_by_variable: true
       separate_by_level: true
       separate_by_lead_time: true
@@ -445,12 +662,18 @@ model:
     diffusion:
       training_timesteps: 1000
       inference_steps: 50
-      prediction_type: epsilon        # epsilon | velocity | sample
+      prediction_type: sample         # epsilon | velocity | sample; sample = x0
       schedule: cosine                # cosine | linear | scaled_linear
       sampler: ddim                   # ddim | ddpm (ddpm requires eta: 1.0)
       eta: 0.0
       clip_sample: false
       clip_sample_range: 10.0
+      snr_weighting: auto             # none | min_snr | snr | truncated_snr | auto
+      snr_gamma: 5.0
+      timestep_distribution: auto     # uniform | low_noise | high_noise | auto
+      timestep_bias: 3.0
+      deterministic_training_steps: 4
+      deterministic_estimator: auto   # auto | ode | posterior_mean
 
     unet:
       hidden_channels: 64
@@ -469,15 +692,31 @@ model:
       num_blocks: 6
       mlp_ratio: 4.0
       dropout: 0.0
-      positional_encoding: latlon_2d  # latlon_2d | sincos_2d
+      positional_encoding: sincos_2d  # latlon_2d | sincos_2d
       max_tokens_lat: 256
       max_tokens_lon: 512
-      attention_mode: global_2d       # global_2d | windowed_2d
+      attention_mode: windowed_2d     # global_2d | windowed_2d
       window_size: [8, 8]
-      shifted_windows: false
+      shifted_windows: true
       gradient_checkpointing: false
       optimized_attention: auto       # auto | sdpa | math
       zero_init_output: true
+      local_refinement: true
+
+  mamba_temporal_enabled: false
+  mamba_temporal_channels: 16
+  mamba_temporal_state: 8
+  mamba_temporal_layers: 2
+  mamba_temporal_conv: 3
+  mamba_temporal_expand: 2
+
+training:
+  mamba_temporal_weight: 0.0          # set > 0 only with explicit Mamba opt-in
+  validation_refinement_ensemble_size: 1
+  validation_source: train_tail       # grouped and purged; never held-out test.nc
+  checkpoint_metric: mean_physical_rmse_ratio
+  require_refinement_improvement: true
+  require_all_physical_channels_improve: true
 
 performance:
   profile: false
@@ -500,6 +739,14 @@ performance:
   `flow_matching.integration_steps = flow_refine_sampling_steps`, ...), so every
   existing YAML file and checkpoint keeps working unchanged.
 * `flow_matching` is a permanent alias for `flow_matching_unet`.
+* `flow_matching_conv` is an alias for the unified
+  `flow_matching_conv_unet`, not for the legacy wrapper.
+* Omitted new options keep the legacy-safe values: no residual scaling,
+  epsilon prediction, no SNR reweighting, uniform diffusion-timestep sampling,
+  no Transformer local stem/head, and temporal Mamba disabled. The improved
+  example YAMLs opt in explicitly where intended. Because scaling, local
+  refinement and Mamba add checkpoint state or parameters, training and
+  inference must agree on those resolved architecture settings.
 * `refinement.enabled: false` and `refinement.type: none` both disable Phase 2.
 * Invalid refiner names, Transformer geometry, patch/window settings, diffusion
   schedules, prediction parameterizations, flow solvers and incompatible option
@@ -534,12 +781,17 @@ output before use, and caching is refused entirely when Aurora is trainable
 | variable | content |
 | --- | --- |
 | `<var>` | deterministic Aurora rollout |
-| `<var>_residual` | predicted residual (normalized target space) |
-| `<var>_refined` | refined prediction (ensemble mean when `M > 1`) |
+| `<var>_residual` | predicted normalized correction (legacy diagnostic name) |
+| `<var>_predicted_correction_physical` | physical correction actually added to Aurora |
+| `<var>_refined` | refined physical prediction (ensemble mean when `M > 1`) |
 | `<var>_members` | every ensemble member, explicit `member` dimension, draw order |
 | `<var>_ensemble_mean` | ensemble mean |
 | `<var>_ensemble_spread` | unbiased ensemble standard deviation |
 | `<var>_truth` | ground truth, when provided |
+
+The dataset attribute `aurora_default_forecast_variable_map` points evaluators to
+`<var>_refined` (or the compatible physical fallback), never to `_residual`, raw
+epsilon/velocity, or a latent.
 
 Coordinates: `rollout_step` (1-based), `init_time`, `time` (valid time),
 `lead_time_hours`, `latitude`, `longitude`, `level`, `member`. Ensemble
@@ -561,6 +813,10 @@ python finetune/aurora_finetune_distributed.py \
 python finetune/aurora_finetune_distributed.py \
   --config finetune/examples/stochastic_refinement/aurora_O3_global_flow_matching_unet.yaml
 
+# unified packed-field flow-matching convolutional UNet
+python finetune/aurora_finetune_distributed.py \
+  --config finetune/examples/stochastic_refinement/aurora_O3_global_flow_matching_conv_unet.yaml
+
 # flow-matching Transformer
 python finetune/aurora_finetune_distributed.py \
   --config finetune/examples/stochastic_refinement/aurora_O3_global_flow_matching_transformer.yaml
@@ -579,9 +835,13 @@ Resume works for every refinement type through the existing
 checkpoint restores the model, optimizer, scheduler, gradient scaler, epoch,
 global step and RNG states, and the recorded Aurora fingerprint is verified.
 
-Single-member versus ensemble inference is selected with
-`model.refinement.ensemble_size` (1 versus N); `model.refinement.seed` makes the
-draws reproducible.
+The shipped unified examples emit the deterministic conditional mean with
+`deterministic_inference: true` and `ensemble_size: 1`. For uncertainty
+quantification, set `deterministic_inference: false` and `ensemble_size >= 2`;
+individual members, their mean, and their spread remain distinct products. A
+configured base seed is deterministically mixed with forecast initialization
+time and member index, so reruns reproduce exactly without replaying one spatial
+latent across every case.
 
 Diagnostics and validation:
 
@@ -591,17 +851,37 @@ python -m finetune.refinement_parity_check \
   --checkpoint finetune/outputs/checkpoints/O3_global_3day_lead/best.ckpt \
   --report /tmp/flow_parity.json
 
-# minimal non-destructive smoke tests for all four refiners
+# minimal non-destructive synthetic smoke tests
 python -m finetune.refinement_smoke_test --report /tmp/refinement_smoke.json
 
-# profiling + numerical-parity benchmark
-python -m finetune.refinement_benchmark --try-bf16 --report /tmp/refinement_bench.json
+# trace one real failed NO2 batch through exact time/coordinate/level matching;
+# this writes strict JSON, NetCDF tensors, and unsmoothed per-field PNGs
+python -m finetune.trace_refinement_batch \
+  --config finetune/aurora_NO2_finetune_US-WEST_3day_lead_diffusion_transformer_config.yaml \
+  --initialization 20240701T000000 --lead-hours 12 \
+  --finetuned-dir finetune/outputs/NO2_US-WEST_3day_lead_diffusion_transformer \
+  --legacy-refined-dir finetune/outputs/NO2_US-WEST_3day_lead \
+  --output-dir /tmp/no2_batch_trace --overwrite
+
+# controlled smooth synthetic reconstruction plus 1-8-sample real overfit;
+# runs the Diffusion Transformer and the same backbone as direct regression
+python -m finetune.run_refinement_diagnostics --mode both \
+  --heads diffusion_transformer direct_regression_transformer \
+  --synthetic-samples 6 --real-samples 4 --train-steps 400 \
+  --batch-size 4 --device cuda \
+  --output-dir /tmp/refinement_controlled
+
+# short real-data execution check (not a scientific-duration training claim)
+python -m finetune.refinement.benchmark --case no2_uswest --compare \
+  --epochs 8 --max-initializations 24 \
+  --output /tmp/no2_refinement_benchmark.json
 
 # automated tests
 python -m pytest tests/test_refinement_config.py tests/test_refinement_target_space.py \
                  tests/test_refinement_models.py tests/test_refinement_transformer.py \
                  tests/test_refinement_checkpoint.py tests/test_refinement_performance.py \
-                 tests/test_refinement_io.py -q
+                 tests/test_refinement_io.py tests/test_refinement_oracle_contract.py \
+                 tests/test_refinement_controlled_diagnostics.py -q
 ```
 
 Rollout-cache generation is enabled per run with
@@ -626,6 +906,7 @@ rows = compare_raw_and_refined(
         "raw": deterministic,
         "flow_matching_unet": refined_fm_unet,
         "flow_matching_transformer": refined_fm_transformer,
+        "flow_matching_conv_unet": refined_fm_conv_unet,
         "diffusion_unet": refined_diff_unet,
         "diffusion_transformer": refined_diff_transformer,
     },
@@ -649,9 +930,23 @@ therefore can never hide an RMSE, MAE or correlation regression, a degraded
 variable/level, or a degraded long-lead forecast. Report the tradeoffs
 explicitly.
 
-Smoke tests establish **software correctness only**. No claim of scientific bias
-reduction should be made without an appropriately trained model evaluated over a
-validation period.
+Smoke tests and short benchmark runs establish **software correctness only**.
+The built-in `o3_global` and `no2_uswest` benchmark cases currently read
+provenance-validated raw Aurora rollouts from
+`examples/outputs/cams_rollouts`; their baseline stage is recorded as
+`pretrained`. That is not a Stage-1 fine-tuned, no-refinement baseline. If the
+scientific comparison requires that baseline, first produce or supply matching
+unrefined rollout files and retain that limitation in any report until they are
+available.
+
+The benchmark groups by forecast initialization and purges the train/test
+boundary by forecast horizon, records source/config/environment provenance, and
+reports every variable, pressure level and lead separately. Those safeguards do
+not make an eight-epoch execution check a performance result. Claims that a
+refiner reduces CAMS bias require a full-duration, case-tuned training run and
+an independent held-out period covering the intended seasons and forecast
+horizons; report MAE, RMSE, bias, correlation, extremes and ensemble calibration,
+not training loss alone.
 
 ---
 
@@ -668,9 +963,12 @@ validation period.
 * `windowed_2d` attention with a periodic longitude and a token grid that is not
   a multiple of the window size handles the final partial window with circular
   padding and warns once; choose a dividing window size to avoid it.
+* Temporal Mamba's authoritative pure-PyTorch scan vectorizes the spatial
+  pixels and selected pressure levels. The regional NO2 contract is covered by
+  executable tests; large global grids need case-specific memory profiling and
+  may require a future chunked/checkpointed scan before full-resolution training.
 * Joint Aurora/refiner fine-tuning is supported only when explicitly configured
   and is incompatible with rollout/conditioning caching.
 * `performance.compile` and reduced-precision modes are exposed but not enabled
-  by default; validate them with `finetune/refinement_benchmark.py` before use.
-* The bf16 parity column of the benchmark is only meaningful on hardware where
-  autocast actually engages for these operators.
+  by default; validate numerical parity and stability on the exact target
+  hardware before production use.

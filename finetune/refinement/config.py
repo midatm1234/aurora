@@ -36,11 +36,13 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import threading
 import warnings
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
 __all__ = [
+    "CORRECTION_CONVENTION",
     "REFINEMENT_TYPES",
     "BiasLossConfig",
     "ConditioningConfig",
@@ -62,11 +64,38 @@ class ConfigValidationError(ValueError):
     """Raised for any invalid or mutually incompatible refinement setting."""
 
 
+_EPSILON_RESIDUAL_WARNING_LOCK = threading.Lock()
+_EPSILON_RESIDUAL_WARNING_EMITTED = False
+
+
+def _warn_epsilon_residual_prediction_once() -> None:
+    """Emit the explicit-epsilon scientific warning once per Python process."""
+    global _EPSILON_RESIDUAL_WARNING_EMITTED
+    with _EPSILON_RESIDUAL_WARNING_LOCK:
+        if _EPSILON_RESIDUAL_WARNING_EMITTED:
+            return
+        warnings.warn(
+            "refinement.diffusion.prediction_type='epsilon' is a poor fit for "
+            "conditional residual correction because clean-sample conversion can "
+            "amplify prediction errors. Prefer prediction_type='sample' (or "
+            "'velocity') for newly tuned residual refiners.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+        _EPSILON_RESIDUAL_WARNING_EMITTED = True
+
+
+#: Machine-readable sign/application contract used in configs and checkpoints.
+CORRECTION_CONVENTION = "cams_minus_aurora_add"
+_CORRECTION_CONVENTIONS = (CORRECTION_CONVENTION,)
+
+
 #: Every supported Phase-2 refinement type. ``none`` disables Phase 2.
 REFINEMENT_TYPES: tuple[str, ...] = (
     "none",
     "flow_matching_unet",
     "flow_matching_transformer",
+    "flow_matching_conv_unet",
     "diffusion_unet",
     "diffusion_transformer",
 )
@@ -83,6 +112,12 @@ _REFINEMENT_ALIASES: dict[str, str] = {
     "flow": "flow_matching_unet",
     "flow_matching_unet": "flow_matching_unet",
     "flow_matching_transformer": "flow_matching_transformer",
+    # The unified (Phase-2) flow-matching objective on the convolutional
+    # backbone. Distinct from ``flow_matching_unet``, which keeps routing to the
+    # original Aurora wrapper so existing checkpoints and configurations are
+    # untouched.
+    "flow_matching_conv": "flow_matching_conv_unet",
+    "flow_matching_conv_unet": "flow_matching_conv_unet",
     "diffusion": "diffusion_unet",
     "diffusion_unet": "diffusion_unet",
     "diffusion_transformer": "diffusion_transformer",
@@ -90,7 +125,9 @@ _REFINEMENT_ALIASES: dict[str, str] = {
 
 _LEGACY_TYPES = frozenset({"flow_matching_unet"})
 _DIFFUSION_TYPES = frozenset({"diffusion_unet", "diffusion_transformer"})
-_FLOW_TYPES = frozenset({"flow_matching_unet", "flow_matching_transformer"})
+_FLOW_TYPES = frozenset(
+    {"flow_matching_unet", "flow_matching_transformer", "flow_matching_conv_unet"}
+)
 _TRANSFORMER_TYPES = frozenset({"diffusion_transformer", "flow_matching_transformer"})
 
 _PREDICTION_TYPES = ("epsilon", "velocity", "sample")
@@ -106,6 +143,10 @@ _ATTENTION_IMPLEMENTATIONS = ("auto", "sdpa", "math")
 _PRECISION_MODES = ("fp32", "bf16", "fp16")
 _GENERATIVE_LOSSES = ("mse", "l1", "huber")
 _RESIDUAL_SPACES = ("normalized",)
+_RESIDUAL_SCALINGS = ("auto", "none", "global", "per_channel")
+_SNR_WEIGHTINGS = ("auto", "none", "min_snr", "snr", "truncated_snr")
+_DETERMINISTIC_ESTIMATORS = ("auto", "ode", "posterior_mean")
+_TIMESTEP_DISTRIBUTIONS = ("auto", "uniform", "low_noise", "high_noise")
 
 
 # ---------------------------------------------------------------------------
@@ -233,8 +274,26 @@ class TargetSpaceConfig:
 
     use_existing_normalization: bool = True
     residual_space: str = "normalized"
+    #: Standardization of the residual *before* the generative process. The
+    #: residual lives in Aurora's field-normalized space, but its scale can still
+    #: differ substantially by variable and level. The backward-compatible
+    #: default remains ``none``; new configurations opt in explicitly with
+    #: ``per_channel`` or ``auto``. The legacy flow wrapper remains untouched.
+    residual_scaling: str = "none"
+    residual_scaling_center: bool = False
+    residual_scaling_momentum: float = 0.05
+    residual_scaling_warmup_batches: int = 32
+    residual_scaling_target_std: float = 1.0
 
-    _KEYS = ("use_existing_normalization", "residual_space")
+    _KEYS = (
+        "use_existing_normalization",
+        "residual_space",
+        "residual_scaling",
+        "residual_scaling_center",
+        "residual_scaling_momentum",
+        "residual_scaling_warmup_batches",
+        "residual_scaling_target_std",
+    )
 
     @classmethod
     def from_mapping(cls, data: Any) -> TargetSpaceConfig:
@@ -263,7 +322,46 @@ class TargetSpaceConfig:
                 d.residual_space,
                 _RESIDUAL_SPACES,
             ),
+            residual_scaling=_as_choice(
+                sec,
+                "residual_scaling",
+                raw.get("residual_scaling"),
+                d.residual_scaling,
+                _RESIDUAL_SCALINGS,
+            ),
+            residual_scaling_center=_as_bool(
+                sec,
+                "residual_scaling_center",
+                raw.get("residual_scaling_center"),
+                d.residual_scaling_center,
+            ),
+            residual_scaling_momentum=_as_float(
+                sec,
+                "residual_scaling_momentum",
+                raw.get("residual_scaling_momentum"),
+                d.residual_scaling_momentum,
+                minimum=0.0,
+                maximum=1.0,
+            ),
+            residual_scaling_warmup_batches=_as_int(
+                sec,
+                "residual_scaling_warmup_batches",
+                raw.get("residual_scaling_warmup_batches"),
+                d.residual_scaling_warmup_batches,
+                minimum=0,
+            ),
+            residual_scaling_target_std=_as_float(
+                sec,
+                "residual_scaling_target_std",
+                raw.get("residual_scaling_target_std"),
+                d.residual_scaling_target_std,
+                minimum=1.0e-6,
+            ),
         )
+
+    def resolved_residual_scaling(self) -> str:
+        """``auto`` resolved to a concrete mode."""
+        return "per_channel" if self.residual_scaling == "auto" else self.residual_scaling
 
     def to_dict(self) -> dict[str, Any]:
         return {key: getattr(self, key) for key in self._KEYS}
@@ -334,6 +432,41 @@ class LossConfig:
     bias_weight: float = 0.0
     gradient_weight: float = 0.0
     pattern_correlation_weight: float = 0.0
+    #: Direct supervision of the *exact quantity inference computes*. The
+    #: generative objective trains a denoiser/velocity field; it does not train
+    #: the deterministic estimate the forecast actually uses. This optional
+    #: term closes that objective/deployment gap and must be tuned by case.
+    deterministic_weight: float = 0.0
+    #: L1 on the residual error. Targets MAE directly (MSE targets RMSE).
+    mae_weight: float = 0.0
+    #: Quantile-weighted squared error emphasising the tails of the refined
+    #: field, plus a spatial max/min magnitude match.
+    extreme_weight: float = 0.0
+    extreme_quantile: float = 0.95
+    extreme_intensity: float = 4.0
+    peak_weight: float = 0.0
+    #: Sorted-value (1-D Wasserstein-2) distance between the refined and true
+    #: field distributions. Matches the full PDF, not just the tails.
+    quantile_weight: float = 0.0
+    #: Spatial standard-deviation match. Counteracts oversmoothing.
+    variance_weight: float = 0.0
+    #: Radially averaged log power-spectrum match. Preserves the scale
+    #: distribution of the refined field.
+    spectral_weight: float = 0.0
+    #: Hinge that is zero while the correction is no worse than leaving the
+    #: rollout unchanged, and positive where it degrades a point.
+    degradation_weight: float = 0.0
+    #: L2 shrinkage on the predicted residual magnitude.
+    magnitude_weight: float = 0.0
+    #: Evaluate the structural terms (pattern correlation, extreme, peak,
+    #: quantile, variance, spectral) on the **deterministic** residual estimate
+    #: rather than on the generative estimate drawn at a random noise level.
+    #: The deterministic estimate is what inference emits, so this is the field
+    #: whose spread, tails and spectrum actually reach the forecast; scoring the
+    #: noisy training estimate instead optimises a quantity nobody consumes.
+    #: Requires ``deterministic_weight > 0`` (which is what computes the
+    #: estimate); ignored otherwise.
+    aux_on_deterministic: bool = True
     area_weighted: bool = True
     separate_by_variable: bool = True
     separate_by_level: bool = True
@@ -345,10 +478,39 @@ class LossConfig:
         "bias_weight",
         "gradient_weight",
         "pattern_correlation_weight",
+        "deterministic_weight",
+        "mae_weight",
+        "extreme_weight",
+        "extreme_quantile",
+        "extreme_intensity",
+        "peak_weight",
+        "quantile_weight",
+        "variance_weight",
+        "spectral_weight",
+        "degradation_weight",
+        "magnitude_weight",
+        "aux_on_deterministic",
         "area_weighted",
         "separate_by_variable",
         "separate_by_level",
         "separate_by_lead_time",
+    )
+
+    #: weights that are plain non-negative scalars multiplying a loss term.
+    _WEIGHT_KEYS = (
+        "reconstruction_weight",
+        "bias_weight",
+        "gradient_weight",
+        "pattern_correlation_weight",
+        "deterministic_weight",
+        "mae_weight",
+        "extreme_weight",
+        "peak_weight",
+        "quantile_weight",
+        "variance_weight",
+        "spectral_weight",
+        "degradation_weight",
+        "magnitude_weight",
     )
 
     @classmethod
@@ -357,35 +519,36 @@ class LossConfig:
         sec = "refinement.loss"
         _reject_unknown(sec, raw, cls._KEYS)
         d = cls()
-        return cls(
+        weights = {
+            key: _as_float(sec, key, raw.get(key), getattr(d, key), minimum=0.0)
+            for key in cls._WEIGHT_KEYS
+        }
+        out = cls(
             generative=_as_choice(
                 sec, "generative", raw.get("generative"), d.generative, _GENERATIVE_LOSSES
             ),
-            reconstruction_weight=_as_float(
+            extreme_quantile=_as_float(
                 sec,
-                "reconstruction_weight",
-                raw.get("reconstruction_weight"),
-                d.reconstruction_weight,
+                "extreme_quantile",
+                raw.get("extreme_quantile"),
+                d.extreme_quantile,
                 minimum=0.0,
+                maximum=1.0,
             ),
-            bias_weight=_as_float(
-                sec, "bias_weight", raw.get("bias_weight"), d.bias_weight, minimum=0.0
-            ),
-            gradient_weight=_as_float(
+            extreme_intensity=_as_float(
                 sec,
-                "gradient_weight",
-                raw.get("gradient_weight"),
-                d.gradient_weight,
-                minimum=0.0,
-            ),
-            pattern_correlation_weight=_as_float(
-                sec,
-                "pattern_correlation_weight",
-                raw.get("pattern_correlation_weight"),
-                d.pattern_correlation_weight,
+                "extreme_intensity",
+                raw.get("extreme_intensity"),
+                d.extreme_intensity,
                 minimum=0.0,
             ),
             area_weighted=_as_bool(sec, "area_weighted", raw.get("area_weighted"), d.area_weighted),
+            aux_on_deterministic=_as_bool(
+                sec,
+                "aux_on_deterministic",
+                raw.get("aux_on_deterministic"),
+                d.aux_on_deterministic,
+            ),
             separate_by_variable=_as_bool(
                 sec,
                 "separate_by_variable",
@@ -401,15 +564,37 @@ class LossConfig:
                 raw.get("separate_by_lead_time"),
                 d.separate_by_lead_time,
             ),
+            **weights,
         )
+        if out.extreme_weight > 0.0 and not 0.0 < out.extreme_quantile < 1.0:
+            raise ConfigValidationError(
+                f"{sec}.extreme_quantile must be strictly between 0 and 1 when "
+                "extreme_weight > 0."
+            )
+        return out
 
     @property
     def has_auxiliary_terms(self) -> bool:
+        """Whether any term beyond the pure generative objective is enabled."""
+        return any(getattr(self, key) > 0.0 for key in self._WEIGHT_KEYS)
+
+    @property
+    def needs_rollout(self) -> bool:
+        """Terms that must be evaluated on the refined *field*, not the residual."""
         return (
-            self.reconstruction_weight > 0.0
-            or self.bias_weight > 0.0
-            or self.gradient_weight > 0.0
-            or self.pattern_correlation_weight > 0.0
+            self.pattern_correlation_weight > 0.0
+            or self.extreme_weight > 0.0
+            or self.peak_weight > 0.0
+            or self.quantile_weight > 0.0
+            or self.variance_weight > 0.0
+            or self.spectral_weight > 0.0
+        )
+
+    @property
+    def needs_deterministic_estimate(self) -> bool:
+        """Whether an extra deterministic forward pass is required."""
+        return self.deterministic_weight > 0.0 or (
+            self.aux_on_deterministic and self.needs_rollout
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -448,6 +633,10 @@ class FlowMatchingConfig:
     logit_normal_std: float = 1.2
     residual_zscore: bool = False
     res_std_momentum: float = 0.99
+    #: Trajectory length used by ``loss.deterministic_weight`` for the
+    #: ``rectified_flow`` (velocity) path. The ``existing_aurora`` path needs a
+    #: single query and ignores it.
+    deterministic_training_steps: int = 4
 
     _KEYS = (
         "source_distribution",
@@ -461,6 +650,7 @@ class FlowMatchingConfig:
         "logit_normal_std",
         "residual_zscore",
         "res_std_momentum",
+        "deterministic_training_steps",
     )
 
     @classmethod
@@ -525,6 +715,13 @@ class FlowMatchingConfig:
                 minimum=0.0,
                 maximum=0.999999,
             ),
+            deterministic_training_steps=_as_int(
+                sec,
+                "deterministic_training_steps",
+                raw.get("deterministic_training_steps"),
+                d.deterministic_training_steps,
+                minimum=1,
+            ),
         )
         return out
 
@@ -542,6 +739,11 @@ class DiffusionConfig:
 
     training_timesteps: int = 1000
     inference_steps: int = 50
+    #: ``epsilon`` remains the legacy-safe default so omitted YAML keys preserve
+    #: existing behavior. New residual-correction configurations should select
+    #: ``sample`` (x0) explicitly: it makes a zero-initialised DDIM head return
+    #: zero residual and avoids dividing prediction error by ``sqrt(abar)``.
+    #: This mirrors the ``x1`` parameterisation used by the working flow head.
     prediction_type: str = "epsilon"
     schedule: str = "cosine"
     sampler: str = "ddim"
@@ -551,6 +753,52 @@ class DiffusionConfig:
     eta: float = 0.0
     clip_sample: bool = False
     clip_sample_range: float = 10.0
+    #: Loss weighting across noise levels. ``none`` preserves legacy behavior;
+    #: improved configurations can explicitly choose ``auto`` (Min-SNR-gamma
+    #: for epsilon/velocity and no extra weighting for sample prediction).
+    snr_weighting: str = "none"
+    snr_gamma: float = 5.0
+    #: Where along the noise axis training timesteps are concentrated.
+    #:
+    #: ``low_noise``
+    #:     the informative end for an ``epsilon`` network.
+    #: ``high_noise``
+    #:     the end where a ``sample`` (x0) network is forced to use the
+    #:     conditioning instead of copying its input, and where the
+    #:     deterministic ``posterior_mean`` query lives. Uniform sampling visits
+    #:     that query point once per ``training_timesteps`` batches. Biasing
+    #:     toward high noise gives the conditional signal more training weight,
+    #:     but the resulting trade-off must be validated separately for each
+    #:     dataset and architecture.
+    #: ``uniform``
+    #:     standard DDPM sampling.
+    #: ``auto``
+    #:     ``high_noise`` for ``sample``, ``low_noise`` for ``epsilon``, and
+    #:     ``uniform`` for ``velocity``.
+    timestep_distribution: str = "uniform"
+    #: Strength of ``timestep_distribution``; ``0`` degenerates to ``uniform``.
+    timestep_bias: float = 3.0
+    #: Trajectory length used by ``loss.deterministic_weight``. Kept short so the
+    #: extra differentiable pass stays affordable.
+    deterministic_training_steps: int = 4
+    #: How the deterministic (mean-like) residual is produced.
+    #:
+    #: ``posterior_mean``
+    #:     one query at the largest timestep from the prior mean ``x = 0``. At
+    #:     that timestep the noisy state is independent of the residual, so
+    #:     ``E[r | x_T, cond] = E[r | cond]`` for *any* ``x_T`` - including the
+    #:     mean - and that conditional mean is exactly the squared-error optimum.
+    #:     This is the direct analogue of the ``t = 0, x = 0`` query that makes
+    #:     the existing Aurora flow-matching head work, and it costs one forward
+    #:     pass instead of ``inference_steps``. Requires ``sample`` or
+    #:     ``velocity`` prediction, because under ``epsilon`` the conversion
+    #:     divides by ``sqrt(abar_T)``.
+    #: ``ode``
+    #:     integrate the full ``eta = 0`` probability-flow trajectory from
+    #:     ``x_T = 0``.
+    #: ``auto``
+    #:     ``posterior_mean`` when the parameterisation supports it, else ``ode``.
+    deterministic_estimator: str = "auto"
 
     _KEYS = (
         "training_timesteps",
@@ -564,6 +812,12 @@ class DiffusionConfig:
         "eta",
         "clip_sample",
         "clip_sample_range",
+        "snr_weighting",
+        "snr_gamma",
+        "timestep_distribution",
+        "timestep_bias",
+        "deterministic_training_steps",
+        "deterministic_estimator",
     )
 
     @classmethod
@@ -602,6 +856,45 @@ class DiffusionConfig:
                 d.clip_sample_range,
                 minimum=0.0,
             ),
+            snr_weighting=_as_choice(
+                sec,
+                "snr_weighting",
+                raw.get("snr_weighting"),
+                d.snr_weighting,
+                _SNR_WEIGHTINGS,
+            ),
+            snr_gamma=_as_float(
+                sec, "snr_gamma", raw.get("snr_gamma"), d.snr_gamma, minimum=0.0
+            ),
+            timestep_distribution=_as_choice(
+                sec,
+                "timestep_distribution",
+                raw.get("timestep_distribution"),
+                d.timestep_distribution,
+                _TIMESTEP_DISTRIBUTIONS,
+            ),
+            timestep_bias=_as_float(
+                sec,
+                "timestep_bias",
+                raw.get("timestep_bias"),
+                d.timestep_bias,
+                minimum=0.0,
+                maximum=8.0,
+            ),
+            deterministic_training_steps=_as_int(
+                sec,
+                "deterministic_training_steps",
+                raw.get("deterministic_training_steps"),
+                d.deterministic_training_steps,
+                minimum=1,
+            ),
+            deterministic_estimator=_as_choice(
+                sec,
+                "deterministic_estimator",
+                raw.get("deterministic_estimator"),
+                d.deterministic_estimator,
+                _DETERMINISTIC_ESTIMATORS,
+            ),
         )
         if out.inference_steps > out.training_timesteps:
             raise ConfigValidationError(
@@ -622,10 +915,53 @@ class DiffusionConfig:
             raise ConfigValidationError(
                 f"{sec}.clip_sample_range must be > 0 when clip_sample is enabled."
             )
+        if (
+            out.prediction_type == "epsilon"
+            and out.resolved_deterministic_estimator() == "posterior_mean"
+        ):
+            raise ConfigValidationError(
+                f"{sec}.deterministic_estimator='posterior_mean' is incompatible "
+                "with prediction_type='epsilon'; expected 'ode' or prediction_type='sample'."
+            )
         return out
 
     def to_dict(self) -> dict[str, Any]:
         return {key: getattr(self, key) for key in self._KEYS}
+
+    def resolved_snr_weighting(self) -> str:
+        """``auto`` resolved from the prediction parameterisation.
+
+        The native loss of each parameterisation already carries an implicit
+        weighting across noise levels:
+
+        * ``epsilon`` weights every timestep equally *in epsilon space*, which is
+          a ``1/SNR`` weighting of the residual error - it under-trains exactly
+          the low-noise timesteps that carry the signal, so it needs
+          ``min_snr``;
+        * ``sample`` measures the error directly on the clean residual, so it is
+          already correctly balanced. Applying ``min_snr`` on top would
+          up-weight the high-SNR timesteps where predicting ``x_0`` from
+          ``x_t`` is the trivial identity, and down-weight the high-noise
+          timesteps where the network must actually use the conditioning. Leave
+          it unweighted.
+        """
+        if self.snr_weighting != "auto":
+            return self.snr_weighting
+        return "none" if self.prediction_type == "sample" else "min_snr"
+
+    def resolved_deterministic_estimator(self) -> str:
+        if self.deterministic_estimator != "auto":
+            return self.deterministic_estimator
+        return "posterior_mean" if self.prediction_type in {"sample", "velocity"} else "ode"
+
+    def resolved_timestep_distribution(self) -> str:
+        if self.timestep_distribution != "auto":
+            return self.timestep_distribution
+        if self.prediction_type == "sample":
+            return "high_noise"
+        if self.prediction_type == "epsilon":
+            return "low_noise"
+        return "uniform"
 
 
 @dataclass(frozen=True)
@@ -734,6 +1070,12 @@ class TransformerConfig:
     gradient_checkpointing: bool = False
     optimized_attention: str = "auto"
     zero_init_output: bool = True
+    #: Optionally add a 3x3 convolutional stem before patchification and a
+    #: zero-initialised 3x3 residual head after reconstruction. Patch tokenization
+    #: compresses each patch to one vector; these convolutions restore overlapping
+    #: local support while preserving identity-at-init. Disabled by default so
+    #: older YAMLs and checkpoints retain their architecture.
+    local_refinement: bool = False
 
     _KEYS = (
         "patch_size",
@@ -753,6 +1095,7 @@ class TransformerConfig:
         "gradient_checkpointing",
         "optimized_attention",
         "zero_init_output",
+        "local_refinement",
     )
 
     @classmethod
@@ -864,6 +1207,9 @@ class TransformerConfig:
             zero_init_output=_as_bool(
                 sec, "zero_init_output", raw.get("zero_init_output"), d.zero_init_output
             ),
+            local_refinement=_as_bool(
+                sec, "local_refinement", raw.get("local_refinement"), d.local_refinement
+            ),
         )
         return out
 
@@ -884,6 +1230,7 @@ class TransformerConfig:
             "gradient_checkpointing": self.gradient_checkpointing,
             "optimized_attention": self.optimized_attention,
             "zero_init_output": self.zero_init_output,
+            "local_refinement": self.local_refinement,
         }
 
 
@@ -902,6 +1249,7 @@ class RefinementConfig:
 
     enabled: bool = False
     type: str = "none"
+    correction_convention: str = CORRECTION_CONVENTION
     checkpoint: str | None = None
     freeze_aurora: bool = True
     joint_finetuning: bool = False
@@ -909,6 +1257,13 @@ class RefinementConfig:
     feedback_to_rollout: bool = False
     ensemble_size: int = 1
     seed: int | None = None
+    #: Use the deterministic (mean-path / probability-flow) estimate at inference
+    #: instead of averaging stochastic draws. Pointwise scores (MAE, RMSE, bias)
+    #: are minimised by the conditional *mean*, which the deterministic path
+    #: targets directly; stochastic draws only approach it as the ensemble grows.
+    #: Enable this when the product is a single deterministic forecast, and leave
+    #: it off when calibrated ensemble spread is the objective.
+    deterministic_inference: bool = False
     target_space: TargetSpaceConfig = field(default_factory=TargetSpaceConfig)
     conditioning: ConditioningConfig = field(default_factory=ConditioningConfig)
     loss: LossConfig = field(default_factory=LossConfig)
@@ -923,6 +1278,7 @@ class RefinementConfig:
     _KEYS = (
         "enabled",
         "type",
+        "correction_convention",
         "checkpoint",
         "freeze_aurora",
         "joint_finetuning",
@@ -930,6 +1286,7 @@ class RefinementConfig:
         "feedback_to_rollout",
         "ensemble_size",
         "seed",
+        "deterministic_inference",
         "target_space",
         "conditioning",
         "loss",
@@ -972,6 +1329,7 @@ class RefinementConfig:
         return {
             "enabled": self.enabled,
             "type": self.type,
+            "correction_convention": self.correction_convention,
             "checkpoint": self.checkpoint,
             "freeze_aurora": self.freeze_aurora,
             "joint_finetuning": self.joint_finetuning,
@@ -979,6 +1337,7 @@ class RefinementConfig:
             "feedback_to_rollout": self.feedback_to_rollout,
             "ensemble_size": self.ensemble_size,
             "seed": self.seed,
+            "deterministic_inference": self.deterministic_inference,
             "target_space": self.target_space.to_dict(),
             "conditioning": self.conditioning.to_dict(),
             "loss": self.loss.to_dict(),
@@ -1384,6 +1743,14 @@ def resolve_refinement_config(config: Any) -> RefinementConfig:
         )
         enabled = False
 
+    correction_convention = _as_choice(
+        "refinement",
+        "correction_convention",
+        raw.get("correction_convention"),
+        CORRECTION_CONVENTION,
+        _CORRECTION_CONVENTIONS,
+    )
+
     checkpoint = raw.get("checkpoint")
     checkpoint = None if checkpoint in (None, "", "null") else str(checkpoint)
 
@@ -1402,12 +1769,11 @@ def resolve_refinement_config(config: Any) -> RefinementConfig:
         "refinement", "train_on_residual", raw.get("train_on_residual"), True
     )
     if enabled and not train_on_residual:
-        warnings.warn(
-            "refinement.train_on_residual=false makes Phase 2 predict the full "
-            "normalized target instead of the residual. This is a scientific change, "
-            "not an optimization.",
-            RuntimeWarning,
-            stacklevel=2,
+        raise ConfigValidationError(
+            "Active refinement requires train_on_residual=true under "
+            "correction_convention='cams_minus_aurora_add': Phase 2 must predict "
+            "CAMS - Aurora and the forecast must add that correction to Aurora. "
+            "Whole-field prediction is not a supported refinement contract."
         )
 
     feedback = _as_bool("refinement", "feedback_to_rollout", raw.get("feedback_to_rollout"), False)
@@ -1423,6 +1789,9 @@ def resolve_refinement_config(config: Any) -> RefinementConfig:
     ensemble_size = _as_int("refinement", "ensemble_size", raw.get("ensemble_size"), 1)
     seed_raw = raw.get("seed")
     seed = None if seed_raw is None else _as_int("refinement", "seed", seed_raw, 0, minimum=0)
+    deterministic_inference = _as_bool(
+        "refinement", "deterministic_inference", raw.get("deterministic_inference"), False
+    )
 
     flow_matching = FlowMatchingConfig.from_mapping(raw.get("flow_matching"))
     diffusion = DiffusionConfig.from_mapping(raw.get("diffusion"))
@@ -1433,6 +1802,7 @@ def resolve_refinement_config(config: Any) -> RefinementConfig:
     cfg = RefinementConfig(
         enabled=enabled,
         type=resolved_type if enabled else "none",
+        correction_convention=correction_convention,
         checkpoint=checkpoint,
         freeze_aurora=freeze_aurora,
         joint_finetuning=joint,
@@ -1440,6 +1810,7 @@ def resolve_refinement_config(config: Any) -> RefinementConfig:
         feedback_to_rollout=feedback,
         ensemble_size=ensemble_size,
         seed=seed,
+        deterministic_inference=deterministic_inference,
         target_space=TargetSpaceConfig.from_mapping(raw.get("target_space")),
         conditioning=ConditioningConfig.from_mapping(raw.get("conditioning")),
         loss=loss,
@@ -1448,6 +1819,15 @@ def resolve_refinement_config(config: Any) -> RefinementConfig:
         unet=unet,
         transformer=transformer,
     )
+
+    raw_diffusion = _as_mapping(raw.get("diffusion"))
+    if (
+        cfg.is_active
+        and cfg.is_diffusion
+        and cfg.diffusion.prediction_type == "epsilon"
+        and raw_diffusion.get("prediction_type") is not None
+    ):
+        _warn_epsilon_residual_prediction_once()
 
     if cfg.is_active and cfg.is_diffusion and raw.get("flow_matching"):
         warnings.warn(

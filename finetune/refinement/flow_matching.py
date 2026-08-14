@@ -80,6 +80,7 @@ class _BaseFlowMatchingRefiner(PackedRefiner):
         self.time_sampling = f.time_sampling
         self.logit_normal_mean = f.logit_normal_mean
         self.logit_normal_std = f.logit_normal_std
+        self.deterministic_training_steps = f.deterministic_training_steps
         super().__init__(
             config,
             residual_channels=residual_channels,
@@ -105,164 +106,225 @@ class _BaseFlowMatchingRefiner(PackedRefiner):
             z = torch.randn(batch, generator=generator, device=gen_device, dtype=torch.float32)
             t = torch.sigmoid(z * self.logit_normal_std + self.logit_normal_mean)
         return t.to(device).clamp(self.sigma_min, 1.0 - self.sigma_min)
+    def _network_prediction(
+        self,
+        state_float32: torch.Tensor,
+        conditioning: torch.Tensor,
+        process_time: torch.Tensor,
+        lead: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Evaluate the flow network at model precision and return float32."""
+        prediction = self.net(
+            state_float32.to(dtype=conditioning.dtype),
+            conditioning,
+            process_time,
+            lead,
+        )
+        if prediction.shape != state_float32.shape:
+            raise RuntimeError(
+                "Flow network output shape must match its state; got "
+                f"{tuple(prediction.shape)} and {tuple(state_float32.shape)}."
+            )
+        prediction32 = prediction.float()
+        if not bool(torch.isfinite(prediction32).all()):
+            raise FloatingPointError("Flow network produced non-finite values.")
+        return prediction32
+
 
     # -- training --------------------------------------------------------
-    def compute_training_loss(
+    def _training_loss(
         self,
         residual_target: torch.Tensor,
         conditioning: torch.Tensor,
         *,
-        forecast_lead_time: torch.Tensor | None = None,
-        mask: torch.Tensor | None = None,
-        generator: torch.Generator | None = None,
-        lead_index: torch.Tensor | None = None,
-        area_weight: torch.Tensor | None = None,
-        rollout_normalized: torch.Tensor | None = None,
-    ) -> RefinerOutput:
+        forecast_lead_time: torch.Tensor | None,
+        mask: torch.Tensor | None,
+        generator: torch.Generator | None,
+    ) -> tuple[RefinerOutput, torch.Tensor]:
         batch = residual_target.shape[0]
-        device, dtype = residual_target.device, residual_target.dtype
+        device = residual_target.device
+        correction32 = residual_target.float()
 
-        x0 = self._randn(tuple(residual_target.shape), device, dtype, generator)
+        source32 = self._randn(
+            tuple(correction32.shape), device, torch.float32, generator
+        )
         t = self._sample_flow_time(batch, device, generator)
-        t_b = t.reshape(-1, *([1] * (residual_target.ndim - 1))).to(dtype)
+        t_b = t.reshape(-1, *([1] * (correction32.ndim - 1)))
 
-        x_t = (1.0 - t_b) * x0 + t_b * residual_target
-        prediction = self.net(
-            x_t, conditioning, self._embed_time(t), self._lead_for(forecast_lead_time)
+        state32 = (1.0 - t_b) * source32 + t_b * correction32
+        prediction32 = self._network_prediction(
+            state32,
+            conditioning,
+            self._embed_time(t),
+            self._lead_for(forecast_lead_time),
         )
 
         if self.predicts_velocity:
-            objective = residual_target - x0
-            # Endpoint estimate consistent with the straight path:
-            # x_1 = x_t + (1 - t) * u_t.
-            residual_estimate = x_t + (1.0 - t_b) * prediction
+            objective32 = correction32 - source32
+            # Endpoint estimate for the straight path: x1 = xt + (1-t) u_t.
+            correction_estimate32 = state32 + (1.0 - t_b) * prediction32
         else:
-            objective = residual_target
-            residual_estimate = prediction
+            objective32 = correction32
+            correction_estimate32 = prediction32
 
-        generative = masked_loss(prediction, objective, mask, self.loss_kind)
-        output = RefinerOutput(generative_loss=generative, process_time=t)
-        if not self.config.loss.has_auxiliary_terms:
-            output.total_loss = generative
-            return output
-        return self._finish(
-            output,
-            residual_estimate=residual_estimate,
-            residual_target=residual_target,
-            mask=mask,
-            lead_index=lead_index,
-            area_weight=area_weight,
-            rollout_normalized=rollout_normalized,
+        generative = masked_loss(
+            prediction32, objective32, mask, self.loss_kind
+        )
+        return (
+            RefinerOutput(generative_loss=generative, process_time=t),
+            correction_estimate32,
         )
 
     # -- integration -----------------------------------------------------
-    @torch.no_grad()
-    def sample_residual(
+    def _sample(
         self,
         conditioning: torch.Tensor,
         *,
-        forecast_lead_time: torch.Tensor | None = None,
-        generator: torch.Generator | None = None,
-        num_steps: int | None = None,
+        forecast_lead_time: torch.Tensor | None,
+        generator: torch.Generator | None,
+        num_steps: int | None,
     ) -> torch.Tensor:
         steps = int(num_steps if num_steps is not None else self.integration_steps)
         if steps < 1:
             raise ValueError("integration_steps must be >= 1")
         shape = self.residual_shape(conditioning)
-        device, dtype = conditioning.device, conditioning.dtype
+        device = conditioning.device
         lead = self._lead_for(forecast_lead_time)
         batch = shape[0]
 
         if self.stochastic_initialization:
-            x = self._randn(shape, device, dtype, generator)
+            state32 = self._randn(shape, device, torch.float32, generator)
         else:
-            x = torch.zeros(shape, device=device, dtype=dtype)
+            state32 = torch.zeros(shape, device=device, dtype=torch.float32)
 
         def evaluate(state: torch.Tensor, t_value: torch.Tensor) -> torch.Tensor:
-            return self.net(state, conditioning, self._embed_time(t_value.expand(batch)), lead)
+            return self._network_prediction(
+                state,
+                conditioning,
+                self._embed_time(t_value.expand(batch)),
+                lead,
+            )
 
         if not self.predicts_velocity:
-            return self._sample_data_parameterisation(x, evaluate, steps, device, dtype)
+            return self._sample_data_parameterisation(
+                state32, evaluate, steps, device
+            )
 
-        # The integration grid is a fixed function of ``steps`` and is built once
-        # per call, on the target device, so the loop performs no host sync.
-        grid = torch.linspace(0.0, 1.0, steps + 1, device=device, dtype=torch.float32)
+        grid = torch.linspace(
+            0.0, 1.0, steps + 1, device=device, dtype=torch.float32
+        )
         for idx in range(steps):
             t0, t1 = grid[idx], grid[idx + 1]
-            dt = (t1 - t0).to(dtype)
+            dt = t1 - t0
             if self.solver == "euler":
-                x = x + dt * evaluate(x, t0)
+                state32 = state32 + dt * evaluate(state32, t0)
             elif self.solver == "midpoint":
-                k1 = evaluate(x, t0)
-                mid = x + 0.5 * dt * k1
-                x = x + dt * evaluate(mid, (t0 + t1) * 0.5)
+                k1 = evaluate(state32, t0)
+                midpoint = state32 + 0.5 * dt * k1
+                state32 = state32 + dt * evaluate(midpoint, (t0 + t1) * 0.5)
             elif self.solver == "heun":
-                k1 = evaluate(x, t0)
-                k2 = evaluate(x + dt * k1, t1)
-                x = x + 0.5 * dt * (k1 + k2)
+                k1 = evaluate(state32, t0)
+                k2 = evaluate(state32 + dt * k1, t1)
+                state32 = state32 + 0.5 * dt * (k1 + k2)
             else:  # pragma: no cover - guarded by config validation
                 raise ValueError(f"Unsupported flow solver {self.solver!r}")
-        return x
+            if not bool(torch.isfinite(state32).all()):
+                raise FloatingPointError(
+                    f"Flow state became non-finite at integration step {idx}."
+                )
+        return state32
 
     def _sample_data_parameterisation(
         self,
-        x: torch.Tensor,
+        state32: torch.Tensor,
         evaluate,
         steps: int,
         device: torch.device,
-        dtype: torch.dtype,
     ) -> torch.Tensor:
-        """Existing-Aurora sampler for the ``x1`` (data) parameterisation.
-
-        ``steps == 1`` reduces to a single deterministic regression at the source
-        mean, exactly as the existing implementation does; more steps run the
-        DDIM-style straight-line update.
-        """
+        """Existing-Aurora x1 sampler with float32 straight-line updates."""
         if steps == 1:
-            zero = torch.zeros_like(x)
+            source_mean = torch.zeros_like(state32)
             t_zero = torch.zeros((), device=device, dtype=torch.float32)
-            return evaluate(zero, t_zero)
+            return evaluate(source_mean, t_zero)
 
-        schedule = torch.linspace(0.0, 1.0 - self.sigma_min, steps + 1, device=device)
-        r_hat = torch.zeros_like(x)
+        schedule = torch.linspace(
+            0.0,
+            1.0 - self.sigma_min,
+            steps + 1,
+            device=device,
+            dtype=torch.float32,
+        )
+        correction_estimate32 = torch.zeros_like(state32)
         for idx in range(steps):
-            t_curr = schedule[idx]
-            t_next = schedule[idx + 1]
-            r_hat = evaluate(x, t_curr)
-            curr = t_curr.to(dtype)
-            nxt = t_next.to(dtype)
-            if float(t_curr) > 0.0:
-                x0_est = (x - curr * r_hat) / (1.0 - curr)
-                x = (1.0 - nxt) * x0_est + nxt * r_hat
+            current = schedule[idx]
+            following = schedule[idx + 1]
+            correction_estimate32 = evaluate(state32, current)
+            if idx > 0:
+                source_estimate32 = (
+                    state32 - current * correction_estimate32
+                ) / (1.0 - current).clamp(min=1e-12)
+                state32 = (
+                    (1.0 - following) * source_estimate32
+                    + following * correction_estimate32
+                )
             else:
-                x = (1.0 - nxt) * x + nxt * r_hat
-        return r_hat
+                state32 = (
+                    (1.0 - following) * state32
+                    + following * correction_estimate32
+                )
+            if not bool(torch.isfinite(state32).all()):
+                raise FloatingPointError(
+                    f"Flow data state became non-finite at integration step {idx}."
+                )
+        return correction_estimate32
 
-    @torch.no_grad()
-    def deterministic_residual(
+    def _deterministic(
         self,
         conditioning: torch.Tensor,
         *,
-        forecast_lead_time: torch.Tensor | None = None,
+        forecast_lead_time: torch.Tensor | None,
+        differentiable: bool = False,
     ) -> torch.Tensor:
-        """Mean-path residual estimate (no random draw)."""
+        """Mean-path residual estimate (no random draw).
+
+        For the ``x1`` (data) parameterisation this is a single query at
+        ``t = 0, x = 0``. Because the source noise is independent of the
+        residual, ``E[r | x_0, t=0, cond] = E[r | cond]`` for *any* ``x_0``, so
+        evaluating at the source mean returns the squared-error optimum. This is
+        also exactly what ``integration_steps: 1`` computes at inference, which
+        is what makes ``loss.deterministic_weight`` supervise the deployed
+        estimator directly.
+        """
+        context = torch.enable_grad() if differentiable else torch.no_grad()
         if not self.predicts_velocity:
             shape = self.residual_shape(conditioning)
-            device, dtype = conditioning.device, conditioning.dtype
-            zero = torch.zeros(shape, device=device, dtype=dtype)
-            t_zero = torch.zeros(shape[0], device=device, dtype=torch.float32)
-            return self.net(
-                zero,
-                conditioning,
-                self._embed_time(t_zero),
-                self._lead_for(forecast_lead_time),
+            device = conditioning.device
+            source_mean = torch.zeros(
+                shape, device=device, dtype=torch.float32
             )
+            t_zero = torch.zeros(shape[0], device=device, dtype=torch.float32)
+            with context:
+                return self._network_prediction(
+                    source_mean,
+                    conditioning,
+                    self._embed_time(t_zero),
+                    self._lead_for(forecast_lead_time),
+                )
         saved = self.stochastic_initialization
         try:
             self.stochastic_initialization = False
-            return self.sample_residual(
-                conditioning, forecast_lead_time=forecast_lead_time, generator=None
+            steps = (
+                min(self.deterministic_training_steps, self.integration_steps)
+                if differentiable
+                else None
             )
+            with context:
+                return self._sample(
+                    conditioning,
+                    forecast_lead_time=forecast_lead_time,
+                    generator=None,
+                    num_steps=steps,
+                )
         finally:
             self.stochastic_initialization = saved
 
@@ -270,3 +332,21 @@ class _BaseFlowMatchingRefiner(PackedRefiner):
 @register_refiner("flow_matching_transformer")
 class FlowMatchingTransformerRefiner(_BaseFlowMatchingRefiner):
     """Spatial-token Transformer conditional flow-matching residual refiner."""
+
+
+@register_refiner("flow_matching_conv_unet")
+class FlowMatchingConvUNetRefiner(_BaseFlowMatchingRefiner):
+    """Conditional flow matching on the convolutional UNet backbone.
+
+    Identical objective, interpolation path, time sampling, sampler and residual
+    scaling as :class:`FlowMatchingTransformerRefiner`; only the network differs.
+    It exists because the Transformer is *not* automatically the better choice
+    for this task: patch tokenization discards sub-patch locality, which a fully
+    convolutional backbone keeps for free. Having both under one objective makes
+    "UNet versus Transformer" a controlled architecture comparison rather than a
+    confounded one.
+
+    This is distinct from ``flow_matching_unet``, which remains routed to the
+    original Aurora wrapper (:mod:`finetune.flow_refine`) so that existing
+    configurations and checkpoints are untouched.
+    """

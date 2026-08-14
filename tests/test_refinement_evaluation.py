@@ -70,6 +70,38 @@ def test_masked_cells_are_excluded() -> None:
         assert row["rmse"] == pytest.approx(0.0, abs=1e-6)
 
 
+def test_nonfinite_cells_do_not_contaminate_weighted_means_or_correlation() -> None:
+    packing, truth, lead_index, _ = make_case(steps=1)
+    prediction = truth + 0.1
+    truth[:, :, 0, 0] = float("nan")
+    prediction[:, :, 0, 0] = float("nan")
+
+    rows = evaluate_packed(prediction, truth, packing=packing, lead_index=lead_index)
+
+    for row in rows:
+        assert row["bias"] == pytest.approx(0.1, abs=1.0e-5)
+        assert row["rmse"] == pytest.approx(0.1, abs=1.0e-5)
+        assert math.isfinite(row["pattern_correlation"])
+
+
+def test_no_valid_cells_are_reported_as_nan_not_zero() -> None:
+    packing, truth, lead_index, _ = make_case(steps=1)
+    mask = torch.zeros_like(truth, dtype=torch.bool)
+
+    rows = evaluate_packed(
+        truth,
+        truth,
+        packing=packing,
+        lead_index=lead_index,
+        mask=mask,
+    )
+
+    for row in rows:
+        assert math.isnan(row["bias"])
+        assert math.isnan(row["mae"])
+        assert math.isnan(row["rmse"])
+
+
 def test_area_weighting_changes_the_score() -> None:
     packing, truth, lead_index, _ = make_case(steps=1)
     prediction = truth.clone()
@@ -99,6 +131,26 @@ def test_ensemble_scores() -> None:
         assert row["crps"] >= 0
         assert math.isfinite(row["spread_skill_ratio"])
         assert "ensemble_mean_bias" in row
+
+
+def test_nonfinite_ensemble_cell_is_excluded_from_all_ensemble_scores() -> None:
+    packing, truth, lead_index, _ = make_case(steps=1)
+    members = truth.unsqueeze(1).repeat(1, 3, 1, 1, 1)
+    members[:, 0, :, 0, 0] = float("nan")
+
+    rows = evaluate_packed(
+        truth,
+        truth,
+        packing=packing,
+        lead_index=lead_index,
+        members=members,
+    )
+
+    for row in rows:
+        assert row["ensemble_mean_bias"] == pytest.approx(0.0, abs=1.0e-6)
+        assert row["ensemble_mean_rmse"] == pytest.approx(0.0, abs=1.0e-6)
+        assert row["ensemble_spread"] == pytest.approx(0.0, abs=1.0e-6)
+        assert row["crps"] == pytest.approx(0.0, abs=1.0e-6)
 
 
 def test_crps_of_a_perfect_deterministic_ensemble_is_zero() -> None:
@@ -177,3 +229,22 @@ def test_shape_mismatch_is_rejected() -> None:
     packing, truth, _, _ = make_case(steps=1)
     with pytest.raises(ValueError, match="same shape"):
         evaluate_packed(truth[:, :1], truth, packing=packing)
+
+
+def test_member_shape_mismatch_is_rejected() -> None:
+    packing, truth, _, _ = make_case(steps=1)
+    members = torch.zeros(1, 2, packing.num_channels + 1, *truth.shape[-2:])
+    with pytest.raises(ValueError, match="members must have non-member shape"):
+        evaluate_packed(truth, truth, packing=packing, members=members)
+
+
+def test_one_lead_group_cannot_mix_physical_lead_times() -> None:
+    packing, truth, _, _ = make_case(steps=1, batch=2)
+    with pytest.raises(ValueError, match="mixes physical lead times"):
+        evaluate_packed(
+            truth,
+            truth,
+            packing=packing,
+            lead_index=torch.tensor([0, 0]),
+            lead_hours=torch.tensor([12.0, 24.0]),
+        )

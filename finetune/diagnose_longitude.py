@@ -1,5 +1,6 @@
-#!/usr/bin/env python3
-"""Report dateline continuity for gridded NetCDF predictions or residuals."""
+"""Copyright (c) Microsoft Corporation. Licensed under the MIT license.
+
+Report dateline continuity for gridded NetCDF predictions or residuals."""
 
 from __future__ import annotations
 

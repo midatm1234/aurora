@@ -1,6 +1,6 @@
 """Copyright (c) Microsoft Corporation. Licensed under the MIT license.
 
-Common Phase-2 residual-refiner interface and registry.
+Common Phase-2 correction-refiner interface and registry.
 
 Every refiner implements the same three operations so training, validation,
 inference, evaluation, checkpoint loading and output writing never need a
@@ -15,8 +15,16 @@ Ensemble generation is driven by the caller (see
 :meth:`finetune.refinement.two_phase.AuroraTwoPhaseRefiner.refine`), which draws
 ``ensemble_size`` members through per-member generators.
 
-All tensors are in the **normalized target space**
-(:mod:`finetune.refinement.target_space`).
+Unless a name explicitly ends in ``_physical``, tensors are in the
+**normalized target space** (:mod:`finetune.refinement.target_space`).
+
+The scientific sign convention is fixed repository-wide::
+
+    correction_target = CAMS - Aurora
+    refined_forecast = Aurora + predicted_correction
+
+The historical ``residual`` method and field names remain as compatibility
+aliases, but new code should use the explicit ``correction`` names below.
 
 ``forecast_lead_time`` is the physical time between forecast initialization and
 valid time. It is *never* the diffusion timestep or the flow interpolation
@@ -69,11 +77,29 @@ class RefinerOutput:
     bias_loss: torch.Tensor | None = None
     gradient_loss: torch.Tensor | None = None
     pattern_correlation_loss: torch.Tensor | None = None
+    deterministic_loss: torch.Tensor | None = None
+    mae_loss: torch.Tensor | None = None
+    extreme_loss: torch.Tensor | None = None
+    peak_loss: torch.Tensor | None = None
+    quantile_loss: torch.Tensor | None = None
+    variance_loss: torch.Tensor | None = None
+    spectral_loss: torch.Tensor | None = None
+    degradation_loss: torch.Tensor | None = None
+    magnitude_loss: torch.Tensor | None = None
     total_loss: torch.Tensor | None = None
+    predicted_correction_normalized: torch.Tensor | None = None
+    predicted_correction_physical: torch.Tensor | None = None
+    # Backward-compatible alias for ``predicted_correction_normalized``.
     predicted_residual: torch.Tensor | None = None
     refined_normalized: torch.Tensor | None = None
     refined_physical: torch.Tensor | None = None
     members: torch.Tensor | None = None
+    member_corrections_normalized: torch.Tensor | None = None
+    member_corrections_physical: torch.Tensor | None = None
+    member_innovations_normalized: torch.Tensor | None = None
+    member_innovations_physical: torch.Tensor | None = None
+    conditional_mean_correction_normalized: torch.Tensor | None = None
+    conditional_mean_correction_physical: torch.Tensor | None = None
     member_residuals: torch.Tensor | None = None
     ensemble_mean: torch.Tensor | None = None
     ensemble_spread: torch.Tensor | None = None
@@ -82,7 +108,11 @@ class RefinerOutput:
     diagnostics: dict[str, Any] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
-        return {k: v for k, v in self.__dict__.items() if v is not None and v != {}}
+        return {
+            key: value
+            for key, value in self.__dict__.items()
+            if value is not None and not (isinstance(value, dict) and not value)
+        }
 
     def scalar_losses(self) -> dict[str, float]:
         out: dict[str, float] = {}
@@ -92,6 +122,15 @@ class RefinerOutput:
             "bias_loss",
             "gradient_loss",
             "pattern_correlation_loss",
+            "deterministic_loss",
+            "mae_loss",
+            "extreme_loss",
+            "peak_loss",
+            "quantile_loss",
+            "variance_loss",
+            "spectral_loss",
+            "degradation_loss",
+            "magnitude_loss",
             "total_loss",
         ):
             value = getattr(self, name)
@@ -198,6 +237,8 @@ def masked_loss(
     target: torch.Tensor,
     valid_mask: torch.Tensor | None,
     kind: str = "mse",
+    *,
+    sample_weight: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Masked reduction shared by every refiner.
 
@@ -217,6 +258,9 @@ def masked_loss(
     else:
         raise ConfigValidationError(f"Unsupported refinement.loss.generative {kind!r}")
 
+    if sample_weight is not None:
+        elementwise = elementwise * sample_weight.to(elementwise.dtype)
+
     if valid_mask is None:
         return elementwise.mean()
     mask = valid_mask.to(elementwise.dtype)
@@ -225,7 +269,13 @@ def masked_loss(
 
 
 class ResidualRefiner(nn.Module, abc.ABC):
-    """Base class for all Phase-2 stochastic residual refiners."""
+    """Base class for all Phase-2 stochastic correction refiners.
+
+    ``sample_residual`` and ``deterministic_residual`` remain compatibility
+    names. Their values mean the normalized ``CAMS - Aurora`` correction; the
+    explicit aliases below prevent confusing that correction with a complete
+    field, diffusion epsilon, velocity, or a physical-space tensor.
+    """
 
     #: set by :func:`register_refiner`
     refiner_type: str = "abstract"
@@ -306,6 +356,68 @@ class ResidualRefiner(nn.Module, abc.ABC):
         forecast_lead_time: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Cheapest deterministic (mean-like) residual estimate."""
+    # -- explicit correction API ----------------------------------------
+    def sample_correction_normalized(
+        self,
+        conditioning: torch.Tensor,
+        *,
+        forecast_lead_time: torch.Tensor | None = None,
+        generator: torch.Generator | None = None,
+        num_steps: int | None = None,
+    ) -> torch.Tensor:
+        """Draw the normalized ``CAMS - Aurora`` correction."""
+        return self.sample_residual(
+            conditioning,
+            forecast_lead_time=forecast_lead_time,
+            generator=generator,
+            num_steps=num_steps,
+        )
+
+    def deterministic_mean_correction_normalized(
+        self,
+        conditioning: torch.Tensor,
+        *,
+        forecast_lead_time: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Return the deterministic conditional-mean correction estimate."""
+        return self.deterministic_residual(
+            conditioning, forecast_lead_time=forecast_lead_time
+        )
+
+    def sample_innovation_normalized(
+        self,
+        conditioning: torch.Tensor,
+        *,
+        forecast_lead_time: torch.Tensor | None = None,
+        generator: torch.Generator | None = None,
+        num_steps: int | None = None,
+        mean_correction_normalized: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Draw only the stochastic innovation around the conditional mean.
+
+        Legacy checkpoints model the complete correction distribution. This
+        decomposition exposes the same draw as ``mean + innovation`` without
+        adding parameters or changing checkpoint keys.
+        """
+        mean = (
+            self.deterministic_mean_correction_normalized(
+                conditioning, forecast_lead_time=forecast_lead_time
+            )
+            if mean_correction_normalized is None
+            else mean_correction_normalized
+        )
+        sample = self.sample_correction_normalized(
+            conditioning,
+            forecast_lead_time=forecast_lead_time,
+            generator=generator,
+            num_steps=num_steps,
+        )
+        if sample.shape != mean.shape:
+            raise RuntimeError(
+                "Sampled correction and deterministic mean correction shapes "
+                f"differ: {tuple(sample.shape)} versus {tuple(mean.shape)}."
+            )
+        return sample.float() - mean.float()
 
     # -- shared helpers --------------------------------------------------
     def residual_shape(self, conditioning: torch.Tensor) -> tuple[int, ...]:

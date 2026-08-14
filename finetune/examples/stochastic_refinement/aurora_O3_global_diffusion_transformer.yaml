@@ -9,8 +9,10 @@
 #
 # See docs/STOCHASTIC_REFINEMENT.md for the full schema.
 paths:
-  project_root: .
+  # Preserve the finetune-directory project root used by the source config.
+  project_root: ../..
   data_dir: ../data
+  data_case_name: O3_global_3day_lead
   train_data_path: ../data/train.nc
   val_data_path: ../data/test.nc
   test_data_path: ../data/test.nc
@@ -26,7 +28,7 @@ paths:
 #   <output_dir>/<case_name>/  and  <checkpoint_dir>/<case_name>/
 # resume_from="best"/"last" resolves relative to the case folder, so
 # stages chain naturally when you keep case_name fixed across runs.
-case_name: O3_global_3day_lead
+case_name: O3_global_3day_lead_diffusion_transformer
 
 # Evaluation settings consumed by evaluate_finetuned_cams_rollouts.ipynb.
 # Ground truth, fine-tuned output, result paths, targets, levels, and lead
@@ -309,18 +311,35 @@ model:
   refinement:
     enabled: true
     type: diffusion_transformer
+    correction_convention: cams_minus_aurora_add
     checkpoint: null
     freeze_aurora: true
     joint_finetuning: false
+    # Repository-wide correction contract (including serialization/evaluation):
+    #   correction_target = CAMS - Aurora
+    #   refined_forecast = Aurora + predicted_correction
     train_on_residual: true
     feedback_to_rollout: false   # experimental when true; evaluate separately
     seed: 1234
-    ensemble_size: 10
+    # Pointwise skill (MAE/RMSE/bias) uses the deterministic conditional mean.
+    # For uncertainty experiments set deterministic_inference=false and use
+    # ensemble_size >= 2; never report one stochastic member as the forecast.
+    ensemble_size: 1
+    deterministic_inference: true
 
     target_space:
       use_existing_normalization: true
       residual_space: normalized
-
+      # The residual lives in Aurora's FIELD-normalized space, where its
+      # standard deviation is 0.02-0.06, not 1.0. Diffusion and flow matching
+      # both mix it with unit-variance Gaussian noise, so without this the
+      # signal sits ~30x below the noise floor. Set to 'none' only to reproduce
+      # pre-audit numerics.
+      residual_scaling: per_channel
+      residual_scaling_center: true
+      residual_scaling_momentum: 0.05
+      residual_scaling_warmup_batches: 32
+      residual_scaling_target_std: 1.0
     conditioning:
       aurora_rollout: true
       aurora_input_state: false
@@ -331,25 +350,57 @@ model:
 
     loss:
       generative: mse
+      # --- Forecast-skill terms -------------------------------------------
+      # The generative objective trains a denoiser/velocity field; it does not
+      # train the deterministic estimate the forecast actually emits.
+      # deterministic_weight directly supervises that deployed estimate.
+      # Re-tune every auxiliary weight on an independent validation split.
+      deterministic_weight: 1.0
+      aux_on_deterministic: true   # score the field inference emits, not a noisy draw
+      bias_weight: 1.0             # systematic bias, grouped by variable/level/lead
+      # --- Structure, spread and extremes ----------------------------------
+      # The conditional mean is smooth, so a pure skill objective oversmooths.
+      # These recover spatial structure and tail behaviour.
+      pattern_correlation_weight: 0.5
+      variance_weight: 2.0         # spatial standard-deviation match
+      extreme_weight: 1.0          # quantile-weighted tail error
+      extreme_quantile: 0.95
+      extreme_intensity: 4.0
+      quantile_weight: 1.0         # sorted-value (1-D Wasserstein) PDF match
+      gradient_weight: 0.25
+      # --- Off by default --------------------------------------------------
       reconstruction_weight: 0.0
-      bias_weight: 0.0
-      gradient_weight: 0.0
-      pattern_correlation_weight: 0.0
+      mae_weight: 0.0
+      peak_weight: 0.0
+      spectral_weight: 0.0         # opt in only after case-specific validation
+      degradation_weight: 1.0      # penalize corrections that worsen Aurora
+      magnitude_weight: 0.0
       area_weighted: true
       separate_by_variable: true
       separate_by_level: true
       separate_by_lead_time: true
-
     diffusion:
       training_timesteps: 1000
       inference_steps: 50
-      prediction_type: epsilon
+      # 'sample' (x0), not 'epsilon': it is the only parameterisation for which a
+      # zero-initialised head makes the whole sampler the identity, so an
+      # untrained refiner returns the unchanged Aurora rollout. Under 'epsilon' a
+      # zero prediction telescopes to x_0 = x_T / sqrt(abar_T) and emits a
+      # residual ~35x larger than the correction being learned.
+      prediction_type: sample
       schedule: cosine
       sampler: ddim
       eta: 0.0
       clip_sample: false
       clip_sample_range: 10.0
-
+      snr_weighting: auto          # -> 'none' for x0-prediction, 'min_snr' for epsilon
+      snr_gamma: 5.0
+      # The deterministic query lives at the high-noise end, so auto sampling
+      # concentrates x0 training there while retaining support over all steps.
+      timestep_distribution: auto  # -> 'high_noise' for x0-prediction
+      timestep_bias: 3.0
+      deterministic_estimator: auto  # -> single posterior-mean query for x0-prediction
+      deterministic_training_steps: 4
     transformer:
       patch_size: [8, 8]
       embedding_dim: 256
@@ -357,7 +408,7 @@ model:
       num_blocks: 6
       mlp_ratio: 4.0
       dropout: 0.0
-      positional_encoding: latlon_2d
+      positional_encoding: sincos_2d  # periodic longitude harmonics on global grids
       max_tokens_lat: 256
       max_tokens_lon: 512
       attention_mode: windowed_2d   # global_2d is exact but costly on global grids
@@ -366,6 +417,7 @@ model:
       gradient_checkpointing: true
       optimized_attention: auto
       zero_init_output: true
+      local_refinement: true  # explicit opt-in; legacy-safe schema default is false
 
   mamba_temporal_enabled: false
   mamba_temporal_channels: 16   # per-pixel feature width of the encoder/SSM
@@ -427,11 +479,17 @@ training:
     patience: 3
     min_delta: 1.0e-5
   validation_frequency: 5
+  # Score the same deterministic conditional-mean product used at inference.
+  validation_refinement_ensemble_size: 1
   skip_validation: false
   # Keep model selection disjoint from the held-out test period. A temporal
   # gap equal to the maximum rollout lead is inserted automatically.
   validation_source: train_tail
   validation_fraction: 0.1
+  # Select in physical space: mean(refined RMSE / Aurora RMSE), grouped by
+  # variable, pressure level, and lead. Every target channel must improve.
+  checkpoint_metric: mean_physical_rmse_ratio
+  require_all_physical_channels_improve: true
   require_refinement_improvement: true
   save_best_only: true
   save_last: true

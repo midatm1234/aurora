@@ -50,7 +50,9 @@ from finetune.refinement.checkpoint import migrate_legacy_flow_state_dict
 from finetune.refinement.config import resolve_refinement_config
 from finetune.refinement.packing import ChannelSpec, FieldPacking
 
-_HEAD_PREFIXES = ("surf_flow.", "atmos_flow.", "_res_std__", "temporal.")
+_FLOW_MODULE_PREFIXES = ("surf_flow.", "atmos_flow.")
+_FLOW_HEAD_PREFIXES = (*_FLOW_MODULE_PREFIXES, "_res_std__")
+_HEAD_PREFIXES = (*_FLOW_HEAD_PREFIXES, "temporal.")
 
 #: Tolerances used to declare parity. Both paths execute the *same* modules on
 #: the same inputs, so tensor-valued results are expected to match bitwise
@@ -65,25 +67,32 @@ LOSS_RTOL = 1e-6
 def _load_payload(path: str) -> dict[str, Any]:
     payload = torch.load(path, map_location="cpu", weights_only=False, mmap=True)
     if "heads" in payload:
+        heads = dict(payload["heads"])
+        _require_flow_heads(path, heads)
         return {
-            "heads": dict(payload["heads"]),
+            "heads": heads,
             "config": payload.get("config"),
             "norm_stats": payload.get("norm_stats"),
             "flow_sampling_steps": payload.get("flow_sampling_steps"),
         }
     state = payload.get("model_state_dict", payload)
     heads = {k: v for k, v in state.items() if k.startswith(_HEAD_PREFIXES)}
-    if not heads:
-        raise SystemExit(
-            f"{path!r} does not contain flow-matching refinement heads "
-            "(surf_flow.* / atmos_flow.*)."
-        )
+    _require_flow_heads(path, heads)
     return {
         "heads": {k: v.clone() for k, v in heads.items()},
         "config": payload.get("config"),
         "norm_stats": payload.get("norm_stats"),
         "flow_sampling_steps": payload.get("flow_sampling_steps"),
     }
+
+
+def _require_flow_heads(path: str, heads: Mapping[str, torch.Tensor]) -> None:
+    """Reject temporal-only/statistics-only payloads before building a packing."""
+    if not any(key.startswith(_FLOW_MODULE_PREFIXES) for key in heads):
+        raise SystemExit(
+            f"{path!r} does not contain flow-matching refinement heads "
+            "(surf_flow.* / atmos_flow.*)."
+        )
 
 
 def _head_layout(heads: Mapping[str, torch.Tensor]) -> dict[str, Any]:
@@ -177,8 +186,8 @@ def _build_reference(config: Mapping[str, Any], packing: FieldPacking, heads):
         lon_periodic=packing.lon_periodic,
     )
     missing, unexpected = reference.load_state_dict(dict(heads), strict=False)
-    unexpected = [k for k in unexpected if k.startswith(_HEAD_PREFIXES)]
-    missing = [k for k in missing if k.startswith(_HEAD_PREFIXES)]
+    unexpected = [k for k in unexpected if k.startswith(_FLOW_HEAD_PREFIXES)]
+    missing = [k for k in missing if k.startswith(_FLOW_HEAD_PREFIXES)]
     if missing or unexpected:
         raise SystemExit(
             f"Legacy head weights did not load cleanly: missing={missing[:5]} "
@@ -200,7 +209,12 @@ def _build_adapter(config: Mapping[str, Any], packing: FieldPacking, heads):
         metadata=packing,
     )
     assert refiner is not None
-    migrated, renames = migrate_legacy_flow_state_dict(dict(heads))
+    # This utility compares only the spatial flow head. Optional temporal Mamba
+    # weights are loaded by the production wrapper, not by the bare refiner used
+    # for this isolated migration/parity comparison.
+    migrated, renames = migrate_legacy_flow_state_dict(
+        {key: value for key, value in heads.items() if key.startswith(_FLOW_HEAD_PREFIXES)}
+    )
     stripped = {
         key[len("refiner.") :]: value
         for key, value in migrated.items()

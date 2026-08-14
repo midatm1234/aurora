@@ -6,10 +6,12 @@ Target space, variable/pressure-level packing and forecast-timing contracts.
 from __future__ import annotations
 
 import math
+from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
-from finetune.refinement.integration import LeadStepBuffer
+from finetune.refinement.integration import LeadStepBuffer, build_field_packing
 from finetune.refinement.packing import FieldPacking
 from finetune.refinement.target_space import NormalizedTargetSpace
 
@@ -77,6 +79,48 @@ def test_atmospheric_specs_without_levels_use_the_configured_axis() -> None:
     )
     assert packing.levels_for("go3") == (100.0, 200.0, 300.0)
     assert packing.num_channels == 3
+
+
+def test_field_packing_accepts_numpy_coordinate_sequences() -> None:
+    packing = FieldPacking.from_specs(
+        [DummySpec("gtco3", "gtco3", "surf")],
+        atmos_levels=np.asarray([100.0, 200.0]),
+        lat=np.asarray([52.0, 51.6, 51.2]),
+        lon=np.asarray([232.0, 232.4]),
+        lead_times_hours=np.asarray([12.0, 24.0]),
+    )
+    assert packing.lat == (52.0, 51.6, 51.2)
+    assert packing.lon == (232.0, 232.4)
+    assert packing.lead_times_hours == (12.0, 24.0)
+
+
+def test_configured_packing_matches_aurora_patch_aligned_coordinates() -> None:
+    config = {
+        "model": {"patch_size": 3},
+        "data": {"target_lead_times": [1, 2], "atmos_levels": [100.0]},
+        "rollout": {"rollout_step_hours": 12},
+    }
+    specs = SimpleNamespace(
+        targets=[DummySpec("gtco3", "gtco3", "surf")]
+    )
+    packing = build_field_packing(
+        config,
+        specs,
+        lat=np.linspace(52.0, 31.2, 53),
+        lon=np.linspace(232.0, 259.6, 70),
+        lon_periodic=False,
+    )
+    assert len(packing.lat) == 51
+    assert len(packing.lon) == 69
+
+    with pytest.raises(ValueError, match="Periodic longitude length 70"):
+        build_field_packing(
+            config,
+            specs,
+            lat=np.linspace(90.0, -90.0, 53),
+            lon=np.linspace(0.0, 360.0, 70, endpoint=False),
+            lon_periodic=True,
+        )
 
 
 # --------------------------------------------------------------------------

@@ -50,6 +50,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from finetune.mamba_temporal import PackedMambaTemporalAdapter
 from finetune.refinement.base import ChunkNoiseSource, ResidualRefiner, build_refiner
 from finetune.refinement.config import (
     PerformanceConfig,
@@ -61,7 +62,53 @@ from finetune.refinement.losses import area_weights_from_latitudes
 from finetune.refinement.packing import FieldPacking
 from finetune.refinement.target_space import NormalizedTargetSpace
 
-__all__ = ["AuroraTwoPhaseRefiner", "TwoPhaseStepOutput", "build_two_phase_refiner"]
+__all__ = [
+    "AuroraTwoPhaseRefiner",
+    "TwoPhaseStepOutput",
+    "build_two_phase_refiner",
+    "resolve_temporal_config",
+]
+
+
+_TEMPORAL_DEFAULTS: dict[str, Any] = {
+    "enabled": False,
+    "channels": 16,
+    "state": 8,
+    "layers": 2,
+    "conv": 3,
+    "expand": 2,
+}
+
+
+def resolve_temporal_config(
+    config: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Resolve the legacy-compatible top-level temporal Mamba settings."""
+    model = (config or {}).get("model", {})
+    enabled = model.get("mamba_temporal_enabled", _TEMPORAL_DEFAULTS["enabled"])
+    if not isinstance(enabled, bool):
+        raise ValueError(
+            "model.mamba_temporal_enabled must be true or false, "
+            f"got {enabled!r}."
+        )
+    return {
+        "enabled": enabled,
+        "channels": int(
+            model.get("mamba_temporal_channels", _TEMPORAL_DEFAULTS["channels"])
+        ),
+        "state": int(
+            model.get("mamba_temporal_state", _TEMPORAL_DEFAULTS["state"])
+        ),
+        "layers": int(
+            model.get("mamba_temporal_layers", _TEMPORAL_DEFAULTS["layers"])
+        ),
+        "conv": int(
+            model.get("mamba_temporal_conv", _TEMPORAL_DEFAULTS["conv"])
+        ),
+        "expand": int(
+            model.get("mamba_temporal_expand", _TEMPORAL_DEFAULTS["expand"])
+        ),
+    }
 
 
 @dataclass
@@ -74,27 +121,49 @@ class TwoPhaseStepOutput:
     """
 
     deterministic_normalized: torch.Tensor
-    """Deterministic Aurora rollout in normalized target space, ``[N, C, H, W]``."""
-
+    """Deterministic Aurora rollout in normalized target space."""
+    conditioning: torch.Tensor | None = None
     deterministic_physical: torch.Tensor | None = None
+
+    correction_target_normalized: torch.Tensor | None = None
+    correction_target_physical: torch.Tensor | None = None
+    # Historical alias for correction_target_normalized.
+    residual_target: torch.Tensor | None = None
+
+    predicted_correction_normalized: torch.Tensor | None = None
+    predicted_correction_physical: torch.Tensor | None = None
+    # Historical alias for predicted_correction_normalized.
     residual: torch.Tensor | None = None
-    """Predicted residual in normalized target space (ensemble mean if N > 1)."""
+
+    conditional_mean_correction_normalized: torch.Tensor | None = None
+    conditional_mean_correction_physical: torch.Tensor | None = None
+    deterministic_refined_normalized: torch.Tensor | None = None
+    deterministic_refined_physical: torch.Tensor | None = None
 
     refined_normalized: torch.Tensor | None = None
     refined_physical: torch.Tensor | None = None
     members: torch.Tensor | None = None
-    """Per-member refined physical fields, ``[N, M, C, H, W]`` in draw order."""
-
+    member_corrections_normalized: torch.Tensor | None = None
+    member_corrections_physical: torch.Tensor | None = None
+    member_innovations_normalized: torch.Tensor | None = None
+    member_innovations_physical: torch.Tensor | None = None
+    # Historical alias for member_corrections_normalized.
     member_residuals: torch.Tensor | None = None
     ensemble_mean: torch.Tensor | None = None
     ensemble_spread: torch.Tensor | None = None
-    residual_target: torch.Tensor | None = None
+    constraint_activation_fraction: torch.Tensor | None = None
+
     valid_mask: torch.Tensor | None = None
     process_time: torch.Tensor | None = None
     losses: dict[str, torch.Tensor] = field(default_factory=dict)
+    diagnostics: dict[str, Any] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
-        return {k: v for k, v in self.__dict__.items() if v is not None and v != {}}
+        return {
+            key: value
+            for key, value in self.__dict__.items()
+            if value is not None and not (isinstance(value, dict) and not value)
+        }
 
 
 def _align_to(tensor: torch.Tensor, size: tuple[int, int]) -> torch.Tensor:
@@ -132,6 +201,13 @@ class AuroraTwoPhaseRefiner(nn.Module):
         performance: PerformanceConfig | None = None,
         *,
         nonnegative_variables: Sequence[str] = (),
+        conditioning_static_names: Sequence[str] = (),
+        temporal_enabled: bool = False,
+        temporal_channels: int = 16,
+        temporal_state: int = 8,
+        temporal_layers: int = 2,
+        temporal_conv: int = 3,
+        temporal_expand: int = 2,
     ) -> None:
         super().__init__()
         self.aurora = aurora if aurora is not None else nn.Identity()
@@ -141,7 +217,40 @@ class AuroraTwoPhaseRefiner(nn.Module):
         self.target_space = NormalizedTargetSpace(
             packing, nonnegative_variables=nonnegative_variables
         )
+        self.conditioning_static_names = tuple(
+            dict.fromkeys(str(name) for name in conditioning_static_names)
+        )
         self.refiner: ResidualRefiner | None = None
+        self.temporal_config = {
+            "enabled": bool(temporal_enabled),
+            "channels": int(temporal_channels),
+            "state": int(temporal_state),
+            "layers": int(temporal_layers),
+            "conv": int(temporal_conv),
+            "expand": int(temporal_expand),
+        }
+        if self.temporal_config["enabled"] and not self.refinement_config.is_active:
+            raise ValueError(
+                "model.mamba_temporal_enabled=true requires an active "
+                "model.refinement.type; actual refinement type is 'none'."
+            )
+        for temporal_field in ("channels", "state", "layers", "conv", "expand"):
+            value = self.temporal_config[temporal_field]
+            if value < 1:
+                raise ValueError(
+                    f"model.mamba_temporal_{temporal_field} must be a positive integer, "
+                    f"got {value!r}."
+                )
+        self.temporal: PackedMambaTemporalAdapter | None = None
+        if self.temporal_config["enabled"]:
+            self.temporal = PackedMambaTemporalAdapter(
+                packing,
+                channels=self.temporal_config["channels"],
+                d_state=self.temporal_config["state"],
+                n_layers=self.temporal_config["layers"],
+                d_conv=self.temporal_config["conv"],
+                expand=self.temporal_config["expand"],
+            )
         self._area_weight_cache: dict[tuple[int, torch.device, torch.dtype], torch.Tensor] = {}
         self._apply_aurora_freeze()
 
@@ -169,8 +278,8 @@ class AuroraTwoPhaseRefiner(nn.Module):
     def conditioning_channels(
         self,
         *,
-        static_fields: int = 0,
-        input_state_channels: int = 0,
+        static_fields: int | None = None,
+        input_state_channels: int | None = None,
     ) -> int:
         """Number of packed spatial conditioning channels for this configuration."""
         cond = self.refinement_config.conditioning
@@ -178,9 +287,17 @@ class AuroraTwoPhaseRefiner(nn.Module):
         if cond.aurora_rollout:
             total += self.packing.num_channels
         if cond.aurora_input_state:
-            total += int(input_state_channels or self.packing.num_channels)
+            total += int(
+                self.packing.num_channels
+                if input_state_channels is None
+                else input_state_channels
+            )
         if cond.static_fields:
-            total += int(static_fields)
+            total += int(
+                len(self.conditioning_static_names)
+                if static_fields is None
+                else static_fields
+            )
         if cond.masks:
             total += 1
         return total
@@ -279,6 +396,31 @@ class AuroraTwoPhaseRefiner(nn.Module):
         return self._area_weight_cache[key]
 
     # ------------------------------------------------------------------
+    @staticmethod
+    def _forecast_lead_vector(
+        forecast_lead_time: torch.Tensor | None,
+        *,
+        batch_size: int,
+        device: torch.device,
+    ) -> torch.Tensor | None:
+        if forecast_lead_time is None:
+            return None
+        lead = forecast_lead_time.detach().reshape(-1).to(
+            device=device, dtype=torch.float32
+        )
+        if lead.numel() == 1:
+            lead = lead.expand(batch_size)
+        elif lead.numel() != batch_size:
+            raise ValueError(
+                "forecast_lead_time must contain one value or one value per "
+                f"packed sample; got {lead.numel()} for batch {batch_size}."
+            )
+        if not bool(torch.isfinite(lead).all()) or bool((lead < 0.0).any()):
+            raise ValueError(
+                "forecast_lead_time values must be finite and non-negative."
+            )
+        return lead
+
     # Training
     # ------------------------------------------------------------------
     def training_step(
@@ -307,38 +449,61 @@ class AuroraTwoPhaseRefiner(nn.Module):
                 "training_step() requires an active refinement configuration; use the "
                 "deterministic training path for Aurora-only runs."
             )
-        rollout = rollout_normalized.detach()
+        rollout = rollout_normalized.detach().float()
+        target = target_normalized.float()
         if conditioning is None:
             conditioning = self.build_conditioning(
                 rollout,
                 input_state_normalized=input_state_normalized,
                 static_fields=static_fields,
             )
+        forecast_lead_time = self._forecast_lead_vector(
+            forecast_lead_time,
+            batch_size=conditioning.shape[0],
+            device=conditioning.device,
+        )
         self.initialize_refiner(conditioning.shape[1])
         assert self.refiner is not None
 
-        if self.refinement_config.train_on_residual:
-            residual_target, valid = self.target_space.residual_target_from_normalized(
-                target_normalized, rollout, valid_mask=valid_mask
+        correction_target, valid = (
+            self.target_space.correction_target_from_normalized(
+                target, rollout, valid_mask=valid_mask
             )
+        )
+        if self.refinement_config.train_on_residual:
+            process_target = correction_target
         else:
-            valid = torch.isfinite(target_normalized)
-            if valid_mask is not None:
-                valid = valid & valid_mask.to(device=valid.device, dtype=torch.bool)
-            residual_target = torch.where(
-                valid, target_normalized, torch.zeros_like(target_normalized)
+            # Deprecated whole-field checkpoints keep their historical training
+            # target, while all public semantics still expose CAMS - Aurora.
+            process_target = torch.where(
+                valid, target, torch.zeros_like(target)
             )
 
         result = self.refiner.compute_training_loss(
-            residual_target.to(conditioning.dtype),
+            process_target,
             conditioning,
             forecast_lead_time=forecast_lead_time,
             mask=valid,
             generator=generator,
             lead_index=lead_index,
-            area_weight=self.area_weight(rollout.shape[-2], rollout.device, torch.float32),
+            area_weight=self.area_weight(
+                rollout.shape[-2], rollout.device, torch.float32
+            ),
             rollout_normalized=rollout,
         )
+        estimated_process_target = result.predicted_correction_normalized
+        estimated_correction = None
+        estimated_correction_physical = None
+        if estimated_process_target is not None:
+            estimated_correction = (
+                estimated_process_target
+                if self.refinement_config.train_on_residual
+                else estimated_process_target - rollout
+            )
+            estimated_correction_physical = self.target_space.correction_to_physical(
+                estimated_correction
+            )
+
         losses = {
             name: value
             for name, value in (
@@ -347,17 +512,261 @@ class AuroraTwoPhaseRefiner(nn.Module):
                 ("bias_loss", result.bias_loss),
                 ("gradient_loss", result.gradient_loss),
                 ("pattern_correlation_loss", result.pattern_correlation_loss),
+                ("deterministic_loss", result.deterministic_loss),
+                ("mae_loss", result.mae_loss),
+                ("extreme_loss", result.extreme_loss),
+                ("peak_loss", result.peak_loss),
+                ("quantile_loss", result.quantile_loss),
+                ("variance_loss", result.variance_loss),
+                ("spectral_loss", result.spectral_loss),
+                ("degradation_loss", result.degradation_loss),
+                ("magnitude_loss", result.magnitude_loss),
                 ("total_loss", result.total_loss),
             )
             if value is not None
         }
         return TwoPhaseStepOutput(
             deterministic_normalized=rollout,
-            residual_target=residual_target,
+            deterministic_physical=self.target_space.decode(rollout),
+            correction_target_normalized=correction_target,
+            correction_target_physical=self.target_space.correction_to_physical(
+                correction_target
+            ),
+            residual_target=correction_target,
+            predicted_correction_normalized=estimated_correction,
+            predicted_correction_physical=estimated_correction_physical,
+            residual=estimated_correction,
             valid_mask=valid,
+            conditioning=conditioning,
             process_time=result.process_time,
             losses=losses,
         )
+
+    @property
+    def has_temporal(self) -> bool:
+        """Whether an eagerly registered packed temporal corrector is active."""
+        return self.temporal is not None
+
+    @staticmethod
+    def lead_major_to_sequence(
+        tensor: torch.Tensor,
+        lead_index: torch.Tensor,
+        *,
+        field_name: str = "tensor",
+    ) -> torch.Tensor:
+        """Unfold lead-major folded batches into [batch, lead, ...]."""
+        if tensor.ndim < 1:
+            raise ValueError(
+                f"{field_name} must have a leading folded batch dimension, "
+                f"got shape {tuple(tensor.shape)}."
+            )
+        index = lead_index.reshape(-1).to(device=tensor.device, dtype=torch.long)
+        if index.numel() != tensor.shape[0]:
+            raise ValueError(
+                f"{field_name} leading dimension is {tensor.shape[0]}, but "
+                f"lead_index contains {index.numel()} values."
+            )
+        unique, counts = torch.unique_consecutive(index, return_counts=True)
+        expected = torch.arange(unique.numel(), device=index.device)
+        if unique.numel() < 2:
+            raise ValueError(
+                f"{field_name} temporal sequence requires at least 2 ordered "
+                f"lead indices, got {unique.tolist()}."
+            )
+        if not torch.equal(unique, expected):
+            raise ValueError(
+                f"{field_name} lead_index must be lead-major contiguous indices "
+                f"[0, ..., S-1], got {unique.tolist()}."
+            )
+        if not torch.all(counts == counts[0]):
+            raise ValueError(
+                f"{field_name} must contain the same batch size for every lead; "
+                f"got per-lead counts {counts.tolist()}."
+            )
+        steps = int(unique.numel())
+        batch = int(counts[0])
+        return (
+            tensor.reshape(steps, batch, *tensor.shape[1:])
+            .transpose(0, 1)
+            .contiguous()
+        )
+
+    def temporal_training_loss(
+        self,
+        rollout_normalized: torch.Tensor,
+        target_normalized: torch.Tensor,
+        *,
+        valid_mask: torch.Tensor,
+        forecast_lead_time: torch.Tensor | None,
+        lead_index: torch.Tensor,
+        conditioning: torch.Tensor | None = None,
+        generator: torch.Generator | None = None,
+        num_steps: int | None = None,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Masked cross-lead loss on target-independent spatial refinements.
+
+        The spatial refiner is evaluated without gradients and detached, so
+        this loss updates only Mamba. It never reuses the diffusion training
+        denoised estimate, whose noised input contains target data.
+        """
+        if self.temporal is None:
+            raise RuntimeError(
+                "temporal_training_loss() requires "
+                "model.mamba_temporal_enabled=true."
+            )
+        if target_normalized.shape != rollout_normalized.shape:
+            raise ValueError(
+                "target_normalized shape must match rollout_normalized for "
+                f"temporal training; expected {tuple(rollout_normalized.shape)}, "
+                f"got {tuple(target_normalized.shape)}."
+            )
+        if valid_mask.shape != rollout_normalized.shape:
+            raise ValueError(
+                "valid_mask shape must match rollout_normalized for temporal "
+                f"training; expected {tuple(rollout_normalized.shape)}, got "
+                f"{tuple(valid_mask.shape)}."
+            )
+        rollout = rollout_normalized.detach()
+        with torch.no_grad():
+            if conditioning is None:
+                conditioning = self.build_conditioning(rollout)
+            else:
+                conditioning = conditioning.detach()
+                if conditioning.ndim != 4:
+                    raise ValueError(
+                        "conditioning must have shape [folded_batch, channel, "
+                        f"latitude, longitude], got {tuple(conditioning.shape)}."
+                    )
+                expected = (
+                    rollout.shape[0],
+                    rollout.shape[-2],
+                    rollout.shape[-1],
+                )
+                actual = (
+                    conditioning.shape[0],
+                    conditioning.shape[-2],
+                    conditioning.shape[-1],
+                )
+                if actual != expected:
+                    raise ValueError(
+                        "conditioning batch/spatial dimensions must match "
+                        f"rollout_normalized; expected {expected}, got {actual}."
+                    )
+                if conditioning.device != rollout.device:
+                    raise ValueError(
+                        "conditioning must be on the same device as "
+                        f"rollout_normalized; expected {rollout.device}, got "
+                        f"{conditioning.device}."
+                    )
+            forecast_lead_time = self._forecast_lead_vector(
+                forecast_lead_time,
+                batch_size=conditioning.shape[0],
+                device=conditioning.device,
+            )
+            self.initialize_refiner(conditioning.shape[1])
+            assert self.refiner is not None
+            # Disable stochastic layers only on the spatial networks. Calling
+            # refiner.eval() recursively also switches ResidualScaler to
+            # inference mode, where an intentionally uncalibrated training
+            # smoke batch must fail. Production validation still requires the
+            # scaler to have been fitted and frozen.
+            inference_modules = [
+                module
+                for module in (
+                    getattr(self.refiner, "net", None),
+                    getattr(self.refiner, "mean_net", None),
+                    getattr(self.refiner, "legacy", None),
+                )
+                if isinstance(module, nn.Module)
+            ]
+            training_modes = [module.training for module in inference_modules]
+            try:
+                for module in inference_modules:
+                    module.eval()
+                # Train temporal Mamba on the same spatial-refiner distribution
+                # it receives during rollout inference.
+                if self.refinement_config.deterministic_inference:
+                    model_output = self.refiner.deterministic_residual(
+                        conditioning, forecast_lead_time=forecast_lead_time
+                    )
+                else:
+                    model_output = self.refiner.sample_residual(
+                        conditioning,
+                        forecast_lead_time=forecast_lead_time,
+                        generator=generator,
+                        num_steps=num_steps,
+                    )
+            finally:
+                for module, was_training in zip(
+                    inference_modules, training_modes
+                ):
+                    module.train(was_training)
+            base_refined = (
+                rollout + model_output
+                if self.refinement_config.train_on_residual
+                else model_output
+            ).detach()
+
+        sequence = self.lead_major_to_sequence(
+            base_refined, lead_index, field_name="base_refined"
+        )
+        target_sequence = self.lead_major_to_sequence(
+            target_normalized.detach(), lead_index, field_name="target_normalized"
+        )
+        mask_sequence = self.lead_major_to_sequence(
+            valid_mask.to(dtype=torch.bool), lead_index, field_name="valid_mask"
+        )
+        finite_base = torch.isfinite(sequence)
+        corrected = self.temporal.corrected_sequence(sequence)
+        valid = (
+            mask_sequence
+            & finite_base
+            & torch.isfinite(target_sequence)
+            & torch.isfinite(corrected)
+        )
+        if not bool(valid.any()):
+            raise ValueError(
+                "valid_mask contains zero finite cells across the temporal "
+                f"sequence with shape {tuple(valid.shape)}."
+            )
+        safe_corrected = torch.where(
+            valid, corrected.float(), torch.zeros_like(corrected, dtype=torch.float32)
+        )
+        safe_target = torch.where(
+            valid,
+            target_sequence.float(),
+            torch.zeros_like(target_sequence, dtype=torch.float32),
+        )
+        squared = (safe_corrected - safe_target).pow(2)
+
+        diagnostics: dict[str, torch.Tensor] = {}
+        variable_losses: list[torch.Tensor] = []
+        for name in self.packing.variables:
+            indices = [
+                spec.index
+                for spec in self.packing.channels
+                if spec.aurora_name == name
+            ]
+            var_valid = valid[:, :, indices]
+            var_squared = squared[:, :, indices]
+            var_count = var_valid.sum()
+            if int(var_count.detach()) == 0:
+                continue
+            var_denom = var_count.to(var_squared.dtype)
+            var_loss = (
+                var_squared * var_valid.to(var_squared.dtype)
+            ).sum() / var_denom
+            diagnostics[f"temporal_loss/{name}"] = var_loss
+            variable_losses.append(var_loss)
+        if not variable_losses:
+            raise ValueError(
+                "No configured target variable has a finite valid cell for the "
+                "temporal loss."
+            )
+        # Match the legacy flow-Mamba contract: each target variable contributes
+        # equally, regardless of how many atmospheric levels it packs.
+        loss = torch.stack(variable_losses).mean()
+        return loss, diagnostics
 
     # ------------------------------------------------------------------
     # Inference
@@ -378,13 +787,14 @@ class AuroraTwoPhaseRefiner(nn.Module):
         return_members: bool = True,
         chunk_size: int | None = None,
         num_steps: int | None = None,
+        temporal_history: list[torch.Tensor] | None = None,
     ) -> TwoPhaseStepOutput:
         """Deterministic plus (optionally) refined ensemble inference.
 
         The deterministic rollout is always returned unchanged; refinement only
         adds fields.
         """
-        rollout = rollout_normalized
+        rollout = rollout_normalized.float()
         out = TwoPhaseStepOutput(
             deterministic_normalized=rollout,
             deterministic_physical=self.target_space.decode(rollout),
@@ -397,127 +807,368 @@ class AuroraTwoPhaseRefiner(nn.Module):
                 input_state_normalized=input_state_normalized,
                 static_fields=static_fields,
             )
+        forecast_lead_time = self._forecast_lead_vector(
+            forecast_lead_time,
+            batch_size=conditioning.shape[0],
+            device=conditioning.device,
+        )
         self.initialize_refiner(conditioning.shape[1])
         assert self.refiner is not None
 
+        # The systematic correction is always produced by the separately
+        # supervised conditional-mean head. Stochastic members add innovations
+        # around this stable field; no arbitrary draw is used as bias correction.
+        mean_process_output = self._deterministic_mean_process(
+            conditioning, rollout, forecast_lead_time
+        ).float()
+        conditional_mean_correction = (
+            mean_process_output
+            if self.refinement_config.train_on_residual
+            else mean_process_output - rollout
+        ).float()
+        (
+            deterministic_refined_normalized,
+            deterministic_refined_physical,
+        ) = self.target_space.apply_correction(
+            rollout,
+            conditional_mean_correction,
+            target_mask=target_mask,
+        )
+
         n = int(
-            ensemble_size if ensemble_size is not None else self.refinement_config.ensemble_size
+            ensemble_size
+            if ensemble_size is not None
+            else self.refinement_config.ensemble_size
         )
         if n < 1:
             return out
 
-        if generator is None:
-            seed_value = seed if seed is not None else self.refinement_config.seed
-            if seed_value is not None:
-                generator = torch.Generator(device=conditioning.device)
-                generator.manual_seed(int(seed_value))
-
-        perf = self.performance_config.ensemble
-        if chunk_size is None:
-            chunk_size = (
-                perf.chunk_size if perf.chunk_size is not None else (n if perf.batch_members else 1)
-            )
-        chunk_size = max(1, min(int(chunk_size), n))
-
-        # Each member gets its own generator seeded from the caller's generator,
-        # so member m sees the same noise sequence regardless of chunking. This
-        # makes serial and batched ensemble generation bitwise identical.
-        gen_device = generator.device if generator is not None else conditioning.device
-        if generator is not None:
-            member_seeds = torch.randint(
-                0, 2**62, (n,), generator=generator, device=gen_device, dtype=torch.int64
-            ).tolist()
-        else:
-            member_seeds = torch.randint(0, 2**62, (n,), dtype=torch.int64).tolist()
-        member_generators = []
-        for member_seed in member_seeds:
-            g = torch.Generator(device=gen_device)
-            g.manual_seed(int(member_seed))
-            member_generators.append(g)
-
         batch = conditioning.shape[0]
-        residuals: list[torch.Tensor] = []
-        drawn = 0
-        while drawn < n:
-            members = min(chunk_size, n - drawn)
-            source = ChunkNoiseSource(member_generators[drawn : drawn + members], batch)
-            if members == 1:
-                with self.refiner.use_noise_source(source):
-                    res = self._sample(conditioning, rollout, forecast_lead_time, num_steps)
-                residuals.append(res.unsqueeze(1))
-            else:
-                cond_rep = conditioning.repeat_interleave(members, dim=0)
-                rollout_rep = rollout.repeat_interleave(members, dim=0)
-                lead_rep = (
-                    forecast_lead_time.repeat_interleave(members, dim=0)
-                    if forecast_lead_time is not None
-                    else None
+        if self.refinement_config.deterministic_inference:
+            member_innovations = torch.zeros_like(mean_process_output).unsqueeze(1).expand(
+                -1, n, -1, -1, -1
+            ).clone()
+        else:
+            if generator is None:
+                seed_value = (
+                    seed if seed is not None else self.refinement_config.seed
                 )
-                with self.refiner.use_noise_source(source):
-                    res = self._sample(cond_rep, rollout_rep, lead_rep, num_steps)
-                res = res.reshape(batch, members, *res.shape[1:])
-                residuals.append(res)
-            drawn += members
+                if seed_value is not None:
+                    generator = torch.Generator(device=conditioning.device)
+                    generator.manual_seed(int(seed_value))
 
-        member_residuals = torch.cat(residuals, dim=1)  # [N, M, C, H, W]
-        member_fields = []
-        for idx in range(n):
-            _, refined_physical = self.target_space.reconstruct(
-                rollout,
-                member_residuals[:, idx].to(rollout.dtype),
-                target_mask=target_mask,
+            perf = self.performance_config.ensemble
+            if chunk_size is None:
+                chunk_size = (
+                    perf.chunk_size
+                    if perf.chunk_size is not None
+                    else (n if perf.batch_members else 1)
+                )
+            chunk_size = max(1, min(int(chunk_size), n))
+
+            # Dedicated member generators keep serial and chunked draws identical.
+            gen_device = (
+                generator.device
+                if generator is not None
+                else conditioning.device
             )
-            member_fields.append(refined_physical.unsqueeze(1))
-        members_physical = torch.cat(member_fields, dim=1)
+            if generator is not None:
+                member_seeds = torch.randint(
+                    0,
+                    2**62,
+                    (n,),
+                    generator=generator,
+                    device=gen_device,
+                    dtype=torch.int64,
+                ).tolist()
+            else:
+                member_seeds = torch.randint(
+                    0, 2**62, (n,), dtype=torch.int64
+                ).tolist()
+            member_generators = []
+            for member_seed in member_seeds:
+                member_generator = torch.Generator(device=gen_device)
+                member_generator.manual_seed(int(member_seed))
+                member_generators.append(member_generator)
 
-        # Ensemble statistics are accumulated in float32 regardless of the
-        # compute dtype so mixed precision cannot bias the mean or the spread.
-        # Masked cells (NaN) are excluded rather than poisoning every member.
+            sampled_innovations: list[torch.Tensor] = []
+            drawn = 0
+            while drawn < n:
+                member_count = min(chunk_size, n - drawn)
+                source = ChunkNoiseSource(
+                    member_generators[drawn : drawn + member_count], batch
+                )
+                if member_count == 1:
+                    with self.refiner.use_noise_source(source):
+                        innovation = self._sample_innovation(
+                            conditioning,
+                            rollout,
+                            forecast_lead_time,
+                            num_steps,
+                            mean_process_output,
+                        )
+                    sampled_innovations.append(innovation.float().unsqueeze(1))
+                else:
+                    cond_rep = conditioning.repeat_interleave(
+                        member_count, dim=0
+                    )
+                    rollout_rep = rollout.repeat_interleave(
+                        member_count, dim=0
+                    )
+                    lead_rep = (
+                        forecast_lead_time.repeat_interleave(
+                            member_count, dim=0
+                        )
+                        if forecast_lead_time is not None
+                        else None
+                    )
+                    mean_rep = mean_process_output.repeat_interleave(
+                        member_count, dim=0
+                    )
+                    with self.refiner.use_noise_source(source):
+                        innovation = self._sample_innovation(
+                            cond_rep,
+                            rollout_rep,
+                            lead_rep,
+                            num_steps,
+                            mean_rep,
+                        )
+                    innovation = innovation.float().reshape(
+                        batch, member_count, *innovation.shape[1:]
+                    )
+                    sampled_innovations.append(innovation)
+                drawn += member_count
+            member_innovations = torch.cat(sampled_innovations, dim=1)
+
+        member_corrections = (
+            conditional_mean_correction.unsqueeze(1) + member_innovations
+        )
+        member_normalized = rollout.unsqueeze(1) + member_corrections
+        if self.temporal is not None:
+            history = temporal_history if temporal_history is not None else []
+            expected_shape = tuple(member_normalized.shape)
+            for history_index, frame in enumerate(history):
+                if tuple(frame.shape) != expected_shape:
+                    raise ValueError(
+                        "Temporal ensemble history shape mismatch at index "
+                        f"{history_index}: expected {expected_shape}, got "
+                        f"{tuple(frame.shape)}."
+                    )
+                if frame.device != member_normalized.device:
+                    raise ValueError(
+                        "Temporal ensemble history device mismatch at index "
+                        f"{history_index}: expected {member_normalized.device}, "
+                        f"got {frame.device}."
+                    )
+                if frame.dtype != member_normalized.dtype:
+                    raise ValueError(
+                        "Temporal ensemble history dtype mismatch at index "
+                        f"{history_index}: expected {member_normalized.dtype}, "
+                        f"got {frame.dtype}."
+                    )
+            current_raw = member_normalized.detach()
+            temporal_sequence = torch.stack([*history, current_raw], dim=2)
+            batch_size, members, steps, channels, height, width = (
+                temporal_sequence.shape
+            )
+            temporal_correction = self.temporal.causal_residual(
+                temporal_sequence.reshape(
+                    batch_size * members, steps, channels, height, width
+                )
+            ).reshape(batch_size, members, channels, height, width).float()
+            member_normalized = member_normalized.float() + temporal_correction
+            member_corrections = member_normalized - rollout.unsqueeze(1)
+            member_innovations = (
+                member_corrections
+                - conditional_mean_correction.unsqueeze(1)
+            )
+            history.append(current_raw)
+            if self.refinement_config.deterministic_inference:
+                conditional_mean_correction = member_corrections[:, 0]
+                member_innovations = (
+                    member_corrections
+                    - conditional_mean_correction.unsqueeze(1)
+                )
+                (
+                    deterministic_refined_normalized,
+                    deterministic_refined_physical,
+                ) = self.target_space.apply_correction(
+                    rollout,
+                    conditional_mean_correction,
+                    target_mask=target_mask,
+                )
+        conditional_mean_source = "supervised_mean_head"
+        flat_shape = (
+            batch * n,
+            member_corrections.shape[2],
+            member_corrections.shape[3],
+            member_corrections.shape[4],
+        )
+        member_corrections_physical = (
+            self.target_space.correction_to_physical(
+                member_corrections.reshape(flat_shape)
+            ).reshape_as(member_corrections)
+        )
+        member_innovations_physical = (
+            self.target_space.correction_to_physical(
+                member_innovations.reshape(flat_shape)
+            ).reshape_as(member_innovations)
+        )
+
+        member_fields: list[torch.Tensor] = []
+        constraint_masks: list[torch.Tensor] = []
+        for member_index in range(n):
+            _, unconstrained = self.target_space.apply_correction(
+                rollout,
+                member_corrections[:, member_index],
+                target_mask=None,
+                apply_constraints=False,
+            )
+            constraint_masks.append(
+                self.target_space.physical_constraint_mask(
+                    unconstrained
+                ).unsqueeze(1)
+            )
+            _, constrained = self.target_space.apply_correction(
+                rollout,
+                member_corrections[:, member_index],
+                target_mask=target_mask,
+                apply_constraints=True,
+            )
+            member_fields.append(constrained.unsqueeze(1))
+        members_physical = torch.cat(member_fields, dim=1)
+        changed = torch.cat(constraint_masks, dim=1)
+        changed_per_channel = changed.sum(dim=(0, 1, 3, 4)).float()
+        total_per_channel = torch.full_like(
+            changed_per_channel,
+            float(batch * n * rollout.shape[-2] * rollout.shape[-1]),
+        )
+        constraint_fraction = changed_per_channel / total_per_channel.clamp(min=1)
+
         stack32 = members_physical.float()
         valid = torch.isfinite(stack32)
         counts = valid.sum(dim=1)
         filled = torch.where(valid, stack32, torch.zeros_like(stack32))
-        mean32 = filled.sum(dim=1) / counts.clamp(min=1)
-        mean32 = torch.where(counts > 0, mean32, torch.full_like(mean32, float("nan")))
-        ensemble_mean = mean32.to(members_physical.dtype)
+        ensemble_mean = filled.sum(dim=1) / counts.clamp(min=1)
+        ensemble_mean = torch.where(
+            counts > 0,
+            ensemble_mean,
+            torch.full_like(ensemble_mean, float("nan")),
+        )
         spread = None
         if n > 1:
             deviations = torch.where(
-                valid, stack32 - mean32.unsqueeze(1), torch.zeros_like(stack32)
+                valid,
+                stack32 - ensemble_mean.unsqueeze(1),
+                torch.zeros_like(stack32),
             )
-            var = deviations.pow(2).sum(dim=1) / (counts - 1).clamp(min=1)
-            var = torch.where(counts > 1, var, torch.full_like(var, float("nan")))
-            spread = var.sqrt().to(members_physical.dtype)
+            variance = deviations.square().sum(dim=1) / (counts - 1).clamp(min=1)
+            variance = torch.where(
+                counts > 1,
+                variance,
+                torch.full_like(variance, float("nan")),
+            )
+            spread = variance.sqrt()
 
-        mean_residual = member_residuals.float().mean(dim=1).to(rollout.dtype)
-        refined_norm, refined_physical = self.target_space.reconstruct(
-            rollout, mean_residual, target_mask=target_mask
+        predicted_correction = member_corrections.mean(dim=1)
+        predicted_correction_physical = (
+            self.target_space.correction_to_physical(predicted_correction)
+        )
+        refined_normalized, refined_physical = (
+            self.target_space.apply_correction(
+                rollout,
+                predicted_correction,
+                target_mask=target_mask,
+            )
         )
 
         out.members = members_physical if return_members else None
-        out.member_residuals = member_residuals if return_members else None
+        out.member_corrections_normalized = (
+            member_corrections if return_members else None
+        )
+        out.member_corrections_physical = (
+            member_corrections_physical if return_members else None
+        )
+        out.member_innovations_normalized = (
+            member_innovations if return_members else None
+        )
+        out.member_innovations_physical = (
+            member_innovations_physical if return_members else None
+        )
+        out.member_residuals = member_corrections if return_members else None
         out.ensemble_mean = ensemble_mean
         out.ensemble_spread = spread
-        out.residual = mean_residual
-        out.refined_normalized = refined_norm
-        out.refined_physical = ensemble_mean if n > 1 else members_physical[:, 0]
+        out.predicted_correction_normalized = predicted_correction
+        out.predicted_correction_physical = predicted_correction_physical
+        out.residual = predicted_correction
+        out.refined_normalized = refined_normalized
+        # The primary field now corresponds exactly to the reported mean
+        # correction; constraints are applied once after ensemble averaging.
+        out.refined_physical = refined_physical
+        out.conditional_mean_correction_normalized = conditional_mean_correction
+        out.conditional_mean_correction_physical = (
+            self.target_space.correction_to_physical(
+                conditional_mean_correction
+            )
+        )
+        out.deterministic_refined_normalized = deterministic_refined_normalized
+        out.deterministic_refined_physical = deterministic_refined_physical
+        out.constraint_activation_fraction = constraint_fraction
+        out.diagnostics["constraint_activation_fraction"] = changed.float().mean()
+        out.diagnostics["conditional_mean_source"] = conditional_mean_source
+        out.diagnostics["constraint_activation_fraction_per_channel"] = (
+            constraint_fraction
+        )
         return out
 
-    def _sample(
+    def _deterministic_mean_process(
+        self,
+        conditioning: torch.Tensor,
+        rollout: torch.Tensor,
+        forecast_lead_time: torch.Tensor | None,
+    ) -> torch.Tensor:
+        assert self.refiner is not None
+        if self.refinement_config.is_legacy_flow_matching:
+            return self.refiner.deterministic_residual(
+                conditioning,
+                forecast_lead_time=forecast_lead_time,
+                rollout_normalized=rollout,
+            )
+        return self.refiner.deterministic_mean_correction_normalized(
+            conditioning, forecast_lead_time=forecast_lead_time
+        )
+
+    def _sample_innovation(
         self,
         conditioning: torch.Tensor,
         rollout: torch.Tensor,
         forecast_lead_time: torch.Tensor | None,
         num_steps: int | None,
+        mean_process_output: torch.Tensor,
     ) -> torch.Tensor:
         assert self.refiner is not None
+        if self.refinement_config.is_legacy_flow_matching:
+            sample = self.refiner.sample_residual(
+                conditioning,
+                forecast_lead_time=forecast_lead_time,
+                num_steps=num_steps,
+                rollout_normalized=rollout,
+            )
+            if sample.shape != mean_process_output.shape:
+                raise RuntimeError(
+                    "Legacy flow correction sample and deterministic mean have "
+                    f"different shapes: {tuple(sample.shape)} and "
+                    f"{tuple(mean_process_output.shape)}."
+                )
+            return sample.float() - mean_process_output.float()
         kwargs: dict[str, Any] = {
             "forecast_lead_time": forecast_lead_time,
             "num_steps": num_steps,
+            "mean_correction_normalized": mean_process_output,
         }
-        if self.refinement_config.is_legacy_flow_matching:
-            kwargs["rollout_normalized"] = rollout
-        return self.refiner.sample_residual(conditioning, **kwargs)
+        return self.refiner.sample_innovation_normalized(
+            conditioning, **kwargs
+        )
 
     # ------------------------------------------------------------------
     # Aurora (Phase-1) delegation
@@ -555,6 +1206,13 @@ class AuroraTwoPhaseRefiner(nn.Module):
     def refine_parameter_count(self) -> int:
         return 0 if self.refiner is None else sum(p.numel() for p in self.refiner.parameters())
 
+    def temporal_parameter_count(self) -> int:
+        return (
+            0
+            if self.temporal is None
+            else sum(p.numel() for p in self.temporal.parameters())
+        )
+
     def forward(self, batch, forecast_lead_time_hours: float | torch.Tensor | None = None):
         """Deterministic Aurora prediction, refined at inference time only.
 
@@ -573,6 +1231,7 @@ class AuroraTwoPhaseRefiner(nn.Module):
         return refine_batch_prediction(
             self,
             pred,
+            aurora_input_batch=batch,
             forecast_lead_time_hours=forecast_lead_time_hours,
             ensemble_size=1,
             seed=self.refinement_config.seed,
@@ -582,19 +1241,27 @@ class AuroraTwoPhaseRefiner(nn.Module):
     # Introspection
     # ------------------------------------------------------------------
     def trainable_parameters(self) -> list[nn.Parameter]:
-        if self.refiner is None or not self.refinement_config.freeze_aurora:
+        if not self.refinement_config.freeze_aurora:
             return [p for p in self.parameters() if p.requires_grad]
-        return [p for p in self.refiner.parameters() if p.requires_grad]
+        phase_two: list[nn.Parameter] = []
+        if self.refiner is not None:
+            phase_two.extend(p for p in self.refiner.parameters() if p.requires_grad)
+        if self.temporal is not None:
+            phase_two.extend(p for p in self.temporal.parameters() if p.requires_grad)
+        return phase_two
 
     def describe(self) -> dict[str, Any]:
         return {
             "refinement": self.refinement_config.to_dict(),
+            "temporal": dict(self.temporal_config),
             "performance": self.performance_config.to_dict(),
             "aurora_frozen": self.aurora_frozen,
             "aurora_parameters": sum(p.numel() for p in self.aurora.parameters()),
             "refiner_parameters": (
                 sum(p.numel() for p in self.refiner.parameters()) if self.refiner is not None else 0
             ),
+            "temporal_parameters": self.temporal_parameter_count(),
+            "conditioning_static_names": list(self.conditioning_static_names),
             "field_packing": self.packing.to_dict(),
         }
 
@@ -605,10 +1272,12 @@ def build_two_phase_refiner(
     config: Mapping[str, Any] | None,
     *,
     nonnegative_variables: Sequence[str] = (),
+    conditioning_static_names: Sequence[str] = (),
 ) -> AuroraTwoPhaseRefiner:
     """Build the wrapper from a raw experiment configuration."""
     refinement = resolve_refinement_config(config)
     performance = resolve_performance_config(config)
+    temporal = resolve_temporal_config(config)
     if refinement.feedback_to_rollout:
         warnings.warn(
             "refinement.feedback_to_rollout is enabled: this experimental path changes "
@@ -623,4 +1292,11 @@ def build_two_phase_refiner(
         refinement=refinement,
         performance=performance,
         nonnegative_variables=nonnegative_variables,
+        conditioning_static_names=conditioning_static_names,
+        temporal_enabled=temporal["enabled"],
+        temporal_channels=temporal["channels"],
+        temporal_state=temporal["state"],
+        temporal_layers=temporal["layers"],
+        temporal_conv=temporal["conv"],
+        temporal_expand=temporal["expand"],
     )

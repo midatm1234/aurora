@@ -348,6 +348,7 @@ def test_precision_change_warns() -> None:
     [
         ("aurora_O3_global_rollout_no_refinement.yaml", "none"),
         ("aurora_O3_global_flow_matching_unet.yaml", "flow_matching_unet"),
+        ("aurora_O3_global_flow_matching_conv_unet.yaml", "flow_matching_conv_unet"),
         ("aurora_O3_global_flow_matching_transformer.yaml", "flow_matching_transformer"),
         ("aurora_O3_global_diffusion_unet.yaml", "diffusion_unet"),
         ("aurora_O3_global_diffusion_transformer.yaml", "diffusion_transformer"),
@@ -363,3 +364,61 @@ def test_example_configurations(name: str, expected: str) -> None:
     assert cfg.type == expected
     # Refinement is postprocessing by default in every shipped example.
     assert cfg.feedback_to_rollout is False
+
+
+_SAFE_UNIFIED_EXAMPLES = (
+    "aurora_O3_global_flow_matching_conv_unet.yaml",
+    "aurora_O3_global_flow_matching_transformer.yaml",
+    "aurora_O3_global_diffusion_unet.yaml",
+    "aurora_O3_global_diffusion_transformer.yaml",
+)
+
+
+@pytest.mark.parametrize("name", _SAFE_UNIFIED_EXAMPLES)
+def test_unified_examples_ship_a_safe_correction_product(name: str) -> None:
+    path = f"{EXAMPLE_DIR}/{name}"
+    with open(path) as handle:
+        text = handle.read()
+    raw = yaml.safe_load(text)
+    cfg = resolve_refinement_config(raw)
+
+    # The equations are intentionally present beside the machine-readable flag:
+    # this prevents an ambiguous `residual` label from reversing the correction.
+    assert "correction_target = CAMS - Aurora" in text
+    assert "refined_forecast = Aurora + predicted_correction" in text
+    assert cfg.train_on_residual is True
+    assert cfg.feedback_to_rollout is False
+
+    # A deterministic conditional mean is the default forecast product. A
+    # stochastic product must be an actual ensemble, never one arbitrary draw.
+    assert cfg.deterministic_inference is True
+    assert cfg.ensemble_size == 1
+    assert cfg.deterministic_inference or cfg.ensemble_size >= 2
+
+    assert cfg.target_space.residual_scaling == "per_channel"
+    assert cfg.target_space.residual_scaling_center is True
+    assert cfg.loss.deterministic_weight > 0.0
+    assert cfg.loss.aux_on_deterministic is True
+    assert cfg.loss.bias_weight > 0.0
+    assert cfg.loss.degradation_weight > 0.0
+
+    model = raw["model"]
+    training = raw["training"]
+    assert model["mamba_temporal_enabled"] is False
+    assert training["mamba_temporal_weight"] == 0.0
+    assert training["validation_refinement_ensemble_size"] == 1
+    assert training["validation_source"] == "train_tail"
+    assert training["checkpoint_metric"] == "mean_physical_rmse_ratio"
+    assert training["require_all_physical_channels_improve"] is True
+    assert training["require_refinement_improvement"] is True
+    assert training["resume_training"] is False
+    assert training["resume_from"] == ""
+
+    if cfg.type.startswith("diffusion_"):
+        backbone_name = "transformer" if cfg.type.endswith("transformer") else "unet"
+        zero_initialized = bool(raw["model"]["refinement"][backbone_name]["zero_init_output"])
+        # Zero model output means x0=0 only for clean-sample prediction. With
+        # epsilon prediction, it is amplified Gaussian latent, not identity.
+        assert zero_initialized is True
+        assert cfg.diffusion.prediction_type == "sample"
+        assert not (zero_initialized and cfg.diffusion.prediction_type == "epsilon")

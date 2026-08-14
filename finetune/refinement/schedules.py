@@ -172,12 +172,36 @@ class DiffusionSchedule(nn.Module):
         super().__init__()
         self.num_train_timesteps = int(num_train_timesteps)
         self.schedule = str(schedule).lower()
+        if self.num_train_timesteps < 1:
+            raise ValueError("num_train_timesteps must be at least one.")
+        if self.schedule in {"linear", "scaled_linear"}:
+            start = float(beta_start)
+            end = float(beta_end)
+            if not (
+                math.isfinite(start)
+                and math.isfinite(end)
+                and 0.0 < start <= end < 1.0
+            ):
+                raise ValueError(
+                    "Linear diffusion betas require 0 < beta_start <= beta_end < 1; "
+                    f"got beta_start={beta_start!r}, beta_end={beta_end!r}."
+                )
+        if not math.isfinite(float(cosine_s)) or float(cosine_s) < 0.0:
+            raise ValueError(f"cosine_s must be finite and non-negative, got {cosine_s!r}.")
 
         betas = self._build_betas(
             self.num_train_timesteps, self.schedule, beta_start, beta_end, cosine_s
-        )
+        ).float()
+        if not bool(torch.isfinite(betas).all()) or bool(
+            ((betas <= 0.0) | (betas >= 1.0)).any()
+        ):
+            raise ValueError("Diffusion beta schedule contains values outside (0, 1).")
         alphas = 1.0 - betas
         alphas_cumprod = torch.cumprod(alphas, dim=0)
+        if not bool(torch.isfinite(alphas_cumprod).all()) or bool(
+            (alphas_cumprod <= 0.0).any()
+        ):
+            raise ValueError("Diffusion cumulative alphas are non-finite or non-positive.")
 
         self.register_buffer("betas", betas, persistent=False)
         self.register_buffer("alphas_cumprod", alphas_cumprod, persistent=False)
@@ -208,32 +232,60 @@ class DiffusionSchedule(nn.Module):
     def _coefficients(
         self, reference: torch.Tensor, timesteps: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if reference.ndim < 1 or not reference.is_floating_point():
+            raise TypeError(
+                "Diffusion state must be a floating tensor with a batch dimension."
+            )
+        indices = timesteps.reshape(-1).to(device=reference.device, dtype=torch.long)
+        if indices.numel() != reference.shape[0]:
+            raise ValueError(
+                "Diffusion timestep count must match state batch size; "
+                f"got {indices.numel()} and {reference.shape[0]}."
+            )
+        if bool(((indices < 0) | (indices >= self.num_train_timesteps)).any()):
+            raise ValueError(
+                f"Diffusion timesteps must lie in [0, {self.num_train_timesteps - 1}]."
+            )
         shape = (-1,) + (1,) * (reference.ndim - 1)
-        s_a = (
-            self.sqrt_alphas_cumprod.to(reference.device)[timesteps]
-            .reshape(shape)
-            .to(reference.dtype)
-        )
-        s_1ma = (
-            self.sqrt_one_minus_alphas_cumprod.to(reference.device)[timesteps]
-            .reshape(shape)
-            .to(reference.dtype)
-        )
+        s_a = self.sqrt_alphas_cumprod.to(
+            device=reference.device, dtype=torch.float32
+        )[indices].reshape(shape)
+        s_1ma = self.sqrt_one_minus_alphas_cumprod.to(
+            device=reference.device, dtype=torch.float32
+        )[indices].reshape(shape)
         return s_a, s_1ma
+
+    @staticmethod
+    def _matching_float32(
+        first: torch.Tensor, second: torch.Tensor, first_name: str, second_name: str
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if first.shape != second.shape:
+            raise ValueError(
+                f"{first_name} and {second_name} shapes must match; got "
+                f"{tuple(first.shape)} and {tuple(second.shape)}."
+            )
+        if first.device != second.device:
+            raise ValueError(
+                f"{first_name} and {second_name} devices must match; got "
+                f"{first.device} and {second.device}."
+            )
+        return first.float(), second.float()
 
     def add_noise(
         self, clean: torch.Tensor, noise: torch.Tensor, timesteps: torch.Tensor
     ) -> torch.Tensor:
-        """``q(x_k | x_0) = sqrt(abar_k) * x_0 + sqrt(1 - abar_k) * eps``."""
-        s_a, s_1ma = self._coefficients(clean, timesteps)
-        return s_a * clean + s_1ma * noise
+        """Apply the forward noising equation entirely in float32."""
+        clean32, noise32 = self._matching_float32(clean, noise, "clean", "noise")
+        s_a, s_1ma = self._coefficients(clean32, timesteps)
+        return s_a * clean32 + s_1ma * noise32
 
     def velocity_target(
         self, clean: torch.Tensor, noise: torch.Tensor, timesteps: torch.Tensor
     ) -> torch.Tensor:
-        """``v = sqrt(abar) * eps - sqrt(1 - abar) * x_0`` (Salimans & Ho)."""
-        s_a, s_1ma = self._coefficients(clean, timesteps)
-        return s_a * noise - s_1ma * clean
+        """Return the Salimans-Ho velocity target in float32."""
+        clean32, noise32 = self._matching_float32(clean, noise, "clean", "noise")
+        s_a, s_1ma = self._coefficients(clean32, timesteps)
+        return s_a * noise32 - s_1ma * clean32
 
     def training_target(
         self,
@@ -242,12 +294,13 @@ class DiffusionSchedule(nn.Module):
         noise: torch.Tensor,
         timesteps: torch.Tensor,
     ) -> torch.Tensor:
+        clean32, noise32 = self._matching_float32(clean, noise, "clean", "noise")
         if prediction_type == "epsilon":
-            return noise
+            return noise32
         if prediction_type == "sample":
-            return clean
+            return clean32
         if prediction_type == "velocity":
-            return self.velocity_target(clean, noise, timesteps)
+            return self.velocity_target(clean32, noise32, timesteps)
         raise ValueError(f"Unsupported prediction_type {prediction_type!r}")
 
     # -- reverse (denoising) process ------------------------------------
@@ -258,14 +311,17 @@ class DiffusionSchedule(nn.Module):
         noisy: torch.Tensor,
         timesteps: torch.Tensor,
     ) -> torch.Tensor:
-        """Convert any supported parameterisation to the clean residual ``x_0``."""
-        s_a, s_1ma = self._coefficients(noisy, timesteps)
+        """Convert a model parameterisation to clean x0 in float32."""
+        output32, noisy32 = self._matching_float32(
+            model_output, noisy, "model_output", "noisy"
+        )
+        s_a, s_1ma = self._coefficients(noisy32, timesteps)
         if prediction_type == "sample":
-            return model_output
+            return output32
         if prediction_type == "epsilon":
-            return (noisy - s_1ma * model_output) / s_a.clamp(min=1e-12)
+            return (noisy32 - s_1ma * output32) / s_a.clamp(min=1e-12)
         if prediction_type == "velocity":
-            return s_a * noisy - s_1ma * model_output
+            return s_a * noisy32 - s_1ma * output32
         raise ValueError(f"Unsupported prediction_type {prediction_type!r}")
 
     def to_epsilon(
@@ -275,13 +331,17 @@ class DiffusionSchedule(nn.Module):
         noisy: torch.Tensor,
         timesteps: torch.Tensor,
     ) -> torch.Tensor:
-        s_a, s_1ma = self._coefficients(noisy, timesteps)
+        """Convert a model parameterisation to epsilon in float32."""
+        output32, noisy32 = self._matching_float32(
+            model_output, noisy, "model_output", "noisy"
+        )
+        s_a, s_1ma = self._coefficients(noisy32, timesteps)
         if prediction_type == "epsilon":
-            return model_output
+            return output32
         if prediction_type == "sample":
-            return (noisy - s_a * model_output) / s_1ma.clamp(min=1e-12)
+            return (noisy32 - s_a * output32) / s_1ma.clamp(min=1e-12)
         if prediction_type == "velocity":
-            return s_a * model_output + s_1ma * noisy
+            return s_a * output32 + s_1ma * noisy32
         raise ValueError(f"Unsupported prediction_type {prediction_type!r}")
 
     def inference_timesteps(self, num_inference_steps: int, device: torch.device) -> torch.Tensor:
@@ -294,6 +354,18 @@ class DiffusionSchedule(nn.Module):
                 f"num_inference_steps ({num_inference_steps}) exceeds "
                 f"num_train_timesteps ({self.num_train_timesteps})"
             )
-        stride = self.num_train_timesteps / num_inference_steps
-        steps = (torch.arange(num_inference_steps, dtype=torch.float64) * stride).round().long()
-        return steps.flip(0).to(device)
+        # Every reverse process starts at the noisiest state the network saw in
+        # training and terminates at t=0. The old arange*stride grid started at
+        # T-stride (980 for T=1000, S=50), while S=1 incorrectly started at
+        # t=0 despite drawing its state from a Gaussian prior.
+        return (
+            torch.linspace(
+                self.num_train_timesteps - 1,
+                0,
+                num_inference_steps,
+                dtype=torch.float64,
+            )
+            .round()
+            .long()
+            .to(device)
+        )

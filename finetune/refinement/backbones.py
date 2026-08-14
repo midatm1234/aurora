@@ -44,11 +44,13 @@ import torch.nn.functional as F
 from torch import nn
 from torch.utils.checkpoint import checkpoint
 
+from finetune.longitude import PeriodicConv2d
 from finetune.refinement.schedules import LeadTimeEmbedding, ProcessTimeEmbedding
 
 __all__ = [
     "ConditionalResidualUNet",
     "SpatialResidualTransformer",
+    "learned_periodic_longitude_encoding",
     "patchify_2d",
     "sincos_2d_positional_encoding",
     "unpatchify_2d",
@@ -170,11 +172,21 @@ class _ConvBlock(nn.Module):
         lon_periodic: bool = False,
     ) -> None:
         super().__init__()
-        padding_mode = "circular" if lon_periodic else "replicate"
-        self.conv1 = nn.Conv2d(in_ch, out_ch, 3, padding=1, padding_mode=padding_mode)
+        # ``padding_mode='circular'`` wraps *both* spatial axes. Latitude is not
+        # periodic, so global fields must use the repository's longitude-only
+        # operator (circular W, replicated H). Keep the legacy Conv2d modules
+        # for regional grids so their behaviour remains bit-for-bit unchanged.
+        def make_conv(in_c: int, out_c: int) -> nn.Conv2d:
+            if lon_periodic:
+                return PeriodicConv2d(in_c, out_c, 3, lon_periodic=True)
+            return nn.Conv2d(
+                in_c, out_c, 3, padding=1, padding_mode="replicate"
+            )
+
+        self.conv1 = make_conv(in_ch, out_ch)
         self.norm1 = nn.GroupNorm(_num_groups(out_ch), out_ch)
         self.film = _FiLM(cond_dim, out_ch)
-        self.conv2 = nn.Conv2d(out_ch, out_ch, 3, padding=1, padding_mode=padding_mode)
+        self.conv2 = make_conv(out_ch, out_ch)
         self.norm2 = nn.GroupNorm(_num_groups(out_ch), out_ch)
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
         self.act = nn.SiLU()
@@ -306,12 +318,36 @@ class ConditionalResidualUNet(nn.Module):
 
         for stage in self.up_blocks:
             skip = skips.pop()
-            h = F.interpolate(h, size=skip.shape[-2:], mode="bilinear", align_corners=False)
+            h = self._upsample(h, skip.shape[-2:])
             h = torch.cat([h, skip], dim=1)
             for block in stage:
                 h = block(h, cond_emb)
 
         return self.out_proj(h)
+
+    def _upsample(self, h: torch.Tensor, size) -> torch.Tensor:
+        """Resample to ``size``, wrapping in longitude on a periodic grid.
+
+        Plain ``F.interpolate`` clamps at the edges, so on a global grid the
+        first and last longitude columns are reconstructed from one-sided
+        neighbourhoods while every interior column uses both sides. That leaves a
+        seam artefact at 0/360 even though every convolution uses circular
+        padding. Padding one column from the opposite edge before resampling and
+        cropping it afterwards removes the asymmetry.
+        """
+        if not self.lon_periodic:
+            return F.interpolate(h, size=size, mode="bilinear", align_corners=False)
+        pad = 1
+        wrapped = torch.cat([h[..., -pad:], h, h[..., :pad]], dim=-1)
+        scale = size[1] / h.shape[-1]
+        pad_out = max(1, int(round(pad * scale)))
+        resampled = F.interpolate(
+            wrapped,
+            size=(size[0], size[1] + 2 * pad_out),
+            mode="bilinear",
+            align_corners=False,
+        )
+        return resampled[..., pad_out : pad_out + size[1]]
 
 
 # ---------------------------------------------------------------------------
@@ -364,13 +400,25 @@ def unpatchify_2d(
 
 
 def sincos_2d_positional_encoding(
-    dim: int, grid_h: int, grid_w: int, device=None, dtype=torch.float32
+    dim: int,
+    grid_h: int,
+    grid_w: int,
+    device=None,
+    dtype=torch.float32,
+    *,
+    periodic_lon: bool = False,
 ) -> torch.Tensor:
     """Fixed 2-D sin/cos positional encoding, ``[grid_h * grid_w, dim]``.
 
     Half of the embedding encodes the latitude token index and half the
     longitude token index, so the encoding is a genuine function of the
     two-dimensional grid location, not of a flattened sequence position.
+
+    With ``periodic_lon=True`` the longitude axis is encoded from the *angle*
+    ``2 * pi * j / grid_w`` using integer harmonics, which makes the encoding
+    exactly periodic: column ``grid_w`` maps onto column ``0``. On a global grid
+    those two columns are physically adjacent, so a non-periodic encoding places
+    an artificial discontinuity at the 0/360 seam.
     """
     if dim % 4 != 0:
         raise ValueError(f"sincos_2d_positional_encoding requires dim % 4 == 0, got {dim}")
@@ -382,11 +430,75 @@ def sincos_2d_positional_encoding(
         out = positions.float().reshape(-1, 1) * omega.reshape(1, -1)
         return torch.cat([torch.sin(out), torch.cos(out)], dim=1)
 
+    def _periodic_axis(positions: torch.Tensor, period: int) -> torch.Tensor:
+        # Integer harmonics of the wrapped angle: sin/cos(k * theta) with
+        # theta = 2*pi*j/period. Every component has period ``period`` exactly.
+        harmonics = torch.arange(1, half // 2 + 1, device=device, dtype=torch.float32)
+        angle = positions.float().reshape(-1, 1) * (2.0 * math.pi / max(int(period), 1))
+        out = angle * harmonics.reshape(1, -1)
+        return torch.cat([torch.sin(out), torch.cos(out)], dim=1)
+
     rows = torch.arange(grid_h, device=device)
     cols = torch.arange(grid_w, device=device)
     lat_grid = rows.reshape(-1, 1).expand(grid_h, grid_w).reshape(-1)
     lon_grid = cols.reshape(1, -1).expand(grid_h, grid_w).reshape(-1)
-    return torch.cat([_axis(lat_grid), _axis(lon_grid)], dim=1).to(dtype)
+    lon_encoding = (
+        _periodic_axis(lon_grid, grid_w) if periodic_lon else _axis(lon_grid)
+    )
+    return torch.cat([_axis(lat_grid), lon_encoding], dim=1).to(dtype)
+
+
+def learned_periodic_longitude_encoding(
+    coefficients: torch.Tensor,
+    positions: torch.Tensor,
+    *,
+    period: int,
+) -> torch.Tensor:
+    """Evaluate a learned Fourier encoding on a periodic longitude axis.
+
+    ``coefficients`` keeps the historical ``pos_lon`` parameter shape
+    ``[max_tokens_lon, embedding_dim]`` so existing state dictionaries still
+    load strictly. Row zero is a learned constant; the following rows are
+    interpreted as cosine/sine pairs for integer harmonics. Unlike
+    indexing a free table, this parameterisation is a continuous function on a
+    circle and therefore treats the last/first longitude pair exactly like an
+    ordinary pair of neighbours.
+
+    Args:
+        coefficients: learned parameter table ``[M, D]``.
+        positions: token-column positions at which to evaluate the encoding.
+        period: number of longitude-token columns in one complete revolution.
+    """
+    if coefficients.ndim != 2:
+        raise ValueError(
+            "learned periodic longitude coefficients must have shape [M, D], "
+            f"got {tuple(coefficients.shape)}."
+        )
+    if period < 1:
+        raise ValueError(f"period must be positive, got {period}.")
+    pos = torch.as_tensor(positions, device=coefficients.device, dtype=torch.float32).reshape(-1)
+    if coefficients.shape[0] < 3 or period == 1:
+        return coefficients[0].unsqueeze(0).expand(pos.numel(), -1)
+
+    # A grid of W points has at most floor(W / 2) distinct real Fourier
+    # harmonics. Limiting the coefficient rows accordingly avoids unused
+    # high-frequency aliases while retaining approximately the same number of
+    # learned rows that the old direct lookup consumed for this grid.
+    harmonics_count = min((coefficients.shape[0] - 1) // 2, max(1, period // 2))
+    harmonics = torch.arange(
+        1,
+        harmonics_count + 1,
+        device=coefficients.device,
+        dtype=torch.float32,
+    )
+    angle = pos[:, None] * (2.0 * math.pi / float(period)) * harmonics[None, :]
+    basis_cos = torch.cos(angle).to(coefficients.dtype)
+    basis_sin = torch.sin(angle).to(coefficients.dtype)
+    paired = coefficients[1 : 1 + 2 * harmonics_count].reshape(harmonics_count, 2, -1)
+    cos_coeff = paired[:, 0]
+    sin_coeff = paired[:, 1]
+    periodic = basis_cos @ cos_coeff + basis_sin @ sin_coeff
+    return coefficients[0].unsqueeze(0) + periodic / math.sqrt(float(harmonics_count))
 
 
 class _SpatialAttention(nn.Module):
@@ -674,6 +786,7 @@ class SpatialResidualTransformer(nn.Module):
         lead_time_scale_hours: float = 72.0,
         lon_periodic: bool = False,
         time_embedding_kind: str = "sinusoidal",
+        local_refinement: bool = True,
     ) -> None:
         super().__init__()
         self.patch_h, self.patch_w = int(patch_size[0]), int(patch_size[1])
@@ -746,6 +859,55 @@ class SpatialResidualTransformer(nn.Module):
         if zero_init_output:
             nn.init.zeros_(self.out_proj.weight)
             nn.init.zeros_(self.out_proj.bias)
+
+        # Local convolutional stem / head. Patch tokenization represents every
+        # patch by a single vector, so all sub-patch structure has to survive one
+        # linear map: the reconstruction is piecewise-per-patch and shows visible
+        # blocking at the patch boundaries. A 3x3 convolution on each side gives
+        # the model overlapping spatial support across those boundaries at
+        # negligible cost. The head is zero-initialised and added as a residual,
+        # so it starts as an exact no-op and identity-at-init is preserved.
+        self.local_refinement = bool(local_refinement)
+        self.stem: nn.Module = nn.Identity()
+        self.head: nn.Module = nn.Identity()
+        if self.local_refinement:
+            in_total = self.in_channels + self.cond_channels
+            if self.lon_periodic:
+                self.stem = PeriodicConv2d(
+                    in_total, in_total, 3, lon_periodic=True, groups=1
+                )
+            else:
+                self.stem = nn.Conv2d(
+                    in_total,
+                    in_total,
+                    3,
+                    padding=1,
+                    padding_mode="replicate",
+                    groups=1,
+                )
+            nn.init.zeros_(self.stem.bias)
+            with torch.no_grad():
+                # Initialise as the identity map so the stem starts transparent.
+                self.stem.weight.zero_()
+                for c in range(in_total):
+                    self.stem.weight[c, c, 1, 1] = 1.0
+            if self.lon_periodic:
+                self.head = PeriodicConv2d(
+                    self.out_channels,
+                    self.out_channels,
+                    3,
+                    lon_periodic=True,
+                )
+            else:
+                self.head = nn.Conv2d(
+                    self.out_channels,
+                    self.out_channels,
+                    3,
+                    padding=1,
+                    padding_mode="replicate",
+                )
+            nn.init.zeros_(self.head.weight)
+            nn.init.zeros_(self.head.bias)
         self._warned_seam = False
 
     # -- helpers ---------------------------------------------------------
@@ -762,13 +924,25 @@ class SpatialResidualTransformer(nn.Module):
                     f"{self.max_tokens_lon}). Increase them or the patch size."
                 )
             lat = self.pos_lat[:grid_h].unsqueeze(1)  # [gh, 1, D]
-            lon = self.pos_lon[:grid_w].unsqueeze(0)  # [1, gw, D]
+            if self.lon_periodic:
+                lon = learned_periodic_longitude_encoding(
+                    self.pos_lon,
+                    torch.arange(grid_w, device=device),
+                    period=grid_w,
+                ).unsqueeze(0)
+            else:
+                lon = self.pos_lon[:grid_w].unsqueeze(0)  # [1, gw, D]
             return (lat + lon).reshape(grid_h * grid_w, self.embedding_dim).to(dtype)
         key = (grid_h, grid_w, device, dtype)
         cached = self._sincos_cache.get(key)
         if cached is None:
             cached = sincos_2d_positional_encoding(
-                self.embedding_dim, grid_h, grid_w, device=device, dtype=dtype
+                self.embedding_dim,
+                grid_h,
+                grid_w,
+                device=device,
+                dtype=dtype,
+                periodic_lon=self.lon_periodic,
             )
             self._sincos_cache[key] = cached
         return cached
@@ -788,6 +962,8 @@ class SpatialResidualTransformer(nn.Module):
             )
         b, _, h, w = x.shape
         stacked = torch.cat([x, cond], dim=1)
+        if self.local_refinement:
+            stacked = self.stem(stacked)
 
         pad_h = (-h) % self.patch_h
         pad_w = (-w) % self.patch_w
@@ -839,6 +1015,11 @@ class SpatialResidualTransformer(nn.Module):
         out = unpatchify_2d(tokens, self.out_channels, grid_h, grid_w, self.patch_h, self.patch_w)
         if pad_h or pad_w:
             out = out[..., :h, :w]
+        if self.local_refinement:
+            # Residual, zero-initialised: smooths the piecewise-per-patch
+            # reconstruction across patch boundaries without changing the
+            # identity-at-init guarantee.
+            out = out + self.head(out)
         if out.shape != (b, self.out_channels, h, w):
             raise RuntimeError(
                 f"Transformer output shape {tuple(out.shape)} does not match the expected "

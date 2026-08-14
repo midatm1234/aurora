@@ -9,9 +9,13 @@ selected through ``model.refinement.type``:
 ``none``
     Refinement disabled (deterministic Aurora only).
 ``flow_matching_unet`` (alias ``flow_matching``)
-    The **existing** Aurora rectified-flow UNet
+    The **existing** Aurora x1/data-prediction flow UNet
     (:mod:`finetune.flow_refine`). Its formulation, checkpoints and numerical
     behaviour are preserved exactly.
+``flow_matching_conv_unet`` (alias ``flow_matching_conv``)
+    Unified packed-field conditional flow matching with the convolutional UNet
+    backbone. This is distinct from the legacy ``flow_matching_unet`` wrapper
+    and does not share its checkpoint format.
 ``flow_matching_transformer``
     Same flow-matching target/path, spatial-token Transformer velocity network.
 ``diffusion_unet``
@@ -19,7 +23,7 @@ selected through ``model.refinement.type``:
 ``diffusion_transformer``
     Spatial-token Transformer denoiser, DDPM training / DDIM sampling.
 
-The four stochastic refiners are **alternatives**; diffusion and flow matching
+The five stochastic refiners are **alternatives**; diffusion and flow matching
 are never stacked and flow matching never requires diffusion to run first.
 
 Attribution

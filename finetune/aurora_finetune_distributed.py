@@ -1,5 +1,6 @@
-#!/usr/bin/env python
-"""Distributed Aurora fine-tuning across multiple GPUs.
+"""Copyright (c) Microsoft Corporation. Licensed under the MIT license.
+
+Distributed Aurora fine-tuning across multiple GPUs.
 
 Automatically detects idle GPUs (≥90 % free) and distributes training across
 them.  Gradients are all-reduced manually after each backward pass — no DDP
@@ -19,6 +20,7 @@ Usage
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -63,25 +65,6 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 import finetune.aurora_finetune_utils as ft  # noqa: E402
-from aurora import (  # noqa: E402
-    Aurora,
-    Aurora12hPretrained,
-    AuroraAirPollution,
-    AuroraHighRes,
-    AuroraPretrained,
-    AuroraSmallPretrained,
-    AuroraWave,
-)
-
-MODEL_REGISTRY = {
-    "aurora": Aurora,
-    "aurora_pretrained": AuroraPretrained,
-    "aurora_small_pretrained": AuroraSmallPretrained,
-    "aurora_12h_pretrained": Aurora12hPretrained,
-    "aurora_highres": AuroraHighRes,
-    "aurora_air_pollution": AuroraAirPollution,
-    "aurora_wave": AuroraWave,
-}
 
 FREE_MEMORY_FRACTION = 0.90
 
@@ -137,6 +120,281 @@ def _allreduce_grads(model: torch.nn.Module, world_size: int):
             param.grad.data.copy_((grad_cpu / world_size).to(param.grad.dtype))
 
 
+def _active_residual_scalers(
+    model: torch.nn.Module,
+) -> list[tuple[str, torch.nn.Module]]:
+    """Return every active unified-refinement scaler in stable module order."""
+    from finetune.refinement.residual_scaling import ResidualScaler
+
+    return [
+        (name, module)
+        for name, module in model.named_modules()
+        if isinstance(module, ResidualScaler) and module.is_active
+    ]
+
+
+def _disjoint_rank_samples(samples: list[dict], rank: int, world_size: int) -> list[dict]:
+    """Shard without padding, duplication, or overlap for calibration."""
+    if world_size <= 0 or rank < 0 or rank >= world_size:
+        raise ValueError(
+            f"Invalid calibration rank/world_size: rank={rank}, world_size={world_size}."
+        )
+    return samples[rank::world_size]
+
+
+def _prepare_exact_calibration_forward(
+    model: torch.nn.Module,
+    scalers: list[tuple[str, torch.nn.Module]],
+) -> None:
+    """Collect training targets with deterministic Aurora/network behavior."""
+    # `compute_supervised_loss` keys target collection off the outer unified
+    # wrapper's training flag. Set flags directly (rather than recursively
+    # calling eval()) so every stochastic/dropout/BatchNorm submodule is in eval
+    # while the wrapper and scaler still execute their training-only target path.
+    model.train()
+    for module in model.modules():
+        module.training = False
+    model.training = True
+    inner = model.module if hasattr(model, "module") else model
+    inner.training = True
+    for _, scaler in scalers:
+        scaler.training = True
+
+
+def _training_split_calibration_fingerprint(
+    ds,
+    train_samples: list[dict],
+    cfg: dict,
+    packing,
+) -> bytes:
+    """Hash the exact logical split, coordinates, and packed channel contract."""
+    data_cfg = cfg.get("data", {})
+    coordinate_names = (
+        str(data_cfg.get("time_dim", "time")),
+        str(data_cfg.get("lat_dim", "latitude")),
+        str(data_cfg.get("lon_dim", "longitude")),
+        str(data_cfg.get("level_dim", "level")),
+    )
+    coordinates = {}
+    for name in coordinate_names:
+        if name not in ds.coords:
+            continue
+        values = np.asarray(ds.coords[name].values)
+        coordinates[name] = {
+            "dtype": str(values.dtype),
+            "shape": list(values.shape),
+            "values": values.tolist(),
+        }
+    payload = {
+        "version": 1,
+        "correction_convention": "CAMS_minus_Aurora",
+        "train_data_path": str(
+            Path(cfg.get("paths", {}).get("train_data_path", "")).resolve()
+        ),
+        "dataset_sizes": {str(k): int(v) for k, v in ds.sizes.items()},
+        "coordinates": coordinates,
+        "samples": train_samples,
+        "target_lead_times": [
+            int(value) for value in data_cfg.get("target_lead_times", ())
+        ],
+        "rollout_step_hours": float(
+            cfg.get("rollout", {}).get("rollout_step_hours", 0.0)
+        ),
+        "packing": packing.to_dict(),
+    }
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).digest()
+
+
+def _residual_calibration_report(
+    *,
+    scalers: list[tuple[str, torch.nn.Module]],
+    packing,
+    fingerprint: bytes,
+    logical_samples: int,
+    packed_examples: int,
+) -> dict:
+    """Build checkpoint/JSON provenance plus physical per-channel statistics."""
+    scaler_reports = []
+    for module_name, scaler in scalers:
+        count, normalized_mean, normalized_std = scaler.raw_statistics()
+        count_values = count.reshape(-1).cpu().tolist()
+        mean_values = normalized_mean.reshape(-1).cpu().tolist()
+        std_values = normalized_std.reshape(-1).cpu().tolist()
+        scale_values = scaler.scale.detach().double().reshape(-1).cpu().tolist()
+        shift_values = scaler.shift.detach().double().reshape(-1).cpu().tolist()
+        channels = []
+        for channel, n, mean, std, scale, shift in zip(
+            packing.channels,
+            count_values,
+            mean_values,
+            std_values,
+            scale_values,
+            shift_values,
+        ):
+            physical_scale = float(channel.std)
+            channels.append(
+                {
+                    "index": int(channel.index),
+                    "variable": str(channel.dataset_name),
+                    "aurora_variable": str(channel.aurora_name),
+                    "level_hpa": (
+                        None if channel.level is None else float(channel.level)
+                    ),
+                    "units": str(channel.units),
+                    "valid_cell_count": int(n),
+                    "normalized_correction_mean": float(mean),
+                    "normalized_correction_std": float(std),
+                    "physical_correction_mean": float(mean) * physical_scale,
+                    "physical_correction_std": float(std) * physical_scale,
+                    "normalizer_scale": float(scale),
+                    "normalizer_shift": float(shift),
+                    "physical_normalizer_scale": float(scale) * physical_scale,
+                    "physical_normalizer_shift": float(shift) * physical_scale,
+                }
+            )
+        scaler_reports.append(
+            {
+                "module": module_name,
+                "mode": str(scaler.mode),
+                "center": bool(scaler.center),
+                "complete": bool(scaler.calibration_complete.item()),
+                "frozen": bool(scaler.frozen.item()),
+                "method": "exact_training_split",
+                "logical_samples": int(scaler.calibration_logical_samples.item()),
+                "packed_examples": int(scaler.calibration_examples.item()),
+                "channels": channels,
+            }
+        )
+    return {
+        "version": 1,
+        "correction_convention": "CAMS_minus_Aurora",
+        "method": "exact_training_split",
+        "complete": True,
+        "training_split_fingerprint_sha256": fingerprint.hex(),
+        "logical_samples": int(logical_samples),
+        "packed_examples": int(packed_examples),
+        "lead_times_hours": [float(value) for value in packing.lead_times_hours],
+        "scalers": scaler_reports,
+    }
+
+
+def _calibrate_residual_scalers_from_training_split(
+    *,
+    model: torch.nn.Module,
+    train_ds,
+    train_samples: list[dict],
+    cfg: dict,
+    resolved_specs,
+    device: torch.device,
+    rank: int,
+    world_size: int,
+    norm_stats,
+    global_step: int,
+) -> dict | None:
+    """Fit exact train-only correction statistics before any optimiser step.
+
+    Ranks consume disjoint, unpadded sample shards. No collective occurs in the
+    forward loop; each scaler performs exactly one final sufficient-statistic
+    all-reduce after all local examples have been observed.
+    """
+    scalers = _active_residual_scalers(model)
+    if not scalers:
+        return None
+    inner = model.module if hasattr(model, "module") else model
+    packing = getattr(inner, "packing", None)
+    if packing is None:
+        raise RuntimeError(
+            "An active ResidualScaler requires canonical field-packing metadata."
+        )
+    logical_samples = len(train_samples)
+    if logical_samples <= 0:
+        raise RuntimeError("Residual calibration requires a non-empty training split.")
+    configured_leads = [
+        int(value) for value in cfg.get("data", {}).get("target_lead_times", ())
+    ]
+    if not configured_leads:
+        raise RuntimeError(
+            "Residual calibration requires configured data.target_lead_times."
+        )
+    packed_examples = logical_samples * len(configured_leads)
+    fingerprint = _training_split_calibration_fingerprint(
+        train_ds, train_samples, cfg, packing
+    )
+
+    if int(global_step) > 0:
+        for module_name, scaler in scalers:
+            try:
+                scaler.validate_exact_training_split_calibration(
+                    logical_samples=logical_samples,
+                    packed_examples=packed_examples,
+                    fingerprint=fingerprint,
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    "Cannot resume trained stochastic-refinement weights with an "
+                    "unverified or incompatible residual normalizer at module "
+                    f"{module_name!r}. Recalibrating it would change the learned "
+                    "coordinate system. Restart Phase-2 training from step zero "
+                    "with the current training split."
+                ) from exc
+        return _residual_calibration_report(
+            scalers=scalers,
+            packing=packing,
+            fingerprint=fingerprint,
+            logical_samples=logical_samples,
+            packed_examples=packed_examples,
+        )
+
+    _prepare_exact_calibration_forward(model, scalers)
+    for _, scaler in scalers:
+        scaler.begin_exact_training_split_calibration()
+    local_samples = _disjoint_rank_samples(train_samples, rank, world_size)
+    batch_size = max(1, int(cfg.get("training", {}).get("batch_size", 1)))
+    try:
+        with torch.inference_mode():
+            for offset in range(0, len(local_samples), batch_size):
+                sample_batch = local_samples[offset : offset + batch_size]
+                loss, _ = ft.compute_supervised_loss(
+                    model=model,
+                    ds=train_ds,
+                    samples=sample_batch,
+                    config=cfg,
+                    resolved_specs=resolved_specs,
+                    device=device,
+                    norm_stats=norm_stats,
+                )
+                if not bool(torch.isfinite(loss.detach()).item()):
+                    raise RuntimeError(
+                        "Residual calibration forward produced a non-finite loss."
+                    )
+        for _, scaler in scalers:
+            scaler.finalize_exact_training_split_calibration(
+                logical_samples=logical_samples,
+                packed_examples=packed_examples,
+                fingerprint=fingerprint,
+                distributed=world_size > 1,
+            )
+    except Exception:
+        for _, scaler in scalers:
+            scaler.abort_exact_training_split_calibration()
+        raise
+
+    return _residual_calibration_report(
+        scalers=scalers,
+        packing=packing,
+        fingerprint=fingerprint,
+        logical_samples=logical_samples,
+        packed_examples=packed_examples,
+    )
+
+
+
 def _optimizer_updates_per_epoch(
     num_samples: int,
     *,
@@ -154,11 +412,145 @@ def _optimizer_updates_per_epoch(
     )
 
 
+def _checkpoint_candidate_improves(
+    *,
+    should_validate: bool,
+    checkpoint_metric_value: float,
+    non_degrading: bool,
+    physical_channel_coverage_complete: bool,
+    best_value: float,
+    min_delta: float,
+) -> bool:
+    """Reject checkpoint candidates unless physical metric coverage is exact."""
+    return bool(
+        should_validate
+        and physical_channel_coverage_complete
+        and np.isfinite(checkpoint_metric_value)
+        and non_degrading
+        and checkpoint_metric_value < (best_value - min_delta)
+    )
+
+
 # ---------------------------------------------------------------------------
 # Distributed validation
 # ---------------------------------------------------------------------------
 
+def _validation_baseline_model(model: torch.nn.Module) -> torch.nn.Module | None:
+    """Return the deterministic Aurora model used for baseline validation."""
+    inner = model.module if hasattr(model, "module") else model
+    from finetune.refinement.two_phase import AuroraTwoPhaseRefiner
+
+    if isinstance(inner, AuroraTwoPhaseRefiner):
+        return inner.aurora
+    return getattr(inner, "base", None)
+
+def _expected_physical_validation_channels(
+    model: torch.nn.Module,
+    cfg: dict,
+    resolved_specs,
+) -> tuple[str, ...]:
+    """Derive the exact variable×level×configured-lead metric key contract."""
+    inner = model.module if hasattr(model, "module") else model
+    packing = getattr(inner, "packing", None)
+    if packing is not None:
+        channels = list(packing.channels)
+        lead_hours = [float(value) for value in packing.lead_times_hours]
+    else:
+        channels = []
+        full_levels = [
+            float(value)
+            for value in cfg.get("data", {}).get(
+                "atmos_levels",
+                cfg.get("data", {}).get("pressure_levels", ()),
+            )
+        ]
+        for spec in resolved_specs.targets:
+            if spec.kind == "surf":
+                channels.append(spec)
+            else:
+                levels = list(spec.loss_levels or full_levels)
+                for level in levels:
+                    channels.append((spec, float(level)))
+        step_hours = float(cfg.get("rollout", {}).get("rollout_step_hours", 0.0))
+        lead_hours = [
+            int(value) * step_hours
+            for value in cfg.get("data", {}).get("target_lead_times", ())
+        ]
+    if not lead_hours or any(not np.isfinite(value) or value <= 0 for value in lead_hours):
+        raise ValueError(
+            "Physical validation coverage requires positive configured lead hours."
+        )
+
+    names = []
+    for channel in channels:
+        if isinstance(channel, tuple):
+            spec, level = channel
+            prefix = f"{spec.dataset_name}@{float(level):g}hPa"
+        elif getattr(channel, "kind", None) == "surf":
+            prefix = f"{channel.dataset_name}@surface"
+        else:
+            prefix = f"{channel.dataset_name}@{float(channel.level):g}hPa"
+        names.extend(f"{prefix}@lead{float(hours):g}h" for hours in lead_hours)
+    if not names or len(set(names)) != len(names):
+        raise RuntimeError(
+            "Physical validation channel contract is empty or contains duplicates."
+        )
+    return tuple(sorted(names))
+
+
+def _summarize_physical_channel_coverage(
+    *,
+    expected_channels,
+    observed_refined,
+    observed_baseline,
+    physical_channels,
+) -> dict[str, object]:
+    """Report missing, extra, and zero-count validation groups exactly."""
+    expected = set(expected_channels)
+    refined = set(observed_refined)
+    baseline = set(observed_baseline)
+    missing_refined = sorted(expected - refined)
+    missing_baseline = sorted(expected - baseline)
+    extra_refined = sorted(refined - expected)
+    extra_baseline = sorted(baseline - expected)
+    zero_count_refined = sorted(
+        name
+        for name in expected
+        if name not in physical_channels
+        or float(physical_channels[name]["refined"]["count"]) <= 0
+    )
+    zero_count_baseline = sorted(
+        name
+        for name in expected
+        if name not in physical_channels
+        or float(physical_channels[name]["baseline"]["count"]) <= 0
+    )
+    complete = not any(
+        (
+            missing_refined,
+            missing_baseline,
+            extra_refined,
+            extra_baseline,
+            zero_count_refined,
+            zero_count_baseline,
+        )
+    )
+    return {
+        "complete": complete,
+        "expected": sorted(expected),
+        "observed_refined": sorted(refined),
+        "observed_baseline": sorted(baseline),
+        "missing_refined": missing_refined,
+        "missing_baseline": missing_baseline,
+        "extra_refined": extra_refined,
+        "extra_baseline": extra_baseline,
+        "zero_count_refined": zero_count_refined,
+        "zero_count_baseline": zero_count_baseline,
+    }
+
+
 def _distributed_validation(
+
     model, ds_val, val_samples, cfg, resolved_specs, device, rank, world_size,
     norm_stats=None, pbar=None,
 ):
@@ -171,26 +563,44 @@ def _distributed_validation(
     loss_sum = torch.zeros(1)
     baseline_loss_sum = torch.zeros(1)
     count = torch.zeros(1)
-    inner = model.module if hasattr(model, "module") else model
-    baseline_model = getattr(inner, "base", None)
+    refined_physical_sums: dict[str, dict[str, float]] = {}
+    baseline_physical_sums: dict[str, dict[str, float]] = {}
+
+    def merge_physical_sums(target, batch_metrics):
+        for channel, values in batch_metrics.get("physical_error_sums", {}).items():
+            slot = target.setdefault(
+                channel,
+                {name: 0.0 for name in ("count", "error_sum", "abs_error_sum", "sq_error_sum")},
+            )
+            for name in slot:
+                slot[name] += float(values[name])
+
+    baseline_model = _validation_baseline_model(model)
+    refinement_generator = ft._validation_refinement_generator(
+        model, device, stream=rank,
+    )
 
     with torch.inference_mode():
         for i in range(0, len(my_samples), batch_size):
             sample_batch = my_samples[i : i + batch_size]
-            loss, _ = ft.compute_supervised_loss(
+            loss, refined_batch_metrics = ft.compute_supervised_loss(
                 model=model, ds=ds_val, samples=sample_batch,
                 config=cfg, resolved_specs=resolved_specs, device=device,
                 norm_stats=norm_stats,
+                refinement_generator=refinement_generator,
             )
+            merge_physical_sums(refined_physical_sums, refined_batch_metrics)
             loss_sum += loss.detach().cpu()
             if baseline_model is not None:
-                baseline_loss, _ = ft.compute_supervised_loss(
+                baseline_loss, baseline_batch_metrics = ft.compute_supervised_loss(
                     model=baseline_model, ds=ds_val, samples=sample_batch,
                     config=cfg, resolved_specs=resolved_specs, device=device,
                     norm_stats=norm_stats,
                 )
             else:
                 baseline_loss = loss
+                baseline_batch_metrics = refined_batch_metrics
+            merge_physical_sums(baseline_physical_sums, baseline_batch_metrics)
             baseline_loss_sum += baseline_loss.detach().cpu()
             count += 1
             if pbar is not None and rank == 0:
@@ -204,6 +614,122 @@ def _distributed_validation(
     dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
     dist.all_reduce(baseline_loss_sum, op=dist.ReduceOp.SUM)
     dist.all_reduce(count, op=dist.ReduceOp.SUM)
+    expected_channels = set(
+        _expected_physical_validation_channels(model, cfg, resolved_specs)
+    )
+    local_channel_sets = {
+        "refined": sorted(refined_physical_sums),
+        "baseline": sorted(baseline_physical_sums),
+    }
+    gathered_channel_sets: list[dict[str, list[str]] | None] = [None] * world_size
+    dist.all_gather_object(gathered_channel_sets, local_channel_sets)
+    observed_refined = {
+        name
+        for rank_sets in gathered_channel_sets
+        for name in ((rank_sets or {}).get("refined", ()))
+    }
+    observed_baseline = {
+        name
+        for rank_sets in gathered_channel_sets
+        for name in ((rank_sets or {}).get("baseline", ()))
+    }
+    channel_names = sorted(
+        expected_channels | observed_refined | observed_baseline
+    )
+    stat_names = ("count", "error_sum", "abs_error_sum", "sq_error_sum")
+
+    def reduce_channel(source, channel):
+        local = source.get(channel, {})
+        packed = torch.tensor(
+            [float(local.get(name, 0.0)) for name in stat_names],
+            dtype=torch.float64,
+        )
+        dist.all_reduce(packed, op=dist.ReduceOp.SUM)
+        return {name: float(value) for name, value in zip(stat_names, packed.tolist())}
+
+    def finalize_channel(sums):
+        n = sums["count"]
+        if n <= 0:
+            return {
+                "count": 0.0,
+                "bias": math.nan,
+                "mae": math.nan,
+                "rmse": math.nan,
+            }
+        return {
+            "count": n,
+            "bias": sums["error_sum"] / n,
+            "mae": sums["abs_error_sum"] / n,
+            "rmse": math.sqrt(max(0.0, sums["sq_error_sum"] / n)),
+        }
+
+    def metric_ratio(refined, baseline, metric, *, absolute=False):
+        numerator = float(refined[metric])
+        denominator = float(baseline[metric])
+        if absolute:
+            numerator = abs(numerator)
+            denominator = abs(denominator)
+        return (
+            numerator / denominator
+            if np.isfinite(numerator)
+            and np.isfinite(denominator)
+            and denominator > 0.0
+            else math.nan
+        )
+
+    physical_channels = {}
+    rmse_ratios = []
+    for channel in channel_names:
+        refined_channel = finalize_channel(
+            reduce_channel(refined_physical_sums, channel)
+        )
+        baseline_channel = finalize_channel(
+            reduce_channel(baseline_physical_sums, channel)
+        )
+        bias_ratio = metric_ratio(
+            refined_channel, baseline_channel, "bias", absolute=True
+        )
+        mae_ratio = metric_ratio(refined_channel, baseline_channel, "mae")
+        rmse_ratio = metric_ratio(refined_channel, baseline_channel, "rmse")
+        if channel in expected_channels and np.isfinite(rmse_ratio):
+            rmse_ratios.append(rmse_ratio)
+        physical_channels[channel] = {
+            "baseline": baseline_channel,
+            "refined": refined_channel,
+            "absolute_bias_ratio": bias_ratio,
+            "mae_ratio": mae_ratio,
+            "rmse_ratio": rmse_ratio,
+            "absolute_bias_improvement_percent": (
+                100.0 * (1.0 - bias_ratio)
+                if np.isfinite(bias_ratio)
+                else math.nan
+            ),
+            "mae_improvement_percent": (
+                100.0 * (1.0 - mae_ratio)
+                if np.isfinite(mae_ratio)
+                else math.nan
+            ),
+            "rmse_improvement_percent": (
+                100.0 * (1.0 - rmse_ratio)
+                if np.isfinite(rmse_ratio)
+                else math.nan
+            ),
+        }
+
+    physical_channel_coverage = _summarize_physical_channel_coverage(
+        expected_channels=expected_channels,
+        observed_refined=observed_refined,
+        observed_baseline=observed_baseline,
+        physical_channels=physical_channels,
+    )
+    coverage_complete = bool(physical_channel_coverage["complete"])
+
+    mean_physical_rmse_ratio = (
+        float(np.mean(rmse_ratios))
+        if coverage_complete and len(rmse_ratios) == len(expected_channels)
+        else math.nan
+    )
+
     val_loss = (loss_sum / count).item() if count.item() > 0 else math.nan
     baseline_val_loss = (
         (baseline_loss_sum / count).item() if count.item() > 0 else math.nan
@@ -217,6 +743,14 @@ def _distributed_validation(
         "val_loss": val_loss,
         "baseline_val_loss": baseline_val_loss,
         "val_improvement_percent": improvement_percent,
+        "physical_channels": physical_channels,
+        "physical_channel_coverage": physical_channel_coverage,
+        "mean_physical_rmse_ratio": mean_physical_rmse_ratio,
+        "all_physical_channels_improved": (
+            coverage_complete
+            and len(rmse_ratios) == len(expected_channels)
+            and all(ratio < 1.0 for ratio in rmse_ratios)
+        ),
         "num_val_batches": int(count.item()),
     }
 
@@ -319,42 +853,19 @@ def _worker(rank: int, world_size: int, local_gpu: int, cfg: dict):
     # ---- model ----
     model_cfg = cfg["model"]
     variant = str(model_cfg.get("model_variant", "aurora_pretrained")).lower()
-    model_var_cfg = ft.derive_model_variable_config(resolved_specs, cfg)
-    model_kwargs = dict(model_cfg.get("model_kwargs", {}))
-
-    if "patch_size" in model_cfg and "patch_size" not in model_kwargs:
-        model_kwargs["patch_size"] = int(model_cfg["patch_size"])
-
     mixed_precision_mode = str(model_cfg.get("mixed_precision", "none")).lower()
     use_bf16 = mixed_precision_mode in {"bf16", "bfloat16"}
-    # Disable Aurora's internal autocast — we store params directly in bf16.
-    model_kwargs["autocast"] = False
-
-    model = MODEL_REGISTRY[variant](
-        surf_vars=model_var_cfg["surf_vars"],
-        static_vars=model_var_cfg["static_vars"],
-        atmos_vars=model_var_cfg["atmos_vars"],
-        **model_kwargs,
+    _print0(rank, f"Building configured model {variant} through shared factory")
+    model = ft.build_finetune_model(
+        cfg,
+        resolved_specs,
+        lon=train_lon,
+        lat=train_lat,
+        norm_stats=norm_stats,
+        load_pretrained=True,
+        autocast=False,
     )
 
-    if bool(model_cfg.get("use_pretrained_weights", True)):
-        ckpt_path = cfg["paths"].get("pretrained_checkpoint")
-        if ckpt_path:
-            _print0(rank, f"Loading local checkpoint: {ckpt_path}")
-            model.load_checkpoint_local(ckpt_path, strict=False)
-        else:
-            _print0(rank, f"Loading default HF checkpoint for {variant}")
-            model.load_checkpoint(strict=False)
-
-    if bool(model_cfg.get("gradient_checkpointing", True)):
-        model.configure_activation_checkpointing()
-
-    # Optionally wrap with convolutional refinement heads.
-    model = ft.maybe_wrap_conv_refine(model, cfg, resolved_specs, lon=train_lon)
-
-    # Optionally wrap with rectified-flow residual refine heads. Mutually
-    # exclusive with conv-refine (the helper checks the flag itself).
-    model = ft.maybe_wrap_flow_refine(model, cfg, resolved_specs, lon=train_lon)
     # If the flow wrapper is in use, hand it the per-variable normalisation
     # stats so its de-normalisation step at inference time matches the
     # space the FM head was trained in.
@@ -375,18 +886,6 @@ def _worker(rank: int, world_size: int, local_gpu: int, cfg: dict):
                 f"atmos={list(model.target_atmos_vars)})",
             )
 
-    # Optionally wrap with the unified stochastic residual refiner
-    # (flow_matching_transformer / diffusion_unet / diffusion_transformer).
-    # Returns the model unchanged for `none` and for the legacy
-    # flow_matching_unet path handled above.
-    model = ft.maybe_wrap_stochastic_refine(
-        model,
-        cfg,
-        resolved_specs,
-        lon=train_lon,
-        lat=train_lat,
-        norm_stats=norm_stats,
-    )
     from finetune.refinement.two_phase import AuroraTwoPhaseRefiner as _ATP
 
     if isinstance(model, _ATP):
@@ -399,6 +898,13 @@ def _worker(rank: int, world_size: int, local_gpu: int, cfg: dict):
             f"channels={model.packing.num_channels}, "
             f"feedback_to_rollout={model.refinement_config.feedback_to_rollout}",
         )
+        if model.has_temporal:
+            _print0(
+                rank,
+                "Mamba temporal module active above unified refiner: "
+                f"{model.temporal_parameter_count():,} params, "
+                f"sequence_channels={model.packing.num_channels}",
+            )
 
     param_summary = ft.configure_trainable_parameters(model, cfg)
     _print0(rank, f"Parameters: {json.dumps(param_summary)}")
@@ -608,6 +1114,7 @@ def _worker(rank: int, world_size: int, local_gpu: int, cfg: dict):
 
     history: list[dict] = []
     best_val_loss = float("inf")
+    latest_validation: dict[str, object] | None = None
     global_step = 0
     start_epoch = 0
 
@@ -647,15 +1154,33 @@ def _worker(rank: int, world_size: int, local_gpu: int, cfg: dict):
             cfg,
             resolved_specs,
             allow_temporal_migration=True,
+            require_validated=False,
         )
-        # Tolerant load so checkpoints from flow-matching-only runs (which lack
-        # the Mamba temporal parameters) resume cleanly into a temporal-enabled
-        # model, and vice-versa. Missing keys keep their fresh init; unexpected
-        # keys (e.g. a disabled temporal module) are ignored. Any *other*
-        # mismatch would still surface here for inspection.
-        load_result = model.load_state_dict(ckpt["model_state_dict"], strict=False)
+        # Only the explicitly validated legacy Mamba migration may be tolerant.
+        # An unchanged architecture (including every unified refiner) loads
+        # strictly so truncated or incompatible restarts fail early.
+        load_result = model.load_state_dict(
+            ckpt["model_state_dict"], strict=not temporal_migration,
+        )
         missing = [k for k in load_result.missing_keys]
         unexpected = [k for k in load_result.unexpected_keys]
+        if temporal_migration:
+            def _is_temporal_key(key: str) -> bool:
+                while key.startswith("module."):
+                    key = key[len("module.") :]
+                return key.startswith("temporal.")
+
+            invalid_migration_keys = [
+                key
+                for key in (*missing, *unexpected)
+                if not _is_temporal_key(key)
+            ]
+            if invalid_migration_keys:
+                raise RuntimeError(
+                    "Temporal warm-start migration may only add or remove "
+                    "temporal.* state. Non-temporal missing/unexpected keys were "
+                    f"found: {invalid_migration_keys[:8]!r}."
+                )
         if missing:
             _print0(rank, f"  checkpoint missing {len(missing)} key(s) "
                           f"(kept fresh init), e.g. {missing[:3]}")
@@ -707,6 +1232,9 @@ def _worker(rank: int, world_size: int, local_gpu: int, cfg: dict):
         start_epoch = int(ckpt.get("epoch", -1)) + 1
         global_step = int(ckpt.get("global_step", 0))
         best_val_loss = float(ckpt.get("best_val_loss", float("inf")))
+        saved_validation = ckpt.get("validation")
+        if isinstance(saved_validation, dict):
+            latest_validation = dict(saved_validation)
         # Load previous history if available
         history_path = output_dir / "training_history.json"
         if history_path.exists():
@@ -716,6 +1244,53 @@ def _worker(rank: int, world_size: int, local_gpu: int, cfg: dict):
                        f"best_val_loss={best_val_loss:.4e}")
     elif resume_training and resume_from:
         _print0(rank, f"WARNING: resume_from='{resume_from}' but checkpoint not found — training from scratch")
+
+    # Calibrate CAMS-minus-Aurora corrections over every logical training sample
+    # before the first optimiser step. Ranks use disjoint, unpadded shards and
+    # synchronize sufficient statistics only once at the end of the pass.
+    residual_calibration = _calibrate_residual_scalers_from_training_split(
+        model=model,
+        train_ds=train_ds,
+        train_samples=train_samples,
+        cfg=cfg,
+        resolved_specs=resolved_specs,
+        device=device,
+        rank=rank,
+        world_size=world_size,
+        norm_stats=norm_stats,
+        global_step=global_step,
+    )
+    if residual_calibration is not None:
+        cfg.setdefault("runtime", {})["residual_calibration"] = residual_calibration
+        if rank == 0:
+            output_dir.mkdir(parents=True, exist_ok=True)
+            (output_dir / "residual_calibration.json").write_text(
+                json.dumps(residual_calibration, indent=2, allow_nan=False) + "\n"
+            )
+            print(
+                "Residual correction statistics "
+                f"(CAMS - Aurora; {residual_calibration['method']}; "
+                f"samples={residual_calibration['logical_samples']}; "
+                f"fingerprint={residual_calibration['training_split_fingerprint_sha256']}):",
+                flush=True,
+            )
+            for scaler_report in residual_calibration["scalers"]:
+                for channel in scaler_report["channels"]:
+                    level = (
+                        "surface"
+                        if channel["level_hpa"] is None
+                        else f"{channel['level_hpa']:g} hPa"
+                    )
+                    print(
+                        f"  {channel['variable']} @ {level}: n={channel['valid_cell_count']} "
+                        f"mean={channel['physical_correction_mean']:.6e} "
+                        f"std={channel['physical_correction_std']:.6e} "
+                        f"{channel['units']}",
+                        flush=True,
+                    )
+    # The pre-pass exercises stochastic training forwards; restore the configured
+    # RNG stream so it cannot alter optimization or sampling reproducibility.
+    ft.set_seed(int(train_cfg.get("seed", 42)))
 
     # Mark the current logical run independently of best/last. Inference uses
     # this marker to reject a stale best checkpoint when a fresh run produces
@@ -924,6 +1499,13 @@ def _worker(rank: int, world_size: int, local_gpu: int, cfg: dict):
         val_loss = float("nan")
         baseline_val_loss = float("nan")
         val_improvement_percent = float("nan")
+        mean_physical_rmse_ratio = float("nan")
+        all_physical_channels_improved = False
+        physical_channels = {}
+        physical_channel_coverage = {
+            "complete": False,
+            "expected": [],
+        }
         if should_validate:
             val_pbar = tqdm(
                 total=n_val_batches,
@@ -944,6 +1526,14 @@ def _worker(rank: int, world_size: int, local_gpu: int, cfg: dict):
             val_improvement_percent = float(
                 val_metrics["val_improvement_percent"]
             )
+            mean_physical_rmse_ratio = float(val_metrics["mean_physical_rmse_ratio"])
+            all_physical_channels_improved = bool(
+                val_metrics["all_physical_channels_improved"]
+            )
+            physical_channels = val_metrics["physical_channels"]
+            physical_channel_coverage = val_metrics[
+                "physical_channel_coverage"
+            ]
             val_pbar.close()
             model.train()
 
@@ -954,6 +1544,9 @@ def _worker(rank: int, world_size: int, local_gpu: int, cfg: dict):
             "val_loss": val_loss,
             "baseline_val_loss": baseline_val_loss,
             "val_improvement_percent": val_improvement_percent,
+            "mean_physical_rmse_ratio": mean_physical_rmse_ratio,
+            "physical_channel_coverage_complete": bool(physical_channel_coverage["complete"]),
+            "physical_rmse_improvement_percent": 100.0 * (1.0 - mean_physical_rmse_ratio),
             "lr": float(optimizer.param_groups[0]["lr"]),
         }
         history.append(row)
@@ -964,40 +1557,115 @@ def _worker(rank: int, world_size: int, local_gpu: int, cfg: dict):
             f"Epoch {epoch + 1}/{num_epochs} | train_loss={train_loss:.4f} | "
             f"val_loss={val_loss:.4f} | baseline_val_loss={baseline_val_loss:.4f} | "
             f"improvement={val_improvement_percent:+.2f}% | "
+            f"physical_RMSE_improvement={100.0 * (1.0 - mean_physical_rmse_ratio):+.2f}% | "
             f"mem={torch.cuda.memory_allocated(device) / 1e9:.1f}GB",
         )
 
+        checkpoint_metric_name = str(
+            train_cfg.get("checkpoint_metric", "validation_loss")
+        ).strip().lower()
+        if checkpoint_metric_name == "mean_physical_rmse_ratio":
+            checkpoint_metric_value = mean_physical_rmse_ratio
+            checkpoint_baseline_value = 1.0
+        elif checkpoint_metric_name in {"validation_loss", "val_loss"}:
+            checkpoint_metric_name = "validation_loss"
+            checkpoint_metric_value = val_loss
+            checkpoint_baseline_value = baseline_val_loss
+        else:
+            raise ValueError(
+                "training.checkpoint_metric must be validation_loss or "
+                f"mean_physical_rmse_ratio; got {checkpoint_metric_name!r}."
+            )
         require_improvement = bool(
             train_cfg.get("require_refinement_improvement", False)
         )
-        non_degrading = (
+        require_all_channels = bool(
+            train_cfg.get("require_all_physical_channels_improve", False)
+        )
+        coverage_complete = bool(physical_channel_coverage["complete"])
+        non_degrading = coverage_complete and (
             not require_improvement
             or (
-                np.isfinite(baseline_val_loss)
-                and val_loss <= baseline_val_loss
+                np.isfinite(checkpoint_baseline_value)
+                and checkpoint_metric_value <= checkpoint_baseline_value
             )
         )
-        improved = (
-            should_validate
-            and np.isfinite(val_loss)
-            and non_degrading
-            and (val_loss < (best_val_loss - min_delta))
+        if require_all_channels and not all_physical_channels_improved:
+            non_degrading = False
+        improved = _checkpoint_candidate_improves(
+            should_validate=should_validate,
+            checkpoint_metric_value=checkpoint_metric_value,
+            non_degrading=non_degrading,
+            physical_channel_coverage_complete=coverage_complete,
+            best_value=best_val_loss,
+            min_delta=min_delta,
         )
+        if should_validate:
+            if not coverage_complete:
+                validation_status = "incomplete_physical_channel_coverage"
+            elif not np.isfinite(checkpoint_metric_value):
+                validation_status = "non_finite_checkpoint_metric"
+            elif require_all_channels and not all_physical_channels_improved:
+                validation_status = "physical_channel_degradation"
+            elif require_improvement and checkpoint_metric_value > checkpoint_baseline_value:
+                validation_status = "degrades_deterministic_baseline"
+            elif not improved:
+                validation_status = "not_better_than_current_best"
+            else:
+                validation_status = "accepted_best"
+            latest_validation = {
+                "status": validation_status,
+                "accepted": bool(improved),
+                "epoch": int(epoch),
+                "global_step": int(global_step),
+                "val_loss": float(val_loss),
+                "baseline_val_loss": float(baseline_val_loss),
+                "val_improvement_percent": float(val_improvement_percent),
+                "physical_channels": physical_channels,
+                "physical_channel_coverage": physical_channel_coverage,
+                "mean_physical_rmse_ratio": float(mean_physical_rmse_ratio),
+                "physical_rmse_improvement_percent": float(
+                    100.0 * (1.0 - mean_physical_rmse_ratio)
+                ),
+                "checkpoint_metric": checkpoint_metric_name,
+                "checkpoint_metric_value": float(checkpoint_metric_value),
+                "validation_refinement_ensemble_size": int(
+                    train_cfg.get("validation_refinement_ensemble_size", 1)
+                ),
+                "min_delta": float(min_delta),
+                "require_refinement_improvement": bool(require_improvement),
+                "require_all_physical_channels_improve": bool(require_all_channels),
+            }
         if improved:
-            best_val_loss = val_loss
+            best_val_loss = checkpoint_metric_value
             no_improve_epochs = 0
 
-        if should_validate and (improved or not save_best_only):
+        if should_validate and improved:
             if rank == 0:
                 ft.save_checkpoint(
                     best_ckpt_path, model, optimizer, scheduler,
                     epoch=epoch, global_step=global_step,
                     best_val_loss=best_val_loss, config=cfg,
                     norm_stats=norm_stats,
+                    validation=latest_validation,
+                    validated_for_inference=True,
                 )
             dist.barrier()
         elif should_validate:
             no_improve_epochs += 1
+
+        if should_validate and not save_best_only:
+            if rank == 0:
+                ft.save_checkpoint(
+                    checkpoint_dir / f"epoch_{epoch:04d}.ckpt",
+                    model, optimizer, scheduler,
+                    epoch=epoch, global_step=global_step,
+                    best_val_loss=best_val_loss, config=cfg,
+                    norm_stats=norm_stats,
+                    validation=latest_validation,
+                    validated_for_inference=bool(improved),
+                )
+            dist.barrier()
 
         if save_last:
             if rank == 0:
@@ -1006,7 +1674,27 @@ def _worker(rank: int, world_size: int, local_gpu: int, cfg: dict):
                     epoch=epoch, global_step=global_step,
                     best_val_loss=best_val_loss, config=cfg,
                     norm_stats=norm_stats,
+                    validation=latest_validation,
+                    validated_for_inference=False,
                 )
+            dist.barrier()
+
+        if rank == 0 and should_validate:
+            (checkpoint_dir / "training_run.metadata.json").write_text(
+                json.dumps(
+                    {
+                        "training_run_id": cfg.get("runtime", {}).get(
+                            "training_run_id", ""
+                        ),
+                        "resume_path": str(resume_path) if resume_path else None,
+                        "validation": latest_validation,
+                    },
+                    indent=2,
+                    allow_nan=True,
+                )
+                + "\n"
+            )
+        if should_validate:
             dist.barrier()
 
         if early_stop_enabled and no_improve_epochs >= patience:
@@ -1018,13 +1706,28 @@ def _worker(rank: int, world_size: int, local_gpu: int, cfg: dict):
         ft.write_training_history(history, output_dir)
 
         rollout_cfg = cfg.get("rollout", {})
+        post_training_rollout_status = "disabled"
+        post_training_rollout_checkpoint: str | None = None
         if bool(rollout_cfg.get("run_rollout_after_training", True)):
-            rollout_ckpt_path = (
-                best_ckpt_path
-                if np.isfinite(best_val_loss) and best_ckpt_path.exists()
-                else last_ckpt_path
+            require_validated = bool(
+                cfg.get("inference", {}).get(
+                    "require_validated_checkpoint", False
+                )
             )
-            if rollout_ckpt_path.exists():
+            try:
+                rollout_ckpt_path = ft.select_refinement_checkpoint(
+                    checkpoint_dir,
+                    require_validated=require_validated,
+                )
+            except (ValueError, FileNotFoundError) as exc:
+                post_training_rollout_status = "skipped_checkpoint_gate"
+                print(
+                    "Skipping post-training rollout because no eligible "
+                    f"checkpoint was selected: {exc}"
+                )
+            else:
+                post_training_rollout_status = "completed"
+                post_training_rollout_checkpoint = str(rollout_ckpt_path)
                 state = torch.load(
                     str(rollout_ckpt_path), map_location=device, weights_only=False,
                 )
@@ -1035,31 +1738,33 @@ def _worker(rank: int, world_size: int, local_gpu: int, cfg: dict):
                 model.load_state_dict(state["model_state_dict"])
                 _print0(rank, f"Post-training rollout checkpoint: {rollout_ckpt_path}")
 
-            input_steps = int(cfg["data"].get("input_time_steps", 2))
-            test_samples = [{
-                "anchor_index": input_steps - 1,
-                "history_indices": list(range(input_steps)),
-                "target_indices": {},
-            }]
-            model.eval()
-            predictions = ft.run_rollout(
-                model=model, ds=test_ds, start_sample=test_samples[0],
-                config=cfg, resolved_specs=resolved_specs, device=device,
-            )
-            print(f"Rollout prediction steps: {len(predictions)}")
-
-            rollout_path = output_dir / "rollout_predictions.nc"
-            if predictions and bool(rollout_cfg.get("save_predictions_to_netcdf", True)):
-                # Convert bf16 predictions to float32 for numpy/netCDF compatibility.
-                predictions = [p.type(torch.float32) for p in predictions]
-                ft.save_predictions(
-                    predictions, rollout_path, save_netcdf=True,
-                    resolved_specs=resolved_specs,
-                    smooth_sigma=float(rollout_cfg.get("smooth_sigma", 0.0)),
-                    patch_size=int(model_cfg.get("patch_size", 3)),
-                    lon_periodic=lon_periodic,
+                input_steps = int(cfg["data"].get("input_time_steps", 2))
+                test_samples = [{
+                    "anchor_index": input_steps - 1,
+                    "history_indices": list(range(input_steps)),
+                    "target_indices": {},
+                }]
+                model.eval()
+                predictions = ft.run_rollout(
+                    model=model, ds=test_ds, start_sample=test_samples[0],
+                    config=cfg, resolved_specs=resolved_specs, device=device,
                 )
-                print(f"Saved rollout NetCDF: {rollout_path}")
+                print(f"Rollout prediction steps: {len(predictions)}")
+
+                rollout_path = output_dir / "rollout_predictions.nc"
+                if predictions and bool(
+                    rollout_cfg.get("save_predictions_to_netcdf", True)
+                ):
+                    # Convert bf16 predictions to float32 for numpy/NetCDF.
+                    predictions = [p.type(torch.float32) for p in predictions]
+                    ft.save_predictions(
+                        predictions, rollout_path, save_netcdf=True,
+                        resolved_specs=resolved_specs,
+                        smooth_sigma=float(rollout_cfg.get("smooth_sigma", 0.0)),
+                        patch_size=int(model_cfg.get("patch_size", 3)),
+                        lon_periodic=lon_periodic,
+                    )
+                    print(f"Saved rollout NetCDF: {rollout_path}")
 
         ft.write_run_manifest(
             cfg, output_dir,
@@ -1070,6 +1775,8 @@ def _worker(rank: int, world_size: int, local_gpu: int, cfg: dict):
                 "parameter_summary": param_summary,
                 "num_train_samples": len(train_samples),
                 "num_val_samples": len(val_samples),
+                "post_training_rollout_status": post_training_rollout_status,
+                "post_training_rollout_checkpoint": post_training_rollout_checkpoint,
             },
         )
         print("Training complete.")

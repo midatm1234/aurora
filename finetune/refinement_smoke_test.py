@@ -39,6 +39,7 @@ from finetune.refinement.two_phase import build_two_phase_refiner
 
 REFINERS = (
     "flow_matching_unet",
+    "flow_matching_conv_unet",
     "flow_matching_transformer",
     "diffusion_unet",
     "diffusion_transformer",
@@ -176,6 +177,16 @@ def run_smoke(
         )
         train_seconds = time.perf_counter() - started
 
+        scaler = getattr(model.refiner, "residual_scaler", None)
+        if scaler is not None and scaler.is_active and not scaler.is_ready:
+            correction, correction_mask = (
+                model.target_space.correction_target_from_normalized(
+                    target, rollout, valid_mask=mask
+                )
+            )
+            model.refiner.fit_residual_scale(correction, correction_mask)
+        model.eval()
+
         # --- one inference pass with an ensemble --------------------------
         started = time.perf_counter()
         inference = model.refine(
@@ -215,15 +226,19 @@ def run_smoke(
             import numpy as np
 
             with tempfile.TemporaryDirectory(dir=output_dir) as tmp:
+                init_times = np.array(
+                    ["2024-01-01T00"] * steps, dtype="datetime64[h]"
+                )
+                lead_values = np.asarray(lead_hours.tolist(), dtype=float)
+                lead_nanoseconds = np.rint(lead_values * 3_600_000_000_000).astype(
+                    "timedelta64[ns]"
+                )
                 dataset = build_refined_dataset(
                     packing=packing,
                     deterministic=model.target_space.decode(rollout),
-                    init_time=np.array(["2024-01-01T00"] * steps, dtype="datetime64[h]"),
-                    valid_time=np.array(
-                        [f"2024-01-0{1 + i // 2}T{(i % 2) * 12:02d}" for i in range(steps)],
-                        dtype="datetime64[h]",
-                    ),
-                    lead_time_hours=lead_hours.tolist(),
+                    init_time=init_times,
+                    valid_time=init_times.astype("datetime64[ns]") + lead_nanoseconds,
+                    lead_time_hours=lead_values,
                     refined=inference.refined_physical,
                     residual=inference.residual,
                     members=inference.members,

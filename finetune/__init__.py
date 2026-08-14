@@ -1,4 +1,6 @@
-"""Aurora fine-tuning utilities package.
+"""Copyright (c) Microsoft Corporation. Licensed under the MIT license.
+
+Aurora fine-tuning utilities package.
 
 Utilities are loaded lazily so lightweight coordinate/preparation helpers can
 be imported without constructing the full Aurora/timm model stack.

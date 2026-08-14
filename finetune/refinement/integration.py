@@ -40,12 +40,18 @@ from finetune.refinement.config import (
     resolve_refinement_config,
 )
 from finetune.refinement.packing import FieldPacking
-from finetune.refinement.two_phase import AuroraTwoPhaseRefiner
+from finetune.refinement.two_phase import (
+    AuroraTwoPhaseRefiner,
+    build_two_phase_refiner,
+    resolve_temporal_config,
+)
 
 __all__ = [
     "LeadStepBuffer",
+    "PackedConditioningInputs",
     "build_field_packing",
     "maybe_build_stochastic_refiner",
+    "pack_refinement_conditioning",
     "refine_batch_prediction",
     "refinement_backend",
 ]
@@ -88,15 +94,257 @@ def build_field_packing(
     """
     cfg = dict(config or {})
     leads = _lead_times_hours(cfg)
+    patch_size = int(cfg.get("model", {}).get("patch_size", 4))
+    if patch_size < 1:
+        raise ValueError(
+            f"model.patch_size must be a positive integer, got {patch_size!r}."
+        )
+
+    def _aligned_coordinates(
+        values: Sequence[float] | None,
+        *,
+        axis: str,
+    ) -> list[float] | None:
+        if values is None:
+            return None
+        resolved = [float(value) for value in values]
+        aligned = len(resolved) - (len(resolved) % patch_size)
+        if aligned < 1:
+            raise ValueError(
+                f"{axis} coordinate length {len(resolved)} is smaller than "
+                f"model.patch_size={patch_size}."
+            )
+        if axis == "longitude" and lon_periodic and aligned != len(resolved):
+            raise ValueError(
+                f"Periodic longitude length {len(resolved)} is not divisible by "
+                f"model.patch_size={patch_size}; regrid instead of cropping a "
+                "global longitude axis."
+            )
+        return resolved[:aligned]
+
+    aligned_lat = _aligned_coordinates(lat, axis="latitude")
+    aligned_lon = _aligned_coordinates(lon, axis="longitude")
     return FieldPacking.from_specs(
         list(resolved_specs.targets),
         norm_stats=norm_stats,
         atmos_levels=_atmos_levels(cfg),
-        lat=lat,
-        lon=lon,
+        lat=aligned_lat,
+        lon=aligned_lon,
         lead_times_hours=leads,
         lead_time_scale_hours=max(leads) if leads else None,
         lon_periodic=lon_periodic,
+    )
+
+
+@dataclasses.dataclass(frozen=True)
+class PackedConditioningInputs:
+    """Optional non-rollout fields consumed by the unified spatial refiner.
+
+    Both tensors use the same effective batch and spatial grid as the packed
+    deterministic rollout. ``input_state_normalized`` follows
+    :class:`FieldPacking` exactly; ``static_fields`` follows the configured
+    ``data.static_variables`` order recorded on the wrapper.
+    """
+
+    input_state_normalized: torch.Tensor | None = None
+    static_fields: torch.Tensor | None = None
+
+
+def _repeat_to_effective_batch(
+    tensor: torch.Tensor,
+    effective_batch: int,
+    *,
+    field_name: str,
+) -> torch.Tensor:
+    source_batch = int(tensor.shape[0])
+    if source_batch == effective_batch:
+        return tensor
+    if source_batch < 1 or effective_batch % source_batch:
+        raise ValueError(
+            f"{field_name} has batch size {source_batch}, which cannot be aligned "
+            f"with the refinement effective batch size {effective_batch}. Expected "
+            "an equal batch size or an exact divisor."
+        )
+    return tensor.repeat_interleave(effective_batch // source_batch, dim=0)
+
+
+def _pack_latest_target_state(
+    refiner: AuroraTwoPhaseRefiner,
+    batch: Any,
+) -> torch.Tensor:
+    """Pack the latest Aurora input frame in target channel/level order."""
+    packing = refiner.packing
+    fields: dict[str, torch.Tensor] = {}
+    metadata_levels = tuple(
+        float(value)
+        for value in getattr(getattr(batch, "metadata", None), "atmos_levels", ())
+    )
+
+    for name in packing.variables:
+        specs = packing.channels_for(name)
+        kind = specs[0].kind
+        source = batch.surf_vars if kind == "surf" else batch.atmos_vars
+        if name not in source:
+            raise ValueError(
+                "refinement.conditioning.aurora_input_state requires target "
+                f"variable {name!r} in the Aurora input batch {kind}_vars; "
+                f"available variables are {sorted(source)}."
+            )
+        tensor = source[name]
+        if kind == "surf":
+            if tensor.ndim == 4:
+                tensor = tensor[:, -1]
+            elif tensor.ndim != 3:
+                raise ValueError(
+                    "refinement.conditioning.aurora_input_state surface variable "
+                    f"{name!r} must have shape [batch, time, latitude, longitude] "
+                    f"or [batch, latitude, longitude], got {tuple(tensor.shape)}."
+                )
+        else:
+            if tensor.ndim == 5:
+                tensor = tensor[:, -1]
+            elif tensor.ndim != 4:
+                raise ValueError(
+                    "refinement.conditioning.aurora_input_state atmospheric "
+                    f"variable {name!r} must have shape [batch, time, level, "
+                    "latitude, longitude] or [batch, level, latitude, longitude], "
+                    f"got {tuple(tensor.shape)}."
+                )
+            selected_levels = tuple(float(spec.level) for spec in specs)
+            if not metadata_levels:
+                if tensor.shape[1] != len(selected_levels):
+                    raise ValueError(
+                        "refinement.conditioning.aurora_input_state cannot select "
+                        f"levels {selected_levels} for {name!r}: batch.metadata."
+                        "atmos_levels is empty and the tensor contains "
+                        f"{tensor.shape[1]} levels."
+                    )
+            else:
+                try:
+                    indices = [metadata_levels.index(level) for level in selected_levels]
+                except ValueError as exc:
+                    missing = [level for level in selected_levels if level not in metadata_levels]
+                    raise ValueError(
+                        "refinement.conditioning.aurora_input_state requires "
+                        f"atmospheric levels {selected_levels} for {name!r}, but "
+                        f"batch.metadata.atmos_levels={metadata_levels}; missing "
+                        f"levels are {missing}."
+                    ) from exc
+                tensor = tensor.index_select(
+                    1,
+                    torch.tensor(indices, dtype=torch.long, device=tensor.device),
+                )
+        fields[name] = tensor
+
+    return refiner.target_space.encode(packing.pack(fields))
+
+
+def _pack_static_fields(
+    refiner: AuroraTwoPhaseRefiner,
+    batch: Any,
+    *,
+    effective_batch: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    names = tuple(refiner.conditioning_static_names)
+    if not names:
+        raise ValueError(
+            "refinement.conditioning.static_fields=true requires at least one "
+            "resolved data.static_variables entry; actual resolved list is empty."
+        )
+    source = getattr(batch, "static_vars", None)
+    if not isinstance(source, Mapping):
+        raise ValueError(
+            "refinement.conditioning.static_fields=true requires an Aurora batch "
+            "with a static_vars mapping."
+        )
+
+    parts: list[torch.Tensor] = []
+    for name in names:
+        if name not in source:
+            raise ValueError(
+                "refinement.conditioning.static_fields requires configured static "
+                f"variable {name!r}, but batch.static_vars contains "
+                f"{sorted(source)}."
+            )
+        tensor = source[name].to(device=device, dtype=dtype)
+        if tensor.ndim == 2:
+            tensor = tensor.unsqueeze(0)
+        elif tensor.ndim == 4 and tensor.shape[1] == 1:
+            tensor = tensor[:, 0]
+        elif tensor.ndim != 3:
+            raise ValueError(
+                "refinement.conditioning.static_fields variable "
+                f"{name!r} must have shape [latitude, longitude], [batch, "
+                "latitude, longitude], or [batch, 1, latitude, longitude], "
+                f"got {tuple(tensor.shape)}."
+            )
+        tensor = _repeat_to_effective_batch(
+            tensor,
+            effective_batch,
+            field_name=f"static field {name!r}",
+        )
+        parts.append(tensor.unsqueeze(1))
+    return torch.cat(parts, dim=1)
+
+
+def pack_refinement_conditioning(
+    refiner: AuroraTwoPhaseRefiner,
+    reference: torch.Tensor,
+    *,
+    aurora_input_batch: Any | None = None,
+    static_batch: Any | None = None,
+) -> PackedConditioningInputs:
+    """Pack configured input-state/statics for shared training and inference.
+
+    ``reference`` is the normalized deterministic rollout ``[N,C,H,W]`` and
+    defines the effective batch, device and dtype. The input state is always
+    taken from the latest frame of the *pre-forecast* Aurora batch, never from
+    the forecast target or the deterministic prediction being corrected.
+    """
+    if reference.ndim != 4:
+        raise ValueError(
+            "reference must have shape [effective_batch, channel, latitude, "
+            f"longitude], got {tuple(reference.shape)}."
+        )
+    cond = refiner.refinement_config.conditioning
+    effective_batch = int(reference.shape[0])
+    input_state: torch.Tensor | None = None
+    statics: torch.Tensor | None = None
+
+    if cond.aurora_input_state:
+        if aurora_input_batch is None:
+            raise ValueError(
+                "refinement.conditioning.aurora_input_state=true requires the "
+                "pre-forecast Aurora input batch, but aurora_input_batch=None."
+            )
+        input_state = _pack_latest_target_state(refiner, aurora_input_batch)
+        input_state = _repeat_to_effective_batch(
+            input_state,
+            effective_batch,
+            field_name="packed Aurora input state",
+        ).to(device=reference.device, dtype=reference.dtype)
+
+    if cond.static_fields:
+        source = static_batch if static_batch is not None else aurora_input_batch
+        if source is None:
+            raise ValueError(
+                "refinement.conditioning.static_fields=true requires a batch "
+                "containing configured static_vars, but no static_batch or "
+                "aurora_input_batch was supplied."
+            )
+        statics = _pack_static_fields(
+            refiner,
+            source,
+            effective_batch=effective_batch,
+            device=reference.device,
+            dtype=reference.dtype,
+        )
+
+    return PackedConditioningInputs(
+        input_state_normalized=None if input_state is None else input_state.detach(),
+        static_fields=None if statics is None else statics.detach(),
     )
 
 
@@ -119,6 +367,24 @@ def maybe_build_stochastic_refiner(
     refinement = resolve_refinement_config(config)
     if refinement.backend != "unified":
         return None
+    static_names = tuple(spec.aurora_name for spec in resolved_specs.static)
+    if refinement.conditioning.static_fields and not static_names:
+        raise ValueError(
+            "refinement.conditioning.static_fields=true requires at least one "
+            "resolved data.static_variables entry; actual resolved list is empty."
+        )
+    if refinement.conditioning.aurora_input_state:
+        predictor_names = {spec.aurora_name for spec in resolved_specs.predictors}
+        target_names = {spec.aurora_name for spec in resolved_specs.targets}
+        missing_inputs = sorted(target_names - predictor_names)
+        if missing_inputs:
+            raise ValueError(
+                "refinement.conditioning.aurora_input_state=true requires every "
+                "refinement target to be present in the Aurora input state. Missing "
+                f"target predictors are {missing_inputs}; add them to "
+                "data.predictor_variables or enable "
+                "data.include_target_variables_as_predictors."
+            )
     packing = build_field_packing(
         config,
         resolved_specs,
@@ -127,14 +393,19 @@ def maybe_build_stochastic_refiner(
         lon=lon,
         lon_periodic=lon_periodic,
     )
-    wrapper = AuroraTwoPhaseRefiner(
+    wrapper = build_two_phase_refiner(
         aurora,
         packing,
-        refinement=refinement,
-        performance=resolve_performance_config(config),
+        config,
         nonnegative_variables=tuple(nonnegative_variables),
+        conditioning_static_names=static_names,
     )
-    wrapper.initialize_refiner(wrapper.conditioning_channels())
+    wrapper.initialize_refiner(
+        wrapper.conditioning_channels(
+            static_fields=len(wrapper.conditioning_static_names),
+            input_state_channels=packing.num_channels,
+        )
+    )
     return wrapper
 
 
@@ -154,6 +425,8 @@ class LeadStepBuffer:
         self._target: dict[int, dict[str, torch.Tensor]] = {}
         self._mask: dict[int, dict[str, torch.Tensor]] = {}
         self._lead_hours: dict[int, torch.Tensor | float | None] = {}
+        self._input_state: dict[int, torch.Tensor] = {}
+        self._static_fields: dict[int, torch.Tensor] = {}
 
     def add(
         self,
@@ -180,6 +453,49 @@ class LeadStepBuffer:
         wanted = set(self.packing.variables)
         return bool(self._rollout) and all(
             set(self._rollout[lead]) == wanted for lead in self._rollout
+        )
+
+    def set_conditioning(
+        self,
+        lead: int,
+        *,
+        input_state_normalized: torch.Tensor | None = None,
+        static_fields: torch.Tensor | None = None,
+    ) -> None:
+        """Record target-independent conditioning for one rollout step."""
+        if input_state_normalized is not None:
+            self._input_state[lead] = input_state_normalized.detach()
+        if static_fields is not None:
+            self._static_fields[lead] = static_fields.detach()
+
+    def pack_conditioning(
+        self,
+        device: torch.device | str | None = None,
+    ) -> PackedConditioningInputs:
+        """Fold optional conditioning into the same lead-major layout as ``pack``."""
+
+        def _pack_optional(
+            values: Mapping[int, torch.Tensor], field_name: str
+        ) -> torch.Tensor | None:
+            if not values:
+                return None
+            missing = [lead for lead in self.leads if lead not in values]
+            extra = sorted(set(values) - set(self.leads))
+            if missing or extra:
+                raise ValueError(
+                    f"{field_name} lead coverage must match rollout leads "
+                    f"{self.leads}; missing={missing}, extra={extra}."
+                )
+            packed = torch.cat([values[lead] for lead in self.leads], dim=0)
+            return packed.to(device) if device is not None else packed
+
+        return PackedConditioningInputs(
+            input_state_normalized=_pack_optional(
+                self._input_state, "Aurora input-state conditioning"
+            ),
+            static_fields=_pack_optional(
+                self._static_fields, "static-field conditioning"
+            ),
         )
 
     def pack(
@@ -237,7 +553,9 @@ def refine_batch_prediction(
     ensemble_size: int | None = None,
     seed: int | None = None,
     generator: torch.Generator | None = None,
+    aurora_input_batch: Any | None = None,
     return_details: bool = False,
+    temporal_history: list[torch.Tensor] | None = None,
 ) -> Any:
     """Refine one deterministic Aurora prediction ``Batch`` as postprocessing.
 
@@ -284,15 +602,24 @@ def refine_batch_prediction(
     batch = reference.shape[0]
     physical = packing.pack(fields)
     rollout_norm = refiner.target_space.encode(physical)
+    packed_conditioning = pack_refinement_conditioning(
+        refiner,
+        rollout_norm,
+        aurora_input_batch=aurora_input_batch,
+        static_batch=aurora_input_batch if aurora_input_batch is not None else pred,
+    )
 
     lead = _lead_tensor(forecast_lead_time_hours, batch, physical.device)
     result = refiner.refine(
         rollout_norm,
+        input_state_normalized=packed_conditioning.input_state_normalized,
+        static_fields=packed_conditioning.static_fields,
         forecast_lead_time=lead,
         ensemble_size=ensemble_size,
         seed=seed,
         generator=generator,
         return_members=return_details,
+        temporal_history=temporal_history,
     )
     refined_physical = result.refined_physical
     if refined_physical is None:
@@ -339,6 +666,7 @@ def describe_refinement(config: Mapping[str, Any] | None) -> dict[str, Any]:
     refinement: RefinementConfig = resolve_refinement_config(config)
     return {
         "refinement": refinement.to_dict(),
+        "temporal": resolve_temporal_config(config),
         "performance": resolve_performance_config(config).to_dict(),
         "backend": refinement.backend,
     }

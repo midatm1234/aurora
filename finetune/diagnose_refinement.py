@@ -17,7 +17,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import xarray as xr
@@ -28,14 +27,30 @@ if __package__ in {None, ""}:
 
 from finetune.generate_overall_evaluation_maps import (
     Selection,
+    aligned_2d_values,
+    assert_same_coordinate,
     file_safe,
     load_settings,
     match_coordinate_indices,
+    match_valid_time_index,
     robust_limits,
     rollout_files_by_initialization,
     select_level_index,
     target_selections,
+    validate_rollout_time_metadata,
 )
+from finetune.refinement.io import resolve_forecast_variable
+
+
+def _pyplot():
+    """Import optional plotting support only when a figure is requested."""
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError as exc:  # pragma: no cover - depends on optional plotting stack.
+        raise RuntimeError(
+            "Matplotlib is required only to render refinement diagnostic figures."
+        ) from exc
+    return plt
 
 
 @dataclass
@@ -310,6 +325,7 @@ def plot_diagnostic_map(
     path: Path,
 ) -> None:
     """Write the requested eight-panel overall diagnostic map."""
+    plt = _pyplot()
     field_limits = robust_limits(
         [fields["truth"], fields["baseline"], fields["refined"]]
     )
@@ -351,7 +367,8 @@ def plot_diagnostic_map(
         axis.set_title(title)
         axis.set_xlabel("Longitude")
         axis.set_ylabel("Latitude")
-        axis.set_xlim(-180, 180)
+        if longitude.size:
+            axis.set_xlim(float(np.nanmin(longitude)), float(np.nanmax(longitude)))
     level = "surface" if selection.level is None else f"{selection.level:g} hPa"
     fig.suptitle(
         f"Refinement diagnosis: {selection.variable} ({level}); "
@@ -369,6 +386,7 @@ def plot_scatter(
     path: Path,
 ) -> None:
     """Plot sampled predicted corrections against true residuals."""
+    plt = _pyplot()
     fig, axis = plt.subplots(figsize=(7, 6))
     axis.hexbin(
         true_residual,
@@ -404,6 +422,7 @@ def plot_scatter(
 
 def plot_metrics_by_lead(frame: pd.DataFrame, output_dir: Path) -> None:
     """Plot magnitude, pattern, amplitude, and correction metrics by lead."""
+    plt = _pyplot()
     for (variable, level), group in frame.groupby(["variable", "level"], sort=True):
         group = group.sort_values("lead_time_hours")
         stem = f"{file_safe(variable)}_{file_safe(level)}"
@@ -438,6 +457,7 @@ def plot_metrics_by_lead(frame: pd.DataFrame, output_dir: Path) -> None:
 
 def plot_metrics_by_case(frame: pd.DataFrame, output_dir: Path) -> None:
     """Plot case-to-case RMSE and correction-amplitude variation."""
+    plt = _pyplot()
     frame = frame.copy()
     frame["initialization_time"] = pd.to_datetime(frame["initialization_time"])
     frame["rmse_improvement_percent"] = np.where(
@@ -592,13 +612,13 @@ def diagnose(
     truth = xr.open_dataset(settings["truth_path"], decode_times=True)
     try:
         truth_times = np.asarray(truth.time.values).astype("datetime64[ns]")
+        if np.isnat(truth_times).any() or np.unique(truth_times).size != truth_times.size:
+            raise ValueError("CAMS truth time must contain unique, non-NaT valid times.")
         truth_lookup = {
             int(value.astype(np.int64)): index
             for index, value in enumerate(truth_times)
         }
-        with xr.open_dataset(refined_files[common[0]]) as first_refined, xr.open_dataset(
-            baseline_files[common[0]]
-        ) as first_baseline:
+        with xr.open_dataset(refined_files[common[0]]) as first_refined:
             latitude = np.asarray(first_refined.latitude.values, dtype=float)
             longitude = np.asarray(first_refined.longitude.values, dtype=float)
             tolerance = settings["coordinate_tolerance"]
@@ -614,15 +634,23 @@ def diagnose(
                 tolerance,
                 name="longitude",
             )
-            if not np.allclose(first_baseline.latitude, latitude, atol=tolerance, rtol=0):
-                raise ValueError("Baseline/refined latitude coordinates do not match.")
-            if not np.allclose(first_baseline.longitude, longitude, atol=tolerance, rtol=0):
-                raise ValueError("Baseline/refined longitude coordinates do not match.")
+
+        missing_truth_variables = [
+            selection.variable
+            for selection in selections
+            if selection.variable not in truth.data_vars
+        ]
+        if missing_truth_variables:
+            raise KeyError(
+                "CAMS truth is missing configured target variable(s): "
+                + ", ".join(sorted(set(missing_truth_variables)))
+            )
 
         sums = {
             selection: SpatialSums.create((len(latitude), len(longitude)))
             for selection in selections
         }
+        skipped_without_truth = 0
         for initialization_ns in tqdm(
             common, desc="Refinement diagnostics", unit="initialization",
         ):
@@ -632,8 +660,45 @@ def diagnose(
                 refined_files[initialization_ns], decode_times=True,
             ) as refined:
                 initialization = np.datetime64(initialization_ns, "ns")
-                valid_times = np.asarray(refined.time.values).astype("datetime64[ns]")
-                for time_index, valid_time in enumerate(valid_times):
+                baseline_context = str(baseline_files[initialization_ns])
+                refined_context = str(refined_files[initialization_ns])
+                valid_times, refined_step_dim = validate_rollout_time_metadata(
+                    refined,
+                    initialization,
+                    context=refined_context,
+                )
+                baseline_valid_times, baseline_step_dim = validate_rollout_time_metadata(
+                    baseline,
+                    initialization,
+                    context=baseline_context,
+                )
+                assert_same_coordinate(
+                    latitude,
+                    np.asarray(refined.latitude.values, dtype=float),
+                    tolerance,
+                    name="latitude",
+                    context=refined_context,
+                )
+                assert_same_coordinate(
+                    longitude,
+                    np.asarray(refined.longitude.values, dtype=float),
+                    tolerance,
+                    name="longitude",
+                    context=refined_context,
+                )
+                baseline_lat_idx = match_coordinate_indices(
+                    np.asarray(baseline.latitude.values, dtype=float),
+                    latitude,
+                    tolerance,
+                    name=f"{baseline_context} latitude",
+                )
+                baseline_lon_idx = match_coordinate_indices(
+                    np.asarray(baseline.longitude.values, dtype=float),
+                    longitude,
+                    tolerance,
+                    name=f"{baseline_context} longitude",
+                )
+                for refined_time_index, valid_time in enumerate(valid_times):
                     lead = float((valid_time - initialization) / np.timedelta64(1, "h"))
                     if not any(
                         np.isclose(lead, requested, atol=1.0e-6, rtol=0)
@@ -642,42 +707,91 @@ def diagnose(
                         continue
                     truth_index = truth_lookup.get(int(valid_time.astype(np.int64)))
                     if truth_index is None:
+                        skipped_without_truth += 1
                         continue
+                    baseline_time_index = match_valid_time_index(
+                        baseline_valid_times,
+                        valid_time,
+                        context=baseline_context,
+                    )
                     for selection in selections:
+                        if selection.variable not in baseline.data_vars:
+                            raise KeyError(
+                                f"{baseline_context} is missing configured variable "
+                                f"{selection.variable!r}."
+                            )
+                        refined_variable = resolve_forecast_variable(
+                            refined, selection.variable
+                        )
+                        if refined_step_dim not in refined_variable.dims:
+                            raise ValueError(
+                                f"{refined_context} forecast variable "
+                                f"{refined_variable.name!r} does not use time step "
+                                f"dimension {refined_step_dim!r}."
+                            )
                         truth_field = truth[selection.variable].isel(
                             time=truth_index,
                             latitude=truth_lat_idx,
                             longitude=truth_lon_idx,
                         )
-                        baseline_field = baseline[selection.variable].isel(time=time_index)
-                        refined_field = refined[selection.variable].isel(time=time_index)
+                        baseline_field = baseline[selection.variable].isel(
+                            {
+                                baseline_step_dim: baseline_time_index,
+                                "latitude": baseline_lat_idx,
+                                "longitude": baseline_lon_idx,
+                            }
+                        )
+                        refined_field = refined_variable.isel(
+                            {refined_step_dim: refined_time_index}
+                        )
                         if selection.level is not None:
                             truth_field = truth_field.isel(
                                 level=select_level_index(
-                                    np.asarray(truth.level.values, dtype=float),
+                                    np.asarray(truth_field.level.values, dtype=float),
                                     selection.level,
                                     settings["level_tolerance"],
                                 )
                             )
                             baseline_field = baseline_field.isel(
                                 level=select_level_index(
-                                    np.asarray(baseline.level.values, dtype=float),
+                                    np.asarray(baseline_field.level.values, dtype=float),
                                     selection.level,
                                     settings["level_tolerance"],
                                 )
                             )
                             refined_field = refined_field.isel(
                                 level=select_level_index(
-                                    np.asarray(refined.level.values, dtype=float),
+                                    np.asarray(refined_field.level.values, dtype=float),
                                     selection.level,
                                     settings["level_tolerance"],
                                 )
                             )
                         if "member" in refined_field.dims:
                             refined_field = refined_field.mean("member", skipna=True)
-                        truth_values = np.asarray(truth_field.values, dtype=float)
-                        baseline_values = np.asarray(baseline_field.values, dtype=float)
-                        refined_values = np.asarray(refined_field.values, dtype=float)
+                        truth_values = aligned_2d_values(
+                            truth_field,
+                            context=f"CAMS {selection.variable!r} at {valid_time}",
+                        )
+                        baseline_values = aligned_2d_values(
+                            baseline_field,
+                            context=f"Aurora {selection.variable!r} at {valid_time}",
+                        )
+                        refined_values = aligned_2d_values(
+                            refined_field,
+                            context=f"refined {selection.variable!r} at {valid_time}",
+                        )
+                        expected_shape = (len(latitude), len(longitude))
+                        for field_name, values in (
+                            ("CAMS", truth_values),
+                            ("Aurora", baseline_values),
+                            ("refined", refined_values),
+                        ):
+                            if values.shape != expected_shape:
+                                raise ValueError(
+                                    f"{field_name} {selection.variable!r} at "
+                                    f"{valid_time} has shape {values.shape}; "
+                                    f"expected {expected_shape}."
+                                )
                         metrics = case_metrics(
                             truth_values, baseline_values, refined_values,
                         )
@@ -722,6 +836,13 @@ def diagnose(
                                     flat_refined[chosen] - flat_base[chosen],
                                 )
                             )
+
+        if skipped_without_truth:
+            print(
+                "Skipped "
+                f"{skipped_without_truth} requested forecast steps outside the CAMS "
+                "truth valid-time range; no nearest-time matching was attempted."
+            )
 
         case_frame = pd.DataFrame(rows)
         lead_frame = aggregate_case_metrics(case_frame)
