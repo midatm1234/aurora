@@ -1,14 +1,11 @@
 paths:
   project_root: .
   data_dir: ../data
-  train_data_path: ../data/train.nc
-  val_data_path: ../data/test.nc
-  test_data_path: ../data/test.nc
+  data_case_name: NO2_US-WEST_3day_lead  # Reuse prepared NO2 data; case_name separates artifacts.
   output_dir: ./outputs
   checkpoint_dir: ./outputs/checkpoints
   pretrained_checkpoint: ""  # Optional local checkpoint path. Empty uses model default HF checkpoint.
   static_data_path: /data/cams/aurora-0.4-air-pollution-static.pickle  # Pickle with lsm, z, slt (from HuggingFace)
-  optional_resume_checkpoint: ""
 
 # Sub-folder under output_dir / checkpoint_dir for this experiment.
 # When set, all artifacts (best.ckpt, last.ckpt, training_history.*,
@@ -58,15 +55,15 @@ data:
     - dataset_name: no2
       aurora_name: no2
       kind: atmos
-      # Compute target loss AND apply flow-refine bias correction only at
-      # these pressure levels. Levels not listed here pass through from
-      # the backbone without post-processing. The full atmospheric level
-      # grid remains in data.atmos_levels so Aurora's encoder/decoder and
-      # checkpoint shapes stay compatible.
+      # Compute loss and train the refinement head at these pressure levels.
+      # Other levels remain Aurora backbone output; the full atmospheric level
+      # grid remains in data.atmos_levels for backbone/checkpoint compatibility.
+      units: kg kg-1
       loss_levels: [1000, 925, 850]
     - dataset_name: tcno2
       aurora_name: tcno2
       kind: surf
+      units: kg m-2
 
   static_variables:
     - dataset_name: lsm
@@ -108,6 +105,7 @@ data:
   target_lead_times: [1,2,3,4,5,6]  # Multi-step rollout supervision at these target lead indices (1 step = rollout_step_hours).
   target_type: rollout  # next-step | multi-step | rollout
 
+  nonnegative_target_variables: [no2, tcno2]
   domain_type: regional  # global | regional
   lat_min: 31.0
   lat_max: 52.0
@@ -161,60 +159,168 @@ data:
 model:
   model_variant: aurora_air_pollution
   patch_size: 3  # AuroraAirPollution uses patch_size=3.
+  lon_periodic: auto  # Resolves false for this regional, non-wrapping domain.
   use_pretrained_weights: true
-  backbone_freeze: true
-  freeze_embeddings: true
-  freeze_encoder: true
-  freeze_decoder: false
-  trainable_head_only: false
-  gradient_checkpointing: false  # backbone is frozen (backbone_freeze/freeze_encoder: true) and GPU is far from full (~7/95 GiB used), so activation checkpointing only wastes compute by recomputing the frozen forward during backward. Disable for a large speedup on this small grid.
+  gradient_checkpointing: false  # Phase-1 Aurora is frozen by refinement.freeze_aurora.
   mixed_precision: bf16  # none | bf16 | fp16
-  device: cuda
-  compile_model: false
-  conv_refine_enabled: false  # Wrap decoder with convolutional refinement heads.
-  conv_refine_hidden: 32      # Hidden channels in conv refinement blocks.
-  # Rectified-flow residual decoder for bias correction.
-  # Trains a small UNet on the conditional residual r = y_true − ŷ in
-  # normalised space; at inference, samples r̂ via Euler integration of
-  # the FM ODE and adds it back. Mutually exclusive with conv-refine
-  # (flow takes precedence when both are enabled).
-  flow_refine_enabled: true
-  flow_refine_hidden: 64           # base UNet width
-  flow_refine_time_dim: 128        # sinusoidal time embedding dim
-  flow_refine_sampling_steps: 1    # Phase-1 (early epochs): deterministic regression.
-  # Progressive sampling-steps schedule. After the first
-  # `flow_refine_phase_fraction` of training (default 1/3) the eval-time
-  # sampler switches to `flow_refine_sampling_steps_late` to let the
-  # head express multi-modal residuals. Training loss is independent of
-  # this knob (t is sampled uniformly in [0,1]); it only affects
-  # validation/rollout.
-  flow_refine_sampling_steps_late: 8
-  flow_refine_phase_fraction: 0.3333
-  # ------------------------------------------------------------------
-  # Mamba temporal module (long-lead rollout corrector).
-  # Adds a selective state-space (Mamba) corrector on top of the
-  # flow-matching output. It learns how the bias-corrected field and
-  # Aurora's residual evolve across a rollout sequence, targeting the
-  # accumulated drift that degrades 2-3 day forecasts relative to 6 h.
-  # The temporal decoder is zero-init (identity-at-init), so the module
-  # is a no-op until trained. Trained on the ordered multi-lead sequence
-  # (see training.mamba_temporal_weight) and applied causally at rollout.
-  # Requires flow_refine_enabled: true and >= 2 target_lead_times.
-  mamba_temporal_enabled: true
-  mamba_temporal_channels: 16   # per-pixel feature width of the encoder/SSM
-  mamba_temporal_state: 8       # SSM hidden state dimension (N)
-  mamba_temporal_layers: 2      # stacked Mamba blocks
-  mamba_temporal_conv: 3        # causal temporal conv kernel
-  mamba_temporal_expand: 2      # SSM inner expansion factor
+  refinement:
+    enabled: true
+    type: flow_matching_conv_unet
+    correction_convention: cams_minus_aurora_add
+    checkpoint: null
+    freeze_aurora: true
+    joint_finetuning: false
+    # Repository-wide correction contract (including serialization/evaluation):
+    #   correction_target = CAMS - Aurora
+    #   refined_forecast = Aurora + predicted_correction
+    train_on_residual: true
+    feedback_to_rollout: false
+    seed: 1234
+    # The default forecast product is the deterministic conditional mean.
+    # For uncertainty experiments set deterministic_inference=false and use
+    # ensemble_size >= 2; never evaluate one arbitrary stochastic member as the
+    # "fine-tuned forecast".
+    ensemble_size: 1
+    deterministic_inference: true
+    # Query and directly supervise the flow network itself for the point
+    # product. While its zero-initialized projection is untouched, inference
+    # returns a literal zero correction before centered residual decoding;
+    # trained outputs use calibrated mean/std. Omitted/legacy configs retain
+    # the independent mean-head contract.
+    deterministic_head: shared_process
+
+    target_space:
+      use_existing_normalization: true
+      residual_space: normalized
+      # Fit one finite, masked training-split mean/std for every packed
+      # variable/pressure-level channel and restore both exactly once.
+      residual_scaling: per_channel
+      residual_scaling_center: true
+      residual_scaling_momentum: 0.05
+      residual_scaling_warmup_batches: 32
+      residual_scaling_target_std: 1.0
+      # Constrain deployed corrections to the centered training residual range.
+      residual_clip_standard_deviations: 4.0
+
+    conditioning:
+      aurora_rollout: true
+      aurora_input_state: false
+      aurora_features: false
+      static_fields: false
+      masks: true
+      forecast_lead_time: true
+      latitude: true
+      longitude: true
+
+    loss:
+      generative: mse
+      # Directly train and score the deterministic correction that is deployed;
+      # the flow objective alone is not a checkpoint-quality metric.
+      deterministic_weight: 1.0
+      aux_on_deterministic: true
+      reconstruction_weight: 0.0
+      mae_weight: 1.0
+      bias_weight: 1.0
+      gradient_weight: 0.25
+      pattern_correlation_weight: 0.5
+      variance_weight: 2.0
+      extreme_weight: 1.0
+      extreme_quantile: 0.95
+      extreme_intensity: 4.0
+      extreme_tail: upper
+      quantile_weight: 1.0
+      peak_weight: 0.0
+      spectral_weight: 0.0
+      degradation_weight: 1.0
+      magnitude_weight: 0.0
+      area_weighted: true
+      separate_by_variable: true
+      separate_by_level: true
+      separate_by_lead_time: true
+
+    # Retained in this consolidated NO2 recipe so changing `type` to
+    # flow_matching_transformer is explicit and does not inherit an accidental
+    # scheduler/path default. The shared target, scaler, deterministic mean,
+    # conditioning, losses, checkpoint metric, and constraints stay unchanged.
+    flow_matching:
+      source_distribution: gaussian
+      interpolation_path: existing_aurora
+      integration_steps: 50
+      solver: euler  # existing_aurora uses data-parameterization updates, not an ODE solver.
+      stochastic_initialization: true
+      time_sampling: logit_normal
+      sigma_min: 1.0e-3
+      logit_normal_mean: -0.5
+      logit_normal_std: 1.2
+      residual_zscore: false  # shared per-channel correction scaler is authoritative
+      res_std_momentum: 0.99
+
+    diffusion:
+      training_timesteps: 1000
+      inference_steps: 50
+      # Predict the clean correction x0. With a zero-initialized projection this
+      # starts at the identity; a zero epsilon prediction instead amplifies the
+      # initial Gaussian latent and is not a zero correction.
+      prediction_type: sample
+      schedule: cosine
+      sampler: ddim
+      eta: 0.0
+      clip_sample: false
+      clip_sample_range: 10.0
+      snr_weighting: auto
+      snr_gamma: 5.0
+      timestep_distribution: auto
+      timestep_bias: 3.0
+      deterministic_estimator: auto
+      deterministic_training_steps: 4
+
+    # Spatial backbone for the flow-matching correction process. The output projection
+    # is independently zero initialized for every packed variable/level.
+    unet:
+      hidden_channels: 64
+      num_levels: 3
+      num_residual_blocks: 2
+      time_embedding_dim: 128
+      dropout: 0.0
+      bottleneck_attention: true
+      attention_heads: 4
+      zero_init_output: true
+
+    transformer:
+      patch_size: [4, 4]  # 51x69 region -> 13x18 tokens; retain plume-scale detail.
+      embedding_dim: 256
+      num_heads: 8
+      num_blocks: 6
+      mlp_ratio: 4.0
+      dropout: 0.0
+      positional_encoding: sincos_2d
+      max_tokens_lat: 256
+      max_tokens_lon: 512
+      attention_mode: windowed_2d
+      window_size: [8, 8]
+      shifted_windows: true
+      gradient_checkpointing: true
+      optimized_attention: auto
+      zero_init_output: true
+      local_refinement: true
+
+  # Optional causal sequence model. Keep it disabled unless a run explicitly
+  # trains and validates the temporal objective independently.
+  mamba_temporal_enabled: false
+  mamba_temporal_channels: 16
+  mamba_temporal_state: 8
+  mamba_temporal_layers: 2
+  mamba_temporal_conv: 3
+  mamba_temporal_expand: 2
   model_kwargs: {}
 
 training:
   seed: 42
-  batch_size: 1  # 6 leads × 13 atmos levels × FM head OOMs at bs=2 on 22 GB A10G; effective batch = 1 × 4 GPUs × 8 accum = 32
-  num_epochs: 100  # fresh finetune at target_lead_times=[1,2,3,4,5,6] from a clean random init of the FM head
-  # Fresh stage-1 fine-tune over target_lead_times=[1,2,3,4,5,6] from a clean
-  # random init of the FM head, trained jointly at the standard 3e-4 UNet
-  # LR so the head learns the multi-lead residual across all leads at once.
+  batch_size: 1  # Six supervised rollout leads per sample; accumulate below.
+  num_epochs: 100
+  # Phase 1 Aurora is frozen; train the flow-matching correction head only.
+  refinement_loss_weight: 1.0
+  mamba_temporal_weight: 0.0
   learning_rate: 3.0e-4
   optimizer: adamw
   weight_decay: 0.0
@@ -222,90 +328,49 @@ training:
   # Short warmup: head-only fine-tune from a pretrained backbone doesn't need
   # the paper's 100-step linear warmup (that's for from-scratch pretraining).
   scheduler_warmup_steps: 10
-  scheduler_t_max: 150  # set near total optimizer updates (num_epochs x updates/epoch); retune if num_epochs or batch geometry changes.
   scheduler_eta_min: 0.0
   scheduler_step_size: 10
   scheduler_gamma: 0.5
   gradient_clip_val: 1.0
   accumulation_steps: 8
-  # Per-parameter LR scaling by weight RMS. AdamW takes ~unit-magnitude steps
-  # in normalised weight units regardless of the parameter's actual scale.
-  # Setting this enables the trust-ratio-style per-tensor scaling in
-  # aurora_finetune_distributed.py.
-  scale_aware_lr:
-    enabled: true
-    # Reference RMS used as the "1.0×" scale. Params with rms below this
-    # get LR proportionally reduced; params above get clipped to 1.0×.
-    # If null, computed automatically as the median rms of well-conditioned
-    # pretrained params at optimizer construction time.
-    reference_rms: null
-    # Lower bound on the per-tensor scale factor so vanishingly small params
-    # are not completely frozen (only applies to pretrained params).
-    min_scale: 1.0e-3
-    # rms below this is considered a (near-)zero-init param (e.g. fresh head
-    # bias) and is excluded from the reference-rms estimate.
-    rms_floor: 1.0e-4
-    # Multiplicative LR scale on Aurora-pretrained params. The pretrained
-    # Aurora is already near-optimal on CAMS dates similar to its training
-    # set (init val_loss < end-of-epoch-1 val_loss in our run); fine-tuning
-    # those weights drifts the model AWAY from the optimum. Set this to 0.0
-    # to freeze pretrained params entirely and let the convolutional refine
-    # heads (newly initialised) absorb the residual biases. The refine
-    # heads always run at the full configured `learning_rate`.
-    pretrained_lr_scale: 0.0
   early_stopping:
+    # Complete all 100 configured epochs; validation still controls best.ckpt.
     enabled: false
     patience: 3
     min_delta: 1.0e-5
   validation_frequency: 5  # validation runs the full multi-lead rollout over the whole val set; doing it every epoch (=1) roughly doubles per-epoch cost. Validate every 5 epochs.
+  # Validate the same deterministic conditional-mean product used at inference.
+  validation_refinement_ensemble_size: 1
+  skip_validation: false
+  validation_source: train_tail  # Keep model selection disjoint from held-out test.nc.
+  validation_fraction: 0.1
+  # Select in physical space: mean(refined RMSE / Aurora RMSE), grouped by
+  # variable, pressure level, and lead. Every target channel must improve.
+  checkpoint_metric: mean_physical_rmse_ratio
+  # RMSE remains the ranking score. These guards prevent a lower mean RMSE
+  # from hiding harmful MAE/bias/pattern regressions in any channel or lead.
+  checkpoint_guard_metrics:
+    - mae
+    - absolute_bias
+    - pattern_correlation
+  checkpoint_guard_relative_tolerance: 0.0
+  checkpoint_guard_correlation_tolerance: 0.0
+  checkpoint_guard_bias_rmse_floor_fraction: 0.05
+  require_all_physical_channels_improve: true
+  require_refinement_improvement: true
   save_best_only: true
   save_last: true
+  # This audited target/scaling/prediction contract is incompatible with the
+  # earlier legacy-flow checkpoint. Start clean; only resume an interrupted run
+  # created from this exact contract.
   resume_training: false
-  resume_from: "last"  # "best", "last", or a path to a .ckpt file. Empty = no resume.
-  resume_skip_scheduler: true  # only relevant when resume_training=true
+  resume_from: ""  # "best", "last", or a path to a .ckpt file. Empty = fresh run.
+  resume_skip_scheduler: false
   # MSE for warmup-stage fine-tuning: gradient ∝ (pred-tgt)/std² shrinks as
   # the model converges, which is essential under tight normalisation floors
   # and bf16 autocast. Switch to "mae" only for late-stage rollout fine-tune.
   loss_function: mse
   multi_target_loss_weights: {}
-  # Weight of the Mamba temporal loss (trained on the ordered multi-lead
-  # rollout sequence). Only active when model.mamba_temporal_enabled=true
-  # and there are >= 2 target lead times. 0 disables the temporal loss term.
-  mamba_temporal_weight: 1.0
-
-  # ---------------------------------------------------------------------
-  # Structural auxiliary losses for the flow-matching refine head.
-  #
-  # The base flow loss is a per-pixel / per-level residual MSE, which has no
-  # notion of spatial pattern, extremes, distribution, vertical shape, or the
-  # column<->profile relationship — exactly the structures left uncorrected in
-  # the rollout-vs-test difference maps. These weighted terms (computed on the
-  # head's clean residual estimate refined = ŷ + r̂ vs the target) add those
-  # objectives. Set any weight to 0 to disable that term; all-zero reproduces
-  # the original pure residual-MSE behaviour.
-  flow_aux_loss:
-    # Master on/off switch for all structural terms below (single-line toggle).
-    enabled: true
-    # Extreme-event performance: up-weight squared error on tail cells
-    # (|z| above the per-sample quantile) + match spatial peak magnitude.
-    extreme_weight: 0.5
-    extreme_quantile: 0.95
-    extreme_intensity: 4.0
-    peak_weight: 0.25
-    # Spatial-pattern agreement: gradient-field MSE + anomaly correlation.
-    spatial_grad_weight: 0.5
-    spatial_acc_weight: 0.25
-    # Distributional errors: spatial-std match + sorted-value Wasserstein.
-    dist_var_weight: 0.25
-    dist_wasserstein_weight: 0.25
-    # Vertical-profile consistency (atmospheric no2): level-difference MSE.
-    vertical_weight: 0.5
-    # Column/profile coherence: tie tcno2 (column) to the pressure-weighted
-    # vertical integral of no2 (profile). Empty var names => auto-detect the
-    # first surf target as column and first atmos target as profile.
-    coherence_weight: 0.25
-    coherence_column_var: tcno2
-    coherence_profile_var: no2
 
 rollout:
   run_rollout_after_training: true
@@ -316,10 +381,10 @@ rollout:
   # model's bias-corrected prediction (plus assertions that no bias-corrected
   # target is ever overwritten by CAMS). Set false to silence the per-step log.
   verbose_provenance: true
-  predicted_fields_get_fed_back: []  # Empty => all model-predicted vars are fed back.
+  predicted_fields_get_fed_back: []  # Empty => all configured target variables are fed back.
   keep_exogenous_predictors: refresh_from_dataset  # fixed | refresh_from_dataset
   save_predictions_to_netcdf: true
-  smooth_sigma: 1.0  # Gaussian sigma (grid cells) to smooth patch artifacts. 0 = off.
+  smooth_sigma: 0.0  # Keep output scientifically identical to the unsmoothed model field.
   save_plots: true
 
 notebook:
@@ -328,3 +393,5 @@ notebook:
     - no2
     - tcno2
   verbosity: 1
+inference:
+  require_validated_checkpoint: true

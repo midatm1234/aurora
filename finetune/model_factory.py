@@ -141,7 +141,7 @@ def validate_unified_checkpoint_contract(
     current = describe_refinement(config)["refinement"]
     if isinstance(saved_config, dict):
         saved = describe_refinement(saved_config)["refinement"]
-    scientific_keys = (
+    common_scientific_keys = (
         "enabled",
         "type",
         "correction_convention",
@@ -149,14 +149,27 @@ def validate_unified_checkpoint_contract(
         "joint_finetuning",
         "train_on_residual",
         "feedback_to_rollout",
+        "deterministic_head",
         "target_space",
         "conditioning",
         "loss",
-        "flow_matching",
-        "diffusion",
-        "unet",
-        "transformer",
     )
+    # A resolved config serializes both stochastic-process and both backbone
+    # sections, including legacy-safe defaults for the inactive alternatives.
+    # Those inactive values do not describe the checkpoint architecture and
+    # therefore must not prevent a compatible load. The canonical type still
+    # remains a common field, so switching process or backbone is rejected.
+    current_type = str(current.get("type", "none"))
+    active_scientific_keys: list[str] = []
+    if current_type.startswith("diffusion_"):
+        active_scientific_keys.append("diffusion")
+    elif current_type.startswith("flow_matching_"):
+        active_scientific_keys.append("flow_matching")
+    if current_type != "none":
+        active_scientific_keys.append(
+            "transformer" if current_type.endswith("_transformer") else "unet"
+        )
+    scientific_keys = (*common_scientific_keys, *active_scientific_keys)
     mismatches = [
         key for key in scientific_keys if saved.get(key) != current.get(key)
     ]

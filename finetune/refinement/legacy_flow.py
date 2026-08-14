@@ -98,6 +98,10 @@ class LegacyFlowMatchingUNetRefiner(ResidualRefiner):
             time_dim=config.unet.time_embedding_dim,
             sampling_steps=flow.integration_steps,
             sigma_min=flow.sigma_min,
+            # This adapter was introduced with the corrected source-endpoint
+            # contract; pin it explicitly so the legacy wrapper's missing-key
+            # v1 fallback does not change unified-refiner semantics.
+            flow_refine_contract_version=2,
             atmos_loss_levels=atmos_loss_levels or None,
             lead_time_cond=config.conditioning.forecast_lead_time,
             lead_time_scale_hours=packing.lead_time_scale_hours,
@@ -156,6 +160,7 @@ class LegacyFlowMatchingUNetRefiner(ResidualRefiner):
                 kind=kind,
                 valid_mask=valid,
                 lead_time_hours=lead,
+                generator=generator,
             )
             total = total + loss.float()
             count += 1
@@ -175,7 +180,11 @@ class LegacyFlowMatchingUNetRefiner(ResidualRefiner):
         """Sample the normalized residual with the existing sampler."""
         rollout = self._require_rollout(rollout_normalized)
         return self._per_variable_residual(
-            rollout, forecast_lead_time, deterministic=False, num_steps=num_steps
+            rollout,
+            forecast_lead_time,
+            deterministic=False,
+            num_steps=num_steps,
+            generator=generator,
         )
 
     @torch.no_grad()
@@ -188,7 +197,11 @@ class LegacyFlowMatchingUNetRefiner(ResidualRefiner):
     ) -> torch.Tensor:
         rollout = self._require_rollout(rollout_normalized)
         return self._per_variable_residual(
-            rollout, forecast_lead_time, deterministic=True, num_steps=None
+            rollout,
+            forecast_lead_time,
+            deterministic=True,
+            num_steps=None,
+            generator=None,
         )
 
     def _per_variable_residual(
@@ -198,6 +211,7 @@ class LegacyFlowMatchingUNetRefiner(ResidualRefiner):
         *,
         deterministic: bool,
         num_steps: int | None,
+        generator: torch.Generator | None,
     ) -> torch.Tensor:
         lead = self._lead_for(forecast_lead_time, self.legacy.lead_time_cond)
         fields = self._split(rollout_normalized)
@@ -216,7 +230,9 @@ class LegacyFlowMatchingUNetRefiner(ResidualRefiner):
                         - pred
                     )
                 else:
-                    residuals[name] = self._stochastic_residual(pred, name, kind, lead)
+                    residuals[name] = self._stochastic_residual(
+                        pred, name, kind, lead, generator
+                    )
         finally:
             self.legacy.sampling_steps = saved_steps
         return self.packing.pack(residuals)
@@ -227,6 +243,7 @@ class LegacyFlowMatchingUNetRefiner(ResidualRefiner):
         var_name: str,
         kind: str,
         lead: torch.Tensor | None,
+        generator: torch.Generator | None,
     ) -> torch.Tensor:
         """Un-standardised residual sample, exactly as ``refine_prediction`` does."""
         heads = self.legacy.surf_flow if kind == "surf" else self.legacy.atmos_flow
@@ -248,7 +265,9 @@ class LegacyFlowMatchingUNetRefiner(ResidualRefiner):
                 if lead_b is not None and kind == "atmos"
                 else lead_b
             )
-        residual = self.legacy._sample_residual(cond, head, lead_hours=lead_n)
+        residual = self.legacy._sample_residual(
+            cond, head, lead_hours=lead_n, generator=generator,
+        )
         sigma = self.legacy._residual_std(kind, var_name, pred_norm, update=False)
         if kind == "atmos":
             if sigma.ndim == 1:

@@ -47,6 +47,7 @@ __all__ = [
     "validate_dataset_contract",
     "load_config",
     "set_seed",
+    "restore_checkpoint_rng_state",
     "derive_refinement_seed",
     "open_dataset",
     "validate_longitude_consistency",
@@ -443,6 +444,10 @@ def validate_config(
             "model.refinement.type: flow_matching_unet for the existing head."
         )
     if flow_enabled:
+        positive_integer(
+            model_cfg.get("flow_refine_contract_version", 1),
+            "model.flow_refine_contract_version",
+        )
         positive_integer(model_cfg.get("flow_refine_hidden", 64), "model.flow_refine_hidden")
         positive_integer(model_cfg.get("flow_refine_time_dim", 128), "model.flow_refine_time_dim")
         positive_integer(
@@ -485,6 +490,20 @@ def validate_config(
     }:
         raise ValueError(
             "rollout.keep_exogenous_predictors must be fixed or refresh_from_dataset."
+        )
+    flow_stochastic_sampling = rollout_cfg.get(
+        "flow_refine_stochastic_sampling", False
+    )
+    if not isinstance(flow_stochastic_sampling, bool):
+        raise ValueError(
+            "rollout.flow_refine_stochastic_sampling must be a boolean."
+        )
+    flow_autoregressive_feedback = training_cfg.get(
+        "flow_refine_autoregressive_feedback", False
+    )
+    if not isinstance(flow_autoregressive_feedback, bool):
+        raise ValueError(
+            "training.flow_refine_autoregressive_feedback must be a boolean."
         )
 
     if bool(model_cfg.get("flow_refine_lead_time_cond", False)):
@@ -609,6 +628,44 @@ def validate_config(
             "training.checkpoint_metric must be validation_loss or "
             "mean_physical_rmse_ratio."
         )
+    raw_guard_metrics = training_cfg.get("checkpoint_guard_metrics", [])
+    if not isinstance(raw_guard_metrics, (list, tuple)):
+        raise ValueError(
+            "training.checkpoint_guard_metrics must be a list containing only "
+            "mae, absolute_bias, and/or pattern_correlation."
+        )
+    allowed_guard_metrics = {"mae", "absolute_bias", "pattern_correlation"}
+    checkpoint_guard_metrics: list[str] = []
+    for index, value in enumerate(raw_guard_metrics):
+        if not isinstance(value, str):
+            raise ValueError(
+                f"training.checkpoint_guard_metrics[{index}] must be one of "
+                f"{sorted(allowed_guard_metrics)}, got {value!r}."
+            )
+        metric = value.strip().lower()
+        if metric not in allowed_guard_metrics:
+            raise ValueError(
+                f"training.checkpoint_guard_metrics[{index}] must be one of "
+                f"{sorted(allowed_guard_metrics)}, got {value!r}."
+            )
+        if metric in checkpoint_guard_metrics:
+            raise ValueError(
+                "training.checkpoint_guard_metrics must not contain duplicate "
+                f"metric {metric!r}."
+            )
+        checkpoint_guard_metrics.append(metric)
+    training_cfg["checkpoint_guard_metrics"] = checkpoint_guard_metrics
+
+    for key in (
+        "checkpoint_guard_relative_tolerance",
+        "checkpoint_guard_correlation_tolerance",
+        "checkpoint_guard_bias_rmse_floor_fraction",
+    ):
+        value = finite_number(training_cfg.get(key, 0.0), f"training.{key}")
+        if value < 0:
+            raise ValueError(f"training.{key} must be >= 0, got {value!r}.")
+        training_cfg[key] = value
+
     for boolean_key in (
         "require_refinement_improvement",
         "require_all_physical_channels_improve",
@@ -637,41 +694,49 @@ def validate_config(
     aux_cfg = training_cfg.get("flow_aux_loss", {}) or {}
     if not isinstance(aux_cfg, dict):
         raise ValueError("training.flow_aux_loss must be a mapping.")
+    extreme_tail = str(aux_cfg.get("extreme_tail", "both")).strip().lower()
+    if extreme_tail not in {"both", "upper"}:
+        raise ValueError(
+            "training.flow_aux_loss.extreme_tail must be 'both' or 'upper'."
+        )
     coherence_weight = finite_number(
         aux_cfg.get("coherence_weight", 0.0),
         "training.flow_aux_loss.coherence_weight",
     )
     if coherence_weight < 0:
         raise ValueError("training.flow_aux_loss.coherence_weight must be >= 0.")
-    if bool(aux_cfg.get("enabled", True)) and coherence_weight > 0:
-        column_name = str(aux_cfg.get("coherence_column_var", "") or "").strip()
-        profile_name = str(aux_cfg.get("coherence_profile_var", "") or "").strip()
+    column_name = str(aux_cfg.get("coherence_column_var", "") or "").strip()
+    profile_name = str(aux_cfg.get("coherence_profile_var", "") or "").strip()
+    # Explicit variable names are schema, even when the term currently has
+    # zero weight or the auxiliary block is disabled. Validating them eagerly
+    # prevents a dormant typo from becoming a delayed training failure when
+    # the weight is later enabled.
+    if column_name or profile_name:
         if bool(column_name) != bool(profile_name):
             raise ValueError(
                 "Set both coherence_column_var and coherence_profile_var, or leave both empty."
             )
-        if column_name:
-            if column_name not in target_lookup:
-                raise ValueError(
-                    "training.flow_aux_loss.coherence_column_var "
-                    f"{column_name!r} is not a configured target."
-                )
-            if profile_name not in target_lookup:
-                raise ValueError(
-                    "training.flow_aux_loss.coherence_profile_var "
-                    f"{profile_name!r} is not a configured target."
-                )
-            if target_lookup[column_name]["kind"] != "surf":
-                raise ValueError("coherence_column_var must identify a surface target.")
-            if target_lookup[profile_name]["kind"] != "atmos":
-                raise ValueError("coherence_profile_var must identify an atmospheric target.")
-        else:
-            if not any(entry["kind"] == "surf" for entry in targets) or not any(
-                entry["kind"] == "atmos" for entry in targets
-            ):
-                raise ValueError(
-                    "Automatic coherence pairing requires one surface and one atmospheric target."
-                )
+        if column_name not in target_lookup:
+            raise ValueError(
+                "training.flow_aux_loss.coherence_column_var "
+                f"{column_name!r} is not a configured target."
+            )
+        if profile_name not in target_lookup:
+            raise ValueError(
+                "training.flow_aux_loss.coherence_profile_var "
+                f"{profile_name!r} is not a configured target."
+            )
+        if target_lookup[column_name]["kind"] != "surf":
+            raise ValueError("coherence_column_var must identify a surface target.")
+        if target_lookup[profile_name]["kind"] != "atmos":
+            raise ValueError("coherence_profile_var must identify an atmospheric target.")
+    elif bool(aux_cfg.get("enabled", True)) and coherence_weight > 0:
+        if not any(entry["kind"] == "surf" for entry in targets) or not any(
+            entry["kind"] == "atmos" for entry in targets
+        ):
+            raise ValueError(
+                "Automatic coherence pairing requires one surface and one atmospheric target."
+            )
 
     feedback = rollout_cfg.get("predicted_fields_get_fed_back") or rollout_cfg.get(
         "predicted_fields_feedback"
@@ -1202,6 +1267,63 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def restore_checkpoint_rng_state(
+    checkpoint: dict[str, Any],
+    *,
+    device: torch.device | str | int | None = None,
+) -> bool:
+    """Restore a serialized PyTorch RNG stream for exact training resume.
+
+    Returns ``False`` for checkpoints written before RNG metadata was added so
+    callers can fall back to their configured seed. CUDA checkpoints record the
+    active rank-zero device explicitly; that stream is restored onto each
+    worker's active CUDA device rather than assigning rank-zero device ordinals
+    to the local process.
+    """
+    rng_state = checkpoint.get("rng_state")
+    if not isinstance(rng_state, dict):
+        return False
+    cpu_state = rng_state.get("cpu")
+    if not torch.is_tensor(cpu_state):
+        return False
+
+    target_cuda: torch.device | None = None
+    if device is None:
+        if torch.cuda.is_available():
+            target_cuda = torch.device("cuda", torch.cuda.current_device())
+    else:
+        if isinstance(device, bool):
+            raise TypeError(
+                "device must be a torch device, string, CUDA ordinal, or None."
+            )
+        target_device = (
+            torch.device("cuda", device)
+            if isinstance(device, int)
+            else torch.device(device)
+        )
+        if target_device.type == "cuda" and torch.cuda.is_available():
+            target_cuda = target_device
+
+    cuda_state = None
+    if target_cuda is not None:
+        cuda_state = rng_state.get("cuda_current")
+        if not torch.is_tensor(cuda_state):
+            legacy_states = rng_state.get("cuda")
+            if isinstance(legacy_states, (list, tuple)) and legacy_states:
+                cuda_state = legacy_states[0]
+        if not torch.is_tensor(cuda_state):
+            return False
+
+    torch.set_rng_state(cpu_state.detach().to(device="cpu", dtype=torch.uint8))
+    if target_cuda is not None:
+        assert torch.is_tensor(cuda_state)
+        torch.cuda.set_rng_state(
+            cuda_state.detach().to(device="cpu", dtype=torch.uint8),
+            device=target_cuda,
+        )
+    return True
 
 
 def derive_refinement_seed(
@@ -2429,6 +2551,55 @@ def _resolve_coherence_pair(
     return col, prof
 
 
+def _spatial_pattern_correlation_sum_count(
+    prediction: torch.Tensor,
+    truth: torch.Tensor,
+    valid_mask: torch.Tensor,
+) -> tuple[float, float]:
+    """Sum valid per-sample spatial correlations without a physical-scale floor.
+
+    Correlation is computed independently for each forecast sample and only
+    finite, jointly valid cells participate. Constant/one-cell fields have no
+    defined spatial pattern and therefore do not increment the count.
+    """
+    if prediction.shape != truth.shape or prediction.shape != valid_mask.shape:
+        raise ValueError(
+            "prediction, truth, and valid_mask must have identical shapes for "
+            "spatial pattern correlation."
+        )
+    if prediction.ndim < 2:
+        raise ValueError(
+            "Spatial pattern correlation expects a leading sample dimension "
+            "and at least one spatial dimension."
+        )
+
+    correlation_sum = 0.0
+    correlation_count = 0.0
+    for sample_index in range(prediction.shape[0]):
+        selected = (
+            valid_mask[sample_index].to(dtype=torch.bool)
+            & torch.isfinite(prediction[sample_index])
+            & torch.isfinite(truth[sample_index])
+        )
+        pred_values = prediction[sample_index][selected].double()
+        truth_values = truth[sample_index][selected].double()
+        if pred_values.numel() < 2:
+            continue
+        pred_anomaly = pred_values - pred_values.mean()
+        truth_anomaly = truth_values - truth_values.mean()
+        pred_variance_sum = pred_anomaly.square().sum()
+        truth_variance_sum = truth_anomaly.square().sum()
+        denominator = (pred_variance_sum * truth_variance_sum).sqrt()
+        if not bool(torch.isfinite(denominator) & (denominator > 0)):
+            continue
+        correlation = (pred_anomaly * truth_anomaly).sum() / denominator
+        if not bool(torch.isfinite(correlation)):
+            continue
+        correlation_sum += float(correlation.clamp(-1.0, 1.0).detach().cpu())
+        correlation_count += 1.0
+    return correlation_sum, correlation_count
+
+
 def compute_supervised_loss(
     model: torch.nn.Module,
     ds: xr.Dataset,
@@ -2806,6 +2977,13 @@ def compute_supervised_loss(
                     if not bool(selected.any().item()):
                         continue
                     error = (physical_pred[selected] - physical_target[selected]).double()
+                    correlation_sum, correlation_count = (
+                        _spatial_pattern_correlation_sum_count(
+                            physical_pred,
+                            physical_target,
+                            selected,
+                        )
+                    )
                     slot = physical_error_sums.setdefault(
                         channel_name,
                         {
@@ -2813,12 +2991,16 @@ def compute_supervised_loss(
                             "error_sum": 0.0,
                             "abs_error_sum": 0.0,
                             "sq_error_sum": 0.0,
+                            "spatial_correlation_sum": 0.0,
+                            "spatial_correlation_count": 0.0,
                         },
                     )
                     slot["count"] += float(error.numel())
                     slot["error_sum"] += float(error.sum().detach().cpu())
                     slot["abs_error_sum"] += float(error.abs().sum().detach().cpu())
                     slot["sq_error_sum"] += float(error.square().sum().detach().cpu())
+                    slot["spatial_correlation_sum"] += correlation_sum
+                    slot["spatial_correlation_count"] += correlation_count
 
             # If the model is a flow-matching refine wrapper AND we're in
             # training mode, replace the deterministic MSE with the
@@ -3174,6 +3356,11 @@ def maybe_wrap_flow_refine(
     # A single source-endpoint query is the safe deterministic correction.
     # Multi-step stochastic sampling must be requested explicitly.
     sampling_steps = int(model_cfg.get("flow_refine_sampling_steps", 1))
+    # Missing contract metadata means a historical checkpoint/configuration.
+    # Keep that endpoint and rollout behaviour until the user opts into v2+.
+    flow_refine_contract_version = int(
+        model_cfg.get("flow_refine_contract_version", 1)
+    )
     doy_cond = bool(model_cfg.get("flow_refine_doy_cond", False))
     lead_time_cond = bool(model_cfg.get("flow_refine_lead_time_cond", False))
     lead_scale_value = model_cfg.get("flow_refine_lead_time_scale_hours")
@@ -3259,6 +3446,7 @@ def maybe_wrap_flow_refine(
         hidden=hidden,
         time_dim=time_dim,
         sampling_steps=sampling_steps,
+        flow_refine_contract_version=flow_refine_contract_version,
         atmos_loss_levels=atmos_loss_levels if atmos_loss_levels else None,
         doy_cond=doy_cond,
         lead_time_cond=lead_time_cond,
@@ -3695,6 +3883,26 @@ def run_rollout(
     except Exception:
         _AFR = None
     flow_refine_active = _AFR is not None and isinstance(base_for_fm, _AFR)
+    flow_refine_contract_version = (
+        int(getattr(base_for_fm, "flow_refine_contract_version", 1))
+        if flow_refine_active
+        else 1
+    )
+    versioned_flow_postprocessing = (
+        flow_refine_active and flow_refine_contract_version >= 2
+    )
+    flow_refine_feedback = (
+        versioned_flow_postprocessing
+        and bool(
+            config.get("training", {}).get(
+                "flow_refine_autoregressive_feedback", False
+            )
+        )
+    )
+    flow_refine_stochastic_sampling = (
+        versioned_flow_postprocessing
+        and bool(rollout_cfg.get("flow_refine_stochastic_sampling", False))
+    )
     try:
         from finetune.refinement.two_phase import AuroraTwoPhaseRefiner as _ATP
     except Exception:
@@ -3755,7 +3963,21 @@ def run_rollout(
         )
     anchor_idx = int(start_sample["anchor_index"])
     resolved_refinement_seed: int | None = None
+    resolved_legacy_flow_seed: int | None = None
     resolved_refinement_ensemble_size = 1
+    if flow_refine_stochastic_sampling:
+        if refinement_seed is not None:
+            resolved_legacy_flow_seed = int(refinement_seed)
+        else:
+            # Legacy recipes already define training.seed (default 42). Derive
+            # a stable initialization-specific stream just like the unified
+            # refiners so repeated rollout calls are reproducible without
+            # producing identical draws for every forecast initialization.
+            time_dim = _dim_names(config)[0]
+            resolved_legacy_flow_seed = derive_refinement_seed(
+                int(config.get("training", {}).get("seed", 42)),
+                ds[time_dim].values[anchor_idx],
+            )
     if unified_refiner is not None:
         configured_seed = unified_refiner.refinement_config.seed
         if refinement_seed is not None:
@@ -3787,6 +4009,11 @@ def run_rollout(
             resolved_refinement_seed,
         )
         if unified_refiner is not None
+        else None
+    )
+    legacy_flow_generator = (
+        _make_refinement_generator(device, resolved_legacy_flow_seed)
+        if flow_refine_stochastic_sampling
         else None
     )
     verbose_provenance = bool(rollout_cfg.get("verbose_provenance", True))
@@ -3823,15 +4050,33 @@ def run_rollout(
                 )
                 feedback_pred = pred if refinement_feedback else deterministic_pred
             else:
-                pred = (
-                    model(
-                        current,
+                if versioned_flow_postprocessing:
+                    # V2+ treats flow correction as postprocessing by default:
+                    # Aurora's raw state advances the physical trajectory while
+                    # the corrected field is emitted to the caller. Feedback is
+                    # an explicit training-config opt-in.
+                    deterministic_pred = base_for_fm.base(current)
+                    pred = base_for_fm.refine_prediction(
+                        deterministic_pred,
+                        deterministic=not flow_refine_stochastic_sampling,
                         forecast_lead_time_hours=forecast_lead_time_hours,
+                        generator=legacy_flow_generator,
                     )
-                    if flow_refine_active
-                    else model(current)
-                )
-                feedback_pred = pred
+                    feedback_pred = (
+                        pred if flow_refine_feedback else deterministic_pred
+                    )
+                else:
+                    # Contract v1 intentionally retains the historical inline
+                    # refinement and autoregressive feedback behaviour exactly.
+                    pred = (
+                        model(
+                            current,
+                            forecast_lead_time_hours=forecast_lead_time_hours,
+                        )
+                        if flow_refine_active
+                        else model(current)
+                    )
+                    feedback_pred = pred
 
             # Mamba temporal correction (causal): refine the flow-corrected
             # target fields using their evolution across the rollout so far.
@@ -3839,7 +4084,12 @@ def run_rollout(
                 pred = base_for_fm.apply_temporal_rollout(
                     pred, legacy_temporal_history
                 )
-                feedback_pred = pred
+                # V1 historically fed the temporal output back unconditionally.
+                # For v2+, temporal correction is part of the emitted
+                # postprocessing and must not replace raw-Aurora provenance
+                # unless refinement feedback was explicitly enabled.
+                if not versioned_flow_postprocessing or flow_refine_feedback:
+                    feedback_pred = pred
             predictions.append(pred.to("cpu"))
 
             if not autoregressive:
@@ -4024,6 +4274,7 @@ def save_checkpoint(
     payload["rng_state"] = {
         "cpu": torch.get_rng_state(),
         "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        "cuda_current": torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
     }
     if isinstance(_inner, _ATP):
         payload["field_packing"] = _inner.packing.to_dict()
@@ -4058,16 +4309,26 @@ def save_checkpoint(
         "validated_for_inference": bool(validated_for_inference),
     }
     if validation is not None:
-        json_validation: dict[str, Any] = {}
-        for key, value in validation.items():
+        def _json_safe_validation_value(value: Any) -> Any:
             if isinstance(value, np.generic):
-                value = value.item()
-            elif torch.is_tensor(value) and value.numel() == 1:
-                value = value.detach().cpu().item()
-            if not isinstance(value, (str, int, float, bool, type(None))):
-                value = str(value)
-            json_validation[str(key)] = value
-        metadata["validation"] = json_validation
+                return value.item()
+            if isinstance(value, np.ndarray):
+                return value.tolist()
+            if torch.is_tensor(value):
+                tensor = value.detach().cpu()
+                return tensor.item() if tensor.numel() == 1 else tensor.tolist()
+            if isinstance(value, dict):
+                return {
+                    str(key): _json_safe_validation_value(item)
+                    for key, item in value.items()
+                }
+            if isinstance(value, (list, tuple)):
+                return [_json_safe_validation_value(item) for item in value]
+            if isinstance(value, (str, int, float, bool, type(None))):
+                return value
+            return str(value)
+
+        metadata["validation"] = _json_safe_validation_value(validation)
     path.with_suffix(path.suffix + ".metadata.json").write_text(
         json.dumps(metadata, indent=2, allow_nan=True) + "\n"
     )

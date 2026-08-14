@@ -5,8 +5,13 @@ Checkpoint compatibility contract for the two-phase Aurora wrapper.
 
 from __future__ import annotations
 
+import copy
+import warnings
+
 import pytest
 import torch
+from finetune import aurora_finetune_utils as ft
+from finetune.model_factory import validate_unified_checkpoint_contract
 from finetune.refinement.checkpoint import (
     CHECKPOINT_KIND_AURORA,
     CHECKPOINT_KIND_COMBINED,
@@ -270,6 +275,225 @@ def test_refinement_checkpoint_records_everything_needed_for_resume() -> None:
     assert [c["level"] for c in packing_meta["channels"]] == [None, 500.0, 850.0]
     assert packing_meta["lead_time_scale_hours"] == 72.0
     assert payload["epoch"] == 3 and payload["global_step"] == 120
+
+
+def test_checkpoint_rng_restore_matches_uninterrupted_stream() -> None:
+    torch.manual_seed(314159)
+    torch.randn(7)
+    checkpoint = {
+        "rng_state": {
+            "cpu": torch.get_rng_state().clone(),
+            "cuda": None,
+            "cuda_current": None,
+        }
+    }
+    uninterrupted = torch.randn(11)
+
+    # Simulate stochastic calibration work in a newly launched resume process.
+    torch.manual_seed(271828)
+    torch.randn(23)
+    assert ft.restore_checkpoint_rng_state(checkpoint, device="cpu") is True
+    resumed = torch.randn(11)
+    assert torch.equal(resumed, uninterrupted)
+
+
+def test_checkpoint_rng_restore_accepts_cuda_device_ordinal(monkeypatch) -> None:
+    checkpoint = {
+        "rng_state": {
+            "cpu": torch.get_rng_state().clone(),
+            "cuda_current": torch.arange(8, dtype=torch.uint8),
+        }
+    }
+    restored: dict[str, object] = {}
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+
+    def capture_cuda_state(state: torch.Tensor, device=None) -> None:
+        restored["state"] = state
+        restored["device"] = device
+
+    monkeypatch.setattr(torch.cuda, "set_rng_state", capture_cuda_state)
+
+    assert ft.restore_checkpoint_rng_state(checkpoint, device=3) is True
+    assert restored["device"] == torch.device("cuda", 3)
+    assert torch.equal(restored["state"], checkpoint["rng_state"]["cuda_current"])
+
+
+def test_checkpoint_rng_restore_rejects_boolean_device_ordinal() -> None:
+    checkpoint = {"rng_state": {"cpu": torch.get_rng_state().clone()}}
+    with pytest.raises(TypeError, match="CUDA ordinal"):
+        ft.restore_checkpoint_rng_state(checkpoint, device=False)
+
+
+@pytest.mark.parametrize(
+    ("saved_head", "current_head"),
+    [
+        ("shared_process", "separate_mean"),
+        ("separate_mean", "shared_process"),
+    ],
+)
+def test_checkpoint_rejects_deterministic_head_migration_in_both_directions(
+    saved_head: str,
+    current_head: str,
+) -> None:
+    saved_config = refinement_config(
+        "diffusion_unet", deterministic_head=saved_head
+    )
+    current_config = refinement_config(
+        "diffusion_unet", deterministic_head=current_head
+    )
+    packing = build_packing(8, 8)
+    saved_model = build_two_phase_refiner(
+        DummyAurora(), packing, saved_config
+    )
+    current_model = build_two_phase_refiner(
+        DummyAurora(), packing, current_config
+    )
+    checkpoint = {
+        "config": saved_config,
+        "resolved_refinement_config": saved_model.refinement_config.to_dict(),
+        "field_packing": packing.to_dict(),
+    }
+
+    with pytest.raises(
+        ValueError,
+        match="Checkpoint unified refinement mismatch: deterministic_head",
+    ):
+        validate_unified_checkpoint_contract(
+            current_model,
+            checkpoint,
+            current_config,
+        )
+
+
+@pytest.mark.parametrize(
+    ("refinement_type", "inactive_section", "key", "value"),
+    [
+        ("diffusion_unet", "flow_matching", "integration_steps", 7),
+        ("diffusion_unet", "transformer", "embedding_dim", 48),
+        ("flow_matching_transformer", "diffusion", "inference_steps", 7),
+        ("flow_matching_transformer", "unet", "hidden_channels", 12),
+    ],
+)
+def test_checkpoint_ignores_inactive_process_and_backbone_sections(
+    refinement_type: str,
+    inactive_section: str,
+    key: str,
+    value: object,
+) -> None:
+    saved_config = refinement_config(refinement_type)
+    current_config = copy.deepcopy(saved_config)
+    inactive = current_config["model"]["refinement"].setdefault(
+        inactive_section, {}
+    )
+    inactive[key] = value
+    packing = build_packing(8, 8)
+    saved_model = build_two_phase_refiner(DummyAurora(), packing, saved_config)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        current_model = build_two_phase_refiner(
+            DummyAurora(), packing, current_config
+        )
+        validate_unified_checkpoint_contract(
+            current_model,
+            {
+                "config": saved_config,
+                "resolved_refinement_config": (
+                    saved_model.refinement_config.to_dict()
+                ),
+                "field_packing": packing.to_dict(),
+            },
+            current_config,
+        )
+
+
+@pytest.mark.parametrize(
+    ("refinement_type", "active_section", "key", "value"),
+    [
+        ("diffusion_unet", "diffusion", "inference_steps", 7),
+        ("diffusion_unet", "unet", "hidden_channels", 12),
+        ("flow_matching_transformer", "flow_matching", "integration_steps", 7),
+        ("flow_matching_transformer", "transformer", "embedding_dim", 48),
+    ],
+)
+def test_checkpoint_rejects_active_process_and_backbone_sections(
+    refinement_type: str,
+    active_section: str,
+    key: str,
+    value: object,
+) -> None:
+    saved_config = refinement_config(refinement_type)
+    current_config = copy.deepcopy(saved_config)
+    current_config["model"]["refinement"][active_section][key] = value
+    packing = build_packing(8, 8)
+    saved_model = build_two_phase_refiner(DummyAurora(), packing, saved_config)
+    current_model = build_two_phase_refiner(DummyAurora(), packing, current_config)
+    checkpoint = {
+        "config": saved_config,
+        "resolved_refinement_config": saved_model.refinement_config.to_dict(),
+        "field_packing": packing.to_dict(),
+    }
+
+    with pytest.raises(
+        ValueError,
+        match=rf"Checkpoint unified refinement mismatch: {active_section}",
+    ):
+        validate_unified_checkpoint_contract(
+            current_model,
+            checkpoint,
+            current_config,
+        )
+
+
+def test_checkpoint_round_trips_residual_amplitude_safeguard_and_statistics() -> None:
+    config = refinement_config(
+        "diffusion_unet",
+        deterministic_head="shared_process",
+        target_space={
+            "residual_scaling": "per_channel",
+            "residual_scaling_center": True,
+            "residual_clip_standard_deviations": 4.0,
+        },
+    )
+    model = build_two_phase_refiner(DummyAurora(), build_packing(8, 8), config)
+    model.initialize_refiner(model.conditioning_channels())
+    assert model.refiner is not None
+    calibration = torch.tensor(
+        [[
+            [[-2.0, 0.0], [2.0, 4.0]],
+            [[-1.0, 1.0], [3.0, 5.0]],
+            [[-4.0, -2.0], [0.0, 2.0]],
+        ]]
+    )
+    model.refiner.fit_residual_scale(calibration)
+    payload = build_refinement_checkpoint(
+        model,
+        kind=CHECKPOINT_KIND_REFINEMENT,
+        refinement_type=model.refinement_config.type,
+        resolved_config=model.refinement_config.to_dict(),
+    )
+
+    assert (
+        payload["resolved_config"]["target_space"][
+            "residual_clip_standard_deviations"
+        ]
+        == 4.0
+    )
+
+    restored = build_two_phase_refiner(DummyAurora(), build_packing(8, 8), config)
+    restored.initialize_refiner(restored.conditioning_channels())
+    report = load_refinement_state_dict(restored, payload)
+    assert report.missing == []
+    assert report.unexpected == []
+    assert restored.refiner is not None
+    assert restored.refiner.residual_clip_standard_deviations == 4.0
+    torch.testing.assert_close(
+        restored.refiner.residual_scaler.scale, model.refiner.residual_scaler.scale
+    )
+    torch.testing.assert_close(
+        restored.refiner.residual_scaler.shift, model.refiner.residual_scaler.shift
+    )
 
 
 def test_aurora_reference_validation() -> None:

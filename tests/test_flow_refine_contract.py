@@ -21,11 +21,17 @@ from finetune.aurora_finetune_utils import (
     VariableSpec,
     _dataset_frames_for_predictor,
     _forecast_lead_hours_for_samples,
+    maybe_wrap_flow_refine,
     run_rollout,
     select_refinement_checkpoint,
     validate_checkpoint_refinement_contract,
 )
-from finetune.flow_refine import AuroraFlowRefine
+from finetune.flow_refine import (
+    DEFAULT_AUX_LOSS_CONFIG,
+    AuroraFlowRefine,
+    _extreme_weighted_mse,
+    _peak_loss,
+)
 
 
 class _RecordingHead(nn.Module):
@@ -52,16 +58,37 @@ class _RecordingHead(nn.Module):
         return self.value.expand_as(x_t)
 
 
+class _EchoHead(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+    def forward(
+        self,
+        x_t: torch.Tensor,
+        t: torch.Tensor,
+        cond: torch.Tensor,
+        doy: torch.Tensor | None = None,
+        lead_hours: torch.Tensor | None = None,
+        coords: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        del cond, doy, lead_hours, coords
+        self.calls.append((x_t.detach().clone(), t.detach().clone()))
+        return x_t
+
+
 def _wrapper(
     *,
     sampling_steps: int = 1,
     lead_time_cond: bool = False,
+    contract_version: int = 2,
 ) -> AuroraFlowRefine:
     model = AuroraFlowRefine(
         nn.Identity(),
         target_surf_vars=("x",),
         hidden=8,
         sampling_steps=sampling_steps,
+        flow_refine_contract_version=contract_version,
         lead_time_cond=lead_time_cond,
         lead_time_scale_hours=72.0,
         lon_periodic=False,
@@ -69,8 +96,15 @@ def _wrapper(
     return model
 
 
-def test_single_step_sampler_queries_source_mean() -> None:
-    model = _wrapper(sampling_steps=1)
+@pytest.mark.parametrize(
+    ("contract_version", "expected_t"),
+    [(1, 1.0), (2, 0.0), (3, 0.0)],
+)
+def test_single_step_sampler_uses_versioned_endpoint(
+    contract_version: int,
+    expected_t: float,
+) -> None:
+    model = _wrapper(sampling_steps=1, contract_version=contract_version)
     head = _RecordingHead(value=2.0)
     cond = torch.randn(2, 1, 4, 4)
 
@@ -80,7 +114,71 @@ def test_single_step_sampler_queries_source_mean() -> None:
     assert len(head.calls) == 1
     x_t, t = head.calls[0]
     assert torch.count_nonzero(x_t) == 0
-    assert torch.count_nonzero(t) == 0
+    assert torch.equal(t, torch.full_like(t, expected_t))
+
+
+def test_legacy_builder_defaults_missing_contract_to_v1() -> None:
+    specs = ResolvedVariableSpecs(
+        predictors=(),
+        targets=(VariableSpec("x", "x", "surf"),),
+        static=(),
+    )
+    config = {
+        "model": {
+            "flow_refine_enabled": True,
+            "flow_refine_hidden": 8,
+            "flow_refine_time_dim": 128,
+            "flow_refine_sampling_steps": 1,
+            "lon_periodic": False,
+        },
+        "data": {},
+    }
+
+    model = maybe_wrap_flow_refine(nn.Identity(), config, specs)
+
+    assert isinstance(model, AuroraFlowRefine)
+    assert model.flow_refine_contract_version == 1
+    head = _RecordingHead(value=0.0)
+    model._sample_residual(torch.zeros(1, 1, 4, 4), head)
+    _, t = head.calls[0]
+    assert torch.equal(t, torch.ones_like(t))
+
+
+def test_legacy_extreme_tail_defaults_to_both_and_can_focus_upper() -> None:
+    target = torch.tensor([[[[-10.0, 0.0, 1.0, 2.0]]]])
+    refined = target.clone()
+    refined[..., 0] += 1.0
+
+    both = _extreme_weighted_mse(
+        refined, target, quantile=0.75, intensity=5.0,
+    )
+    upper = _extreme_weighted_mse(
+        refined, target, quantile=0.75, intensity=5.0, tail="upper",
+    )
+    peak_both = _peak_loss(refined, target)
+    peak_upper = _peak_loss(refined, target, tail="upper")
+
+    assert DEFAULT_AUX_LOSS_CONFIG["extreme_tail"] == "both"
+    assert float(both) > float(upper)
+    assert float(peak_both) > 0.0
+    assert float(peak_upper) == 0.0
+
+
+def test_multistep_sampler_honors_generator() -> None:
+    model = _wrapper(sampling_steps=2)
+    cond = torch.zeros(1, 1, 4, 4)
+    head_a = _EchoHead()
+    head_b = _EchoHead()
+    generator_a = torch.Generator().manual_seed(17)
+    generator_b = torch.Generator().manual_seed(17)
+
+    result_a = model._sample_residual(cond, head_a, generator=generator_a)
+    result_b = model._sample_residual(cond, head_b, generator=generator_b)
+
+    torch.testing.assert_close(result_a, result_b)
+    assert len(head_a.calls) == len(head_b.calls) == 2
+    torch.testing.assert_close(head_a.calls[0][0], head_b.calls[0][0])
+    assert torch.equal(generator_a.get_state(), generator_b.get_state())
 
 
 def test_flow_loss_trains_deterministic_query_and_degradation_hinge() -> None:
@@ -455,6 +553,224 @@ class _OneStepBatchModel(nn.Module):
             batch,
             surf_vars={"x": batch.surf_vars["x"][:, -1:]},
         )
+
+
+class _RecordingIncrementBatchModel(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.inputs: list[torch.Tensor] = []
+
+    def forward(self, batch: Batch) -> Batch:
+        latest = batch.surf_vars["x"][:, -1:]
+        self.inputs.append(latest.detach().clone())
+        return dataclasses.replace(
+            batch,
+            surf_vars={"x": latest + 1.0},
+        )
+
+
+@pytest.mark.parametrize(
+    (
+        "contract_version",
+        "feedback_enabled",
+        "temporal_offset",
+        "expected_outputs",
+        "expected_base_inputs",
+    ),
+    [
+        (2, False, 0.0, [11.0, 12.0], [0.0, 1.0]),
+        (2, True, 0.0, [11.0, 22.0], [0.0, 11.0]),
+        (2, False, 100.0, [111.0, 112.0], [0.0, 1.0]),
+        # Missing/legacy v1 semantics refine and feed back unconditionally.
+        (1, False, 0.0, [11.0, 22.0], [0.0, 11.0]),
+    ],
+)
+def test_flow_rollout_two_step_refinement_provenance(
+    monkeypatch: pytest.MonkeyPatch,
+    contract_version: int,
+    feedback_enabled: bool,
+    temporal_offset: float,
+    expected_outputs: list[float],
+    expected_base_inputs: list[float],
+) -> None:
+    batch = Batch(
+        surf_vars={"x": torch.zeros(1, 2, 1, 1)},
+        static_vars={},
+        atmos_vars={},
+        metadata=Metadata(
+            lat=torch.tensor([0.0]),
+            lon=torch.tensor([0.0]),
+            time=(np.datetime64("2024-01-01T12").tolist(),),
+            atmos_levels=(),
+        ),
+    )
+    base = _RecordingIncrementBatchModel()
+    model = AuroraFlowRefine(
+        base,
+        target_surf_vars=("x",),
+        hidden=8,
+        # V2+ must still use one deterministic query even when the configured
+        # sampler has multiple integration steps.
+        sampling_steps=3 if contract_version >= 2 else 1,
+        flow_refine_contract_version=contract_version,
+        lon_periodic=False,
+    )
+    head = _RecordingHead(value=10.0)
+    model.surf_flow["x"] = head
+    if temporal_offset:
+        model.temporal_enabled = True
+        model.temporal = nn.Identity()
+
+        def add_temporal_offset(
+            pred: Batch,
+            history: dict[tuple[str, str], list[torch.Tensor]],
+        ) -> Batch:
+            del history
+            return dataclasses.replace(
+                pred,
+                surf_vars={"x": pred.surf_vars["x"] + temporal_offset},
+            )
+
+        monkeypatch.setattr(model, "apply_temporal_rollout", add_temporal_offset)
+
+    times = np.datetime64("2024-01-01T00") + np.arange(6) * np.timedelta64(12, "h")
+    ds = xr.Dataset(coords={"time": times})
+    spec = VariableSpec("x", "x", "surf")
+    specs = ResolvedVariableSpecs(
+        predictors=(spec,),
+        targets=(spec,),
+        static=(),
+    )
+    config = {
+        "data": {
+            "time_dim": "time",
+            "input_time_steps": 2,
+            "target_lead_times": [1, 2],
+        },
+        "training": {
+            "flow_refine_autoregressive_feedback": feedback_enabled,
+        },
+        "rollout": {
+            "rollout_num_steps": 2,
+            "rollout_step_hours": 12,
+            "autoregressive_inputs": True,
+            "keep_exogenous_predictors": "fixed",
+            "verbose_provenance": False,
+        },
+    }
+    monkeypatch.setattr(
+        "finetune.aurora_finetune_utils.build_aurora_batch",
+        lambda *args, **kwargs: batch,
+    )
+
+    predictions = run_rollout(
+        model,
+        ds,
+        {"anchor_index": 1, "history_indices": [0, 1], "target_indices": {}},
+        config,
+        specs,
+        device="cpu",
+    )
+
+    outputs = [float(pred.surf_vars["x"].item()) for pred in predictions]
+    base_inputs = [float(value.item()) for value in base.inputs]
+    assert outputs == expected_outputs
+    assert base_inputs == expected_base_inputs
+    assert len(head.calls) == 2
+    expected_t = 1.0 if contract_version == 1 else 0.0
+    assert all(
+        torch.equal(t, torch.full_like(t, expected_t))
+        and torch.count_nonzero(x_t) == 0
+        for x_t, t in head.calls
+    )
+
+
+def test_v2_rollout_stochastic_sampling_is_explicit_opt_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    batch = Batch(
+        surf_vars={"x": torch.zeros(1, 2, 1, 1)},
+        static_vars={},
+        atmos_vars={},
+        metadata=Metadata(
+            lat=torch.tensor([0.0]),
+            lon=torch.tensor([0.0]),
+            time=(np.datetime64("2024-01-01T12").tolist(),),
+            atmos_levels=(),
+        ),
+    )
+    model = AuroraFlowRefine(
+        _RecordingIncrementBatchModel(),
+        target_surf_vars=("x",),
+        hidden=8,
+        sampling_steps=2,
+        flow_refine_contract_version=2,
+        lon_periodic=False,
+    )
+    head = _EchoHead()
+    model.surf_flow["x"] = head
+    times = np.datetime64("2024-01-01T00") + np.arange(4) * np.timedelta64(12, "h")
+    ds = xr.Dataset(coords={"time": times})
+    spec = VariableSpec("x", "x", "surf")
+    specs = ResolvedVariableSpecs(
+        predictors=(spec,),
+        targets=(spec,),
+        static=(),
+    )
+    config = {
+        "data": {
+            "time_dim": "time",
+            "input_time_steps": 2,
+            "target_lead_times": [1],
+        },
+        "rollout": {
+            "rollout_num_steps": 1,
+            "rollout_step_hours": 12,
+            "autoregressive_inputs": True,
+            "keep_exogenous_predictors": "fixed",
+            "verbose_provenance": False,
+            "flow_refine_stochastic_sampling": True,
+        },
+    }
+    monkeypatch.setattr(
+        "finetune.aurora_finetune_utils.build_aurora_batch",
+        lambda *args, **kwargs: batch,
+    )
+    first = run_rollout(
+        model,
+        ds,
+        {"anchor_index": 1, "history_indices": [0, 1], "target_indices": {}},
+        config,
+        specs,
+        device="cpu",
+        refinement_seed=29,
+    )
+    second = run_rollout(
+        model,
+        ds,
+        {"anchor_index": 1, "history_indices": [0, 1], "target_indices": {}},
+        config,
+        specs,
+        device="cpu",
+        refinement_seed=29,
+    )
+    third = run_rollout(
+        model,
+        ds,
+        {"anchor_index": 1, "history_indices": [0, 1], "target_indices": {}},
+        config,
+        specs,
+        device="cpu",
+        refinement_seed=30,
+    )
+
+    assert len(head.calls) == 6
+    torch.testing.assert_close(
+        first[0].surf_vars["x"], second[0].surf_vars["x"],
+    )
+    assert not torch.equal(
+        first[0].surf_vars["x"], third[0].surf_vars["x"],
+    )
 
 
 def test_run_rollout_passes_cumulative_physical_hours(

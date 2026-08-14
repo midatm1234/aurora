@@ -62,6 +62,19 @@ def test_legacy_flow_refine_keys_resolve_to_flow_matching_unet() -> None:
     assert cfg.feedback_to_rollout is True
 
 
+def test_legacy_autoregressive_feedback_requires_a_boolean() -> None:
+    with pytest.raises(
+        ConfigValidationError,
+        match="training.flow_refine_autoregressive_feedback must be a boolean",
+    ):
+        resolve_refinement_config(
+            {
+                "model": {"flow_refine_enabled": True},
+                "training": {"flow_refine_autoregressive_feedback": "false"},
+            }
+        )
+
+
 def test_flow_matching_alias() -> None:
     aliased = resolve_refinement_config({"model": {"refinement": {"type": "flow_matching"}}})
     explicit = resolve_refinement_config({"model": {"refinement": {"type": "flow_matching_unet"}}})
@@ -248,6 +261,179 @@ def test_conditioning_cannot_be_empty() -> None:
         )
 
 
+def test_coordinate_conditioning_flags_default_off_and_round_trip() -> None:
+    default = resolve_refinement_config({"model": {"refinement": {"type": "diffusion_unet"}}})
+    configured = resolve_refinement_config(
+        {
+            "model": {
+                "refinement": {
+                    "type": "diffusion_unet",
+                    "conditioning": {"latitude": True, "longitude": True},
+                }
+            }
+        }
+    )
+    round_tripped = resolve_refinement_config(
+        {
+            "model": {
+                "refinement": {
+                    "type": "diffusion_unet",
+                    "conditioning": configured.conditioning.to_dict(),
+                }
+            }
+        }
+    )
+
+    assert default.conditioning.latitude is False
+    assert default.conditioning.longitude is False
+    assert configured.conditioning.latitude is True
+    assert configured.conditioning.longitude is True
+    assert round_tripped.conditioning == configured.conditioning
+
+
+def test_residual_amplitude_safeguard_defaults_off_and_round_trips() -> None:
+    default = resolve_refinement_config({"model": {"refinement": {"type": "diffusion_unet"}}})
+    configured = resolve_refinement_config(
+        {
+            "model": {
+                "refinement": {
+                    "type": "diffusion_unet",
+                    "target_space": {
+                        "residual_scaling": "per_channel",
+                        "residual_scaling_center": True,
+                        "residual_clip_standard_deviations": 4.0,
+                    },
+                }
+            }
+        }
+    )
+    round_tripped = resolve_refinement_config(
+        {
+            "model": {
+                "refinement": {
+                    "type": "diffusion_unet",
+                    "target_space": configured.target_space.to_dict(),
+                }
+            }
+        }
+    )
+
+    assert default.target_space.residual_clip_standard_deviations == 0.0
+    assert configured.target_space.residual_clip_standard_deviations == 4.0
+    assert round_tripped.target_space == configured.target_space
+
+
+@pytest.mark.parametrize("value", [-1.0, float("nan"), float("inf")])
+def test_invalid_residual_amplitude_safeguard_is_rejected(value: float) -> None:
+    with pytest.raises(ConfigValidationError, match="residual_clip_standard_deviations"):
+        resolve_refinement_config(
+            {
+                "model": {
+                    "refinement": {
+                        "type": "diffusion_unet",
+                        "target_space": {
+                            "residual_scaling": "per_channel",
+                            "residual_clip_standard_deviations": value,
+                        },
+                    }
+                }
+            }
+        )
+
+
+def test_residual_amplitude_safeguard_requires_active_scaling() -> None:
+    with pytest.raises(ConfigValidationError, match="requires active residual_scaling"):
+        resolve_refinement_config(
+            {
+                "model": {
+                    "refinement": {
+                        "type": "diffusion_unet",
+                        "target_space": {
+                            "residual_scaling": "none",
+                            "residual_clip_standard_deviations": 4.0,
+                        },
+                    }
+                }
+            }
+        )
+
+
+def test_legacy_head_rejects_unimplemented_residual_amplitude_safeguard() -> None:
+    with pytest.raises(ConfigValidationError, match="only by unified"):
+        resolve_refinement_config(
+            {
+                "model": {
+                    "refinement": {
+                        "type": "flow_matching_unet",
+                        "target_space": {
+                            "residual_scaling": "per_channel",
+                            "residual_clip_standard_deviations": 4.0,
+                        },
+                    }
+                }
+            }
+        )
+
+
+def test_coordinates_supplement_instead_of_replace_state_conditioning() -> None:
+    with pytest.raises(ConfigValidationError, match="at least one"):
+        resolve_refinement_config(
+            {
+                "model": {
+                    "refinement": {
+                        "type": "diffusion_unet",
+                        "conditioning": {
+                            "aurora_rollout": False,
+                            "aurora_input_state": False,
+                            "aurora_features": False,
+                            "static_fields": False,
+                            "masks": False,
+                            "latitude": True,
+                            "longitude": True,
+                        },
+                    }
+                }
+            }
+        )
+
+
+def test_unknown_coordinate_conditioning_key_is_rejected() -> None:
+    with pytest.raises(ConfigValidationError, match="latitude_degrees"):
+        resolve_refinement_config(
+            {
+                "model": {
+                    "refinement": {
+                        "type": "diffusion_unet",
+                        "conditioning": {"latitude_degrees": True},
+                    }
+                }
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "aurora_NO2_finetune_US-WEST_3day_lead_config.yaml",
+        "aurora_NO2_finetune_US-WEST_3day_lead_diffusion_config.yaml",
+        "aurora_NO2_finetune_US-WEST_3day_lead_diffusion_transformer_config.yaml",
+        "aurora_NO2_finetune_US-WEST_3day_lead_flow_matching_transformer_config.yaml",
+    ],
+)
+def test_unified_no2_configs_enable_geophysical_coordinates(name: str) -> None:
+    with open(f"finetune/{name}") as handle:
+        raw = yaml.safe_load(handle)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        config = resolve_refinement_config(raw)
+
+    assert config.backend == "unified"
+    assert config.conditioning.latitude is True
+    assert config.conditioning.longitude is True
+    assert config.target_space.residual_clip_standard_deviations == 4.0
+    assert config.loss.extreme_tail == "upper"
+
+
 def test_legacy_type_rejects_new_auxiliary_losses() -> None:
     with pytest.raises(ConfigValidationError, match="auxiliary weights"):
         resolve_refinement_config(
@@ -276,12 +462,71 @@ def test_legacy_type_rejects_other_interpolation_paths() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "flow_override",
+    [
+        {"solver": "heun"},
+        {"stochastic_initialization": False},
+        {"time_sampling": "uniform"},
+        {"logit_normal_mean": 0.0},
+        {"logit_normal_std": 0.8},
+        {"deterministic_training_steps": 8},
+    ],
+)
+def test_legacy_type_rejects_silently_unsupported_flow_options(
+    flow_override: dict[str, object],
+) -> None:
+    with pytest.raises(ConfigValidationError, match="does not implement"):
+        resolve_refinement_config(
+            {
+                "model": {
+                    "refinement": {
+                        "type": "flow_matching_unet",
+                        "flow_matching": flow_override,
+                    }
+                }
+            }
+        )
+
+
 def test_auxiliary_losses_default_to_zero() -> None:
     cfg = resolve_refinement_config({"model": {"refinement": {"type": "diffusion_unet"}}})
     assert cfg.loss.has_auxiliary_terms is False
     assert cfg.loss.reconstruction_weight == 0.0
     assert cfg.loss.bias_weight == 0.0
     assert cfg.loss.gradient_weight == 0.0
+
+
+def test_extreme_tail_defaults_to_legacy_both_and_accepts_upper() -> None:
+    default = resolve_refinement_config({"model": {"refinement": {"type": "diffusion_unet"}}})
+    upper = resolve_refinement_config(
+        {
+            "model": {
+                "refinement": {
+                    "type": "diffusion_unet",
+                    "loss": {"extreme_tail": "upper"},
+                }
+            }
+        }
+    )
+
+    assert default.loss.extreme_tail == "both"
+    assert default.loss.to_dict()["extreme_tail"] == "both"
+    assert upper.loss.extreme_tail == "upper"
+
+
+def test_invalid_extreme_tail_is_rejected() -> None:
+    with pytest.raises(ConfigValidationError, match="extreme_tail"):
+        resolve_refinement_config(
+            {
+                "model": {
+                    "refinement": {
+                        "type": "diffusion_unet",
+                        "loss": {"extreme_tail": "lower"},
+                    }
+                }
+            }
+        )
 
 
 # --------------------------------------------------------------------------
@@ -422,3 +667,31 @@ def test_unified_examples_ship_a_safe_correction_product(name: str) -> None:
         assert zero_initialized is True
         assert cfg.diffusion.prediction_type == "sample"
         assert not (zero_initialized and cfg.diffusion.prediction_type == "epsilon")
+
+
+def test_unified_head_warns_when_legacy_auxiliary_block_is_enabled() -> None:
+    raw = {
+        "model": {"refinement": {"enabled": True, "type": "diffusion_unet"}},
+        "training": {"flow_aux_loss": {"enabled": True, "bias_weight": 1.0}},
+    }
+    with pytest.warns(RuntimeWarning, match="training.flow_aux_loss.*ignored"):
+        config = resolve_refinement_config(raw)
+    assert config.backend == "unified"
+
+
+def test_existing_aurora_flow_warns_when_ode_solver_would_be_ignored() -> None:
+    raw = {
+        "model": {
+            "refinement": {
+                "enabled": True,
+                "type": "flow_matching_conv_unet",
+                "flow_matching": {
+                    "interpolation_path": "existing_aurora",
+                    "solver": "heun",
+                },
+            }
+        }
+    }
+    with pytest.warns(RuntimeWarning, match="solver is ignored"):
+        config = resolve_refinement_config(raw)
+    assert config.flow_matching.solver == "heun"

@@ -57,7 +57,13 @@ from finetune.refinement.losses import area_weights_from_latitudes
 from finetune.refinement.packing import ChannelSpec, FieldPacking
 from finetune.refinement.target_space import NormalizedTargetSpace
 
-SUPPORTED_HEADS = ("diffusion_transformer", "direct_regression_transformer")
+SUPPORTED_HEADS = (
+    "diffusion_unet",
+    "diffusion_transformer",
+    "flow_matching_conv_unet",
+    "flow_matching_transformer",
+    "direct_regression_transformer",
+)
 
 
 def _channel_label(spec: ChannelSpec) -> str:
@@ -377,10 +383,17 @@ def _predict_correction(
     conditioning_override: torch.Tensor | None = None,
 ) -> torch.Tensor:
     rollout = data.rollout.to(device)
-    valid = data.valid.to(device)
+    input_valid_mask = None if data.rollout_valid is None else data.rollout_valid.to(device)
+    static_fields = None if data.static is None else data.static.to(device)
     lead = data.lead_hours.to(device)
     conditioning = (
-        _conditioning(rollout, valid)
+        _conditioning(
+            rollout,
+            packing=data.packing,
+            config=config,
+            static_fields=static_fields,
+            input_valid_mask=input_valid_mask,
+        )
         if conditioning_override is None
         else conditioning_override.to(device)
     )
@@ -421,13 +434,20 @@ def fit_tiny_dataset(
     merged = _experiment_overrides()
     if overrides:
         _deep_update(merged, overrides)
-    config = build_config(
-        "diffusion_transformer", lon_periodic=data.case.lon_periodic, overrides=merged
+    configured_head = "diffusion_transformer" if head == "direct_regression_transformer" else head
+    config = build_config(configured_head, lon_periodic=data.case.lon_periodic, overrides=merged)
+    conditioning_example = _conditioning(
+        data.rollout[:1],
+        packing=data.packing,
+        config=config,
+        static_fields=None if data.static is None else data.static[:1],
+        input_valid_mask=(None if data.rollout_valid is None else data.rollout_valid[:1]),
     )
+    cond_channels = int(conditioning_example.shape[1])
     refiner = build_refiner(
         config,
         residual_channels=data.packing.num_channels,
-        cond_channels=data.packing.num_channels + 1,
+        cond_channels=cond_channels,
         metadata=data.packing,
     )
     assert refiner is not None
@@ -490,14 +510,22 @@ def fit_tiny_dataset(
         valid = data.valid[indices].to(device)
         lead = data.lead_hours[indices].to(device)
         lead_index = data.lead_index[indices].to(device)
-        conditioning = _conditioning(rollout, valid)
+        conditioning = _conditioning(
+            rollout,
+            packing=data.packing,
+            config=config,
+            static_fields=None if data.static is None else data.static[indices].to(device),
+            input_valid_mask=(
+                None if data.rollout_valid is None else data.rollout_valid[indices].to(device)
+            ),
+        )
         target_correction = torch.where(valid, target - rollout, torch.zeros_like(target))
 
         optimizer.zero_grad(set_to_none=True)
         if head == "direct_regression_transformer":
             scaled_target = refiner.residual_scaler.encode(target_correction)
             process_time = torch.zeros(rollout.shape[0], device=device, dtype=torch.float32)
-            predicted_scaled = refiner.mean_net(
+            predicted_scaled = refiner.net(
                 torch.zeros_like(scaled_target), conditioning, process_time, lead
             )
             loss = masked_loss(predicted_scaled, scaled_target, valid, "huber")
@@ -569,8 +597,15 @@ def conditioning_diagnostics(
     device = torch.device(device)
     original = result.predicted_correction
     rollout = data.rollout.to(device)
-    valid = data.valid.to(device)
-    condition = _conditioning(rollout, valid)
+    input_valid_mask = None if data.rollout_valid is None else data.rollout_valid.to(device)
+    static_fields = None if data.static is None else data.static.to(device)
+    condition = _conditioning(
+        rollout,
+        packing=data.packing,
+        config=result.config,
+        static_fields=static_fields,
+        input_valid_mask=input_valid_mask,
+    )
     permutation = torch.arange(len(data) - 1, -1, -1, device=device)
     shuffled_condition = condition[permutation]
     shuffled = _predict_correction(

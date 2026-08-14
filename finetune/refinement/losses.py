@@ -120,6 +120,45 @@ def area_weights_from_latitudes(
     return weights.to(device=device, dtype=dtype).view(1, 1, -1, 1)
 
 
+def _scaled_zero_correction(
+    reference: torch.Tensor,
+    decode: Callable[[torch.Tensor], torch.Tensor] | None,
+) -> torch.Tensor:
+    """Return the scaled-space value that decodes to a literal zero correction.
+
+    ResidualScaler.decode is affine: decode(z) = z * scale + shift. Evaluating
+    it at zero and one recovers the shift and scale without exposing scaler
+    internals. This keeps magnitude and degradation losses in the same scaled
+    units as the generative objective while making their identity reference
+    physically correct when residual centering is enabled.
+    """
+    if decode is None:
+        return torch.zeros_like(reference, dtype=torch.float32)
+
+    zero = torch.zeros_like(reference, dtype=torch.float32)
+    decoded_zero = decode(zero).float()
+    decoded_one = decode(torch.ones_like(zero)).float()
+    if decoded_zero.shape != reference.shape or decoded_one.shape != reference.shape:
+        raise ValueError(
+            "Residual decode must preserve tensor shape when constructing the "
+            "zero-correction baseline."
+        )
+    scale = decoded_one - decoded_zero
+    if not bool(torch.isfinite(decoded_zero).all()) or not bool(
+        torch.isfinite(scale).all()
+    ):
+        raise ValueError(
+            "Residual decode produced non-finite values while constructing the "
+            "zero-correction baseline."
+        )
+    if bool((scale.abs() < 1.0e-8).any()):
+        raise ValueError(
+            "Residual decode has a near-zero affine scale; a zero-correction "
+            "baseline cannot be constructed."
+        )
+    return -decoded_zero / scale
+
+
 def _group_ids(
     packing: FieldPacking | None,
     channels: int,
@@ -202,6 +241,10 @@ def compute_auxiliary_losses(
       deterministic, degradation, magnitude, bias, gradient) is computed there,
       so a weight of ``1.0`` really does mean "as important as the generative
       objective" regardless of how small the physical residual happens to be.
+      When requested and supplied, the deterministic inference estimate is used
+      consistently for forecast-quality auxiliaries. Magnitude and degradation
+      use the scaled value that decodes to a literal zero correction as their
+      identity, because scaled zero is not the identity under centered scaling.
     * **normalized target space** - terms that need the refined *field*
       (``rollout + residual``) are computed after ``decode``, because adding a
       standardized residual to an un-standardized rollout would be meaningless.
@@ -218,9 +261,9 @@ def compute_auxiliary_losses(
             network.
         rollout_normalized: deterministic rollout in normalized target space.
         deterministic_estimate: the residual the deterministic inference path
-            would produce, required by ``deterministic_weight``. Supplying it
-            costs one extra forward pass and is what ties the training objective
-            to the quantity the forecast actually uses.
+            would produce. It is required by ``deterministic_weight`` and,
+            when supplied with ``aux_on_deterministic=true``, is used by all
+            forecast-quality auxiliary terms.
         decode: maps the scaled residual back to normalized target space.
     """
     if not config.has_auxiliary_terms:
@@ -228,27 +271,46 @@ def compute_auxiliary_losses(
 
     estimate = residual_estimate.float()
     target = residual_target.float()
-    error = estimate - target
-    weight = torch.ones_like(error) if mask is None else mask.to(error.dtype)
+    score_estimate = (
+        deterministic_estimate.float()
+        if config.aux_on_deterministic and deterministic_estimate is not None
+        else estimate
+    )
+    score_error = score_estimate - target
+    weight = (
+        torch.ones_like(score_error)
+        if mask is None
+        else mask.to(device=score_error.device, dtype=score_error.dtype)
+    )
     if config.area_weighted and area_weight is not None:
-        weight = weight * area_weight.to(device=error.device, dtype=error.dtype)
+        weight = weight * area_weight.to(
+            device=score_error.device, dtype=score_error.dtype
+        )
 
     terms = BiasLossTerms()
     denom = weight.sum().clamp(min=1.0)
 
     if config.reconstruction_weight > 0.0:
-        terms.reconstruction = (error.pow(2) * weight).sum() / denom
+        terms.reconstruction = (score_error.pow(2) * weight).sum() / denom
 
     if config.mae_weight > 0.0:
-        terms.mae = (error.abs() * weight).sum() / denom
+        terms.mae = (score_error.abs() * weight).sum() / denom
+
+    zero_correction = None
+    if config.magnitude_weight > 0.0 or config.degradation_weight > 0.0:
+        zero_correction = _scaled_zero_correction(score_estimate, decode)
 
     if config.magnitude_weight > 0.0:
-        terms.magnitude = (estimate.pow(2) * weight).sum() / denom
+        assert zero_correction is not None
+        correction = score_estimate - zero_correction
+        terms.magnitude = (correction.pow(2) * weight).sum() / denom
 
     if config.degradation_weight > 0.0:
+        assert zero_correction is not None
         # Zero while the correction is at least as good as no correction at all,
         # positive exactly where it makes a point worse.
-        hinge = torch.relu(error.pow(2) - target.pow(2))
+        uncorrected_error = zero_correction - target
+        hinge = torch.relu(score_error.pow(2) - uncorrected_error.pow(2))
         terms.degradation = (hinge * weight).sum() / denom
 
     if config.deterministic_weight > 0.0:
@@ -262,16 +324,25 @@ def compute_auxiliary_losses(
 
     if config.bias_weight > 0.0:
         groups = _group_ids(
-            packing, error.shape[1], config, lead_index, error.shape[0], error.device
+            packing,
+            score_error.shape[1],
+            config,
+            lead_index,
+            score_error.shape[0],
+            score_error.device,
         )
-        numerator = (error * weight).sum(dim=(-2, -1))
+        numerator = (score_error * weight).sum(dim=(-2, -1))
         denominator = weight.sum(dim=(-2, -1))
         group_bias, present = _grouped_mean(numerator, denominator, groups)
-        terms.bias = (group_bias[present] ** 2).mean() if bool(present.any()) else error.sum() * 0.0
+        terms.bias = (
+            (group_bias[present] ** 2).mean()
+            if bool(present.any())
+            else score_error.sum() * 0.0
+        )
 
     if config.gradient_weight > 0.0:
         terms.gradient = _gradient_loss(
-            error,
+            score_error,
             weight,
             lon_periodic=bool(getattr(packing, "lon_periodic", False)),
         )
@@ -288,13 +359,8 @@ def compute_auxiliary_losses(
         # estimate is drawn at a random noise level and is far noisier than the
         # deterministic estimate, so its spread/tails/spectrum are not the ones
         # a user sees.
-        field_source = (
-            deterministic_estimate
-            if config.aux_on_deterministic and deterministic_estimate is not None
-            else estimate
-        )
         base = rollout_normalized.float()
-        refined = base + to_physical(field_source.float()).float()
+        refined = base + to_physical(score_estimate).float()
         truth = base + to_physical(target).float()
 
         if config.pattern_correlation_weight > 0.0:
@@ -306,6 +372,7 @@ def compute_auxiliary_losses(
                 weight,
                 quantile=config.extreme_quantile,
                 intensity=config.extreme_intensity,
+                tail=config.extreme_tail,
             )
         if config.peak_weight > 0.0:
             terms.peak = _peak_loss(refined, truth, weight)
@@ -374,14 +441,21 @@ def _extreme_loss(
     *,
     quantile: float,
     intensity: float,
+    tail: str = "both",
 ) -> torch.Tensor:
     """Squared error re-weighted towards the tails of the *observed* field.
 
     The weight ramps from 1 to ``1 + intensity`` as the truth moves from the
-    configured quantile to the field maximum, and symmetrically for the lower
-    tail. Anchoring the weights on the truth (not the prediction) keeps the term
-    from rewarding a model that simply inflates its own extremes.
+    configured quantile to the field maximum. With ``tail="both"`` (the
+    backward-compatible default), the same weighting is applied symmetrically
+    to the lower tail; ``tail="upper"`` focuses only on high concentrations.
+    Anchoring the weights on the truth (not the prediction) keeps the term from
+    rewarding a model that simply inflates its own extremes.
     """
+    if tail not in {"both", "upper"}:
+        raise ValueError(
+            f"Unsupported extreme tail {tail!r}; expected 'both' or 'upper'."
+        )
     flat_refined = refined.flatten(start_dim=-2).reshape(-1, refined.shape[-2] * refined.shape[-1])
     flat_truth = truth.flatten(start_dim=-2).reshape(-1, truth.shape[-2] * truth.shape[-1])
     flat_weight = weight.flatten(start_dim=-2).reshape(-1, weight.shape[-2] * weight.shape[-1])
@@ -393,14 +467,19 @@ def _extreme_loss(
             continue
         observed = truth_map[valid].float()
         upper = torch.quantile(observed, quantile).to(truth.dtype)
-        lower = torch.quantile(observed, 1.0 - quantile).to(truth.dtype)
         maximum = observed.max().to(truth.dtype)
-        minimum = observed.min().to(truth.dtype)
         span_up = (maximum - upper).clamp(min=1e-6)
-        span_down = (lower - minimum).clamp(min=1e-6)
         excess_up = ((truth_map[valid] - upper) / span_up).clamp(min=0.0, max=1.0)
-        excess_down = ((lower - truth_map[valid]) / span_down).clamp(min=0.0, max=1.0)
-        tail_weight = 1.0 + intensity * torch.maximum(excess_up, excess_down)
+        tail_emphasis = excess_up
+        if tail == "both":
+            lower = torch.quantile(observed, 1.0 - quantile).to(truth.dtype)
+            minimum = observed.min().to(truth.dtype)
+            span_down = (lower - minimum).clamp(min=1e-6)
+            excess_down = ((lower - truth_map[valid]) / span_down).clamp(
+                min=0.0, max=1.0
+            )
+            tail_emphasis = torch.maximum(excess_up, excess_down)
+        tail_weight = 1.0 + intensity * tail_emphasis
         combined = map_weight[valid] * tail_weight
         numerator = numerator + ((refined_map[valid] - truth_map[valid]).pow(2) * combined).sum()
         denominator = denominator + combined.sum()

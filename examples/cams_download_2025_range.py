@@ -1,4 +1,5 @@
-"""
+"""Copyright (c) Microsoft Corporation. Licensed under the MIT license.
+
 Sequential CAMS downloader in half-month chunks.
 Takes a start_date and end_date and generates date ranges automatically.
 Skips ranges whose output files already exist and pass a basic completeness check.

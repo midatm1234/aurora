@@ -164,6 +164,28 @@ def test_extreme_thresholds_and_extrema_ignore_masked_cells() -> None:
     torch.testing.assert_close(masked_peak, compact_peak)
 
 
+def test_extreme_tail_can_focus_on_high_concentrations_only() -> None:
+    truth = torch.tensor([[[[0.0, 1.0, 2.0, 3.0, 4.0]]]])
+    # Put all error at the observed lower extreme. A symmetric objective should
+    # emphasise it, while an upper-only NO2-tail objective should not.
+    refined = truth.clone()
+    refined[..., 0] = 10.0
+    weight = torch.ones_like(truth)
+
+    legacy_default = _extreme_loss(
+        refined, truth, weight, quantile=0.8, intensity=4.0
+    )
+    both = _extreme_loss(
+        refined, truth, weight, quantile=0.8, intensity=4.0, tail="both"
+    )
+    upper = _extreme_loss(
+        refined, truth, weight, quantile=0.8, intensity=4.0, tail="upper"
+    )
+
+    torch.testing.assert_close(legacy_default, both)
+    assert float(both) > float(upper)
+
+
 def test_quantile_loss_exactly_excludes_masked_cells() -> None:
     refined = torch.tensor([[[[0.0, 10.0, -999.0, 999.0]]]])
     truth = torch.tensor([[[[2.0, 4.0, 999.0, -999.0]]]])

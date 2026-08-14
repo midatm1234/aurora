@@ -182,6 +182,12 @@ model:
     # "fine-tuned forecast".
     ensemble_size: 1
     deterministic_inference: true
+    # Query and directly supervise the flow network itself for the point
+    # product. While its zero-initialized projection is untouched, inference
+    # returns a literal zero correction before centered residual decoding;
+    # trained outputs use calibrated mean/std. Omitted/legacy configs retain
+    # the independent mean-head contract.
+    deterministic_head: shared_process
 
     target_space:
       use_existing_normalization: true
@@ -193,6 +199,8 @@ model:
       residual_scaling_momentum: 0.05
       residual_scaling_warmup_batches: 32
       residual_scaling_target_std: 1.0
+      # Constrain deployed corrections to the centered training residual range.
+      residual_clip_standard_deviations: 4.0
 
     conditioning:
       aurora_rollout: true
@@ -201,6 +209,8 @@ model:
       static_fields: false
       masks: true
       forecast_lead_time: true
+      latitude: true
+      longitude: true
 
     loss:
       generative: mse
@@ -209,7 +219,7 @@ model:
       deterministic_weight: 1.0
       aux_on_deterministic: true
       reconstruction_weight: 0.0
-      mae_weight: 0.0
+      mae_weight: 1.0
       bias_weight: 1.0
       gradient_weight: 0.25
       pattern_correlation_weight: 0.5
@@ -217,6 +227,7 @@ model:
       extreme_weight: 1.0
       extreme_quantile: 0.95
       extreme_intensity: 4.0
+      extreme_tail: upper
       quantile_weight: 1.0
       peak_weight: 0.0
       spectral_weight: 0.0
@@ -235,7 +246,7 @@ model:
       source_distribution: gaussian
       interpolation_path: existing_aurora
       integration_steps: 50
-      solver: heun
+      solver: euler  # existing_aurora uses data-parameterization updates, not an ODE solver.
       stochastic_initialization: true
       time_sampling: logit_normal
       sigma_min: 1.0e-3
@@ -276,7 +287,7 @@ model:
       zero_init_output: true
 
     transformer:
-      patch_size: [8, 8]
+      patch_size: [4, 4]  # 51x69 region -> 13x18 tokens; retain plume-scale detail.
       embedding_dim: 256
       num_heads: 8
       num_blocks: 6
@@ -307,7 +318,7 @@ training:
   seed: 42
   batch_size: 1  # Six supervised rollout leads per sample; accumulate below.
   num_epochs: 100
-  # Phase 1 Aurora is frozen; train the diffusion correction head only.
+  # Phase 1 Aurora is frozen; train the flow-matching correction head only.
   refinement_loss_weight: 1.0
   mamba_temporal_weight: 0.0
   learning_rate: 3.0e-4
@@ -336,12 +347,21 @@ training:
   # Select in physical space: mean(refined RMSE / Aurora RMSE), grouped by
   # variable, pressure level, and lead. Every target channel must improve.
   checkpoint_metric: mean_physical_rmse_ratio
+  # RMSE remains the ranking score. These guards prevent a lower mean RMSE
+  # from hiding harmful MAE/bias/pattern regressions in any channel or lead.
+  checkpoint_guard_metrics:
+    - mae
+    - absolute_bias
+    - pattern_correlation
+  checkpoint_guard_relative_tolerance: 0.0
+  checkpoint_guard_correlation_tolerance: 0.0
+  checkpoint_guard_bias_rmse_floor_fraction: 0.05
   require_all_physical_channels_improve: true
   require_refinement_improvement: true
   save_best_only: true
   save_last: true
   # This audited target/scaling/prediction contract is incompatible with the
-  # earlier epsilon checkpoint. Start clean; only resume an interrupted run
+  # earlier pre-contract checkpoint. Start clean; only resume an interrupted run
   # created from this exact contract.
   resume_training: false
   resume_from: ""  # "best", "last", or a path to a .ckpt file. Empty = fresh run.

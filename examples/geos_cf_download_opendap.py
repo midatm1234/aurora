@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Download GEOS-CF v1 `assim` variables over OPeNDAP for a user-defined region.
+"""Copyright (c) Microsoft Corporation. Licensed under the MIT license.
+
+Download GEOS-CF v1 `assim` variables over OPeNDAP for a user-defined region.
 
 Outputs:
 - Daily combined files (default): one NetCDF per day with both 2D+3D variables.

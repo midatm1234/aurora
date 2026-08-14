@@ -111,6 +111,9 @@ DEFAULT_AUX_LOSS_CONFIG: dict = {
     "extreme_weight": 0.0,
     "extreme_quantile": 0.95,
     "extreme_intensity": 4.0,
+    # 'both' preserves the historical absolute-target-tail objective. 'upper'
+    # focuses NO2-style recipes on high concentrations only.
+    "extreme_tail": "both",
     "peak_weight": 0.0,
     # Spatial-pattern agreement: gradient-field MSE + anomaly correlation.
     "spatial_grad_weight": 0.0,
@@ -162,16 +165,21 @@ def _extreme_weighted_mse(
     target: torch.Tensor,
     quantile: float,
     intensity: float,
+    tail: str = "both",
 ) -> torch.Tensor:
     """Squared error up-weighted on extreme (tail) cells.
 
-    A cell is "extreme" when its normalised target magnitude exceeds the
-    per-sample ``quantile`` of |target|. Extreme cells contribute
-    ``intensity``× their squared error, so high-ozone plumes (the tails the
-    plain MSE averages away) are corrected harder.
+    With tail="both" (the backward-compatible default), a cell is extreme
+    when its normalised target magnitude exceeds the per-sample quantile of
+    |target|. tail="upper" instead selects the same quantile of the signed
+    target, focusing the weight on high concentrations only.
     """
+    if tail not in {"both", "upper"}:
+        raise ValueError(
+            f"extreme_tail must be 'both' or 'upper', got {tail!r}."
+        )
     se = (refined - target) ** 2
-    z = target.abs()
+    z = target.abs() if tail == "both" else target
     N = z.shape[0]
     z_flat = z.reshape(N, -1)
     q = torch.clamp(torch.tensor(quantile, device=z.device, dtype=torch.float32), 0.0, 1.0)
@@ -182,13 +190,24 @@ def _extreme_weighted_mse(
     return (weight * se).sum() / weight.sum().clamp_min(1.0)
 
 
-def _peak_loss(refined: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    """Match the per-sample spatial maximum and minimum magnitudes."""
+def _peak_loss(
+    refined: torch.Tensor,
+    target: torch.Tensor,
+    tail: str = "both",
+) -> torch.Tensor:
+    """Match upper peaks, and lower peaks when tail="both"."""
+    if tail not in {"both", "upper"}:
+        raise ValueError(
+            f"extreme_tail must be 'both' or 'upper', got {tail!r}."
+        )
     r_max = refined.amax(dim=(-1, -2))
     t_max = target.amax(dim=(-1, -2))
+    upper = F.mse_loss(r_max, t_max)
+    if tail == "upper":
+        return upper
     r_min = refined.amin(dim=(-1, -2))
     t_min = target.amin(dim=(-1, -2))
-    return 0.5 * (F.mse_loss(r_max, t_max) + F.mse_loss(r_min, t_min))
+    return 0.5 * (upper + F.mse_loss(r_min, t_min))
 
 
 def _spatial_gradient_loss(
@@ -656,6 +675,7 @@ class AuroraFlowRefine(nn.Module):
         temporal_layers: int = 2,
         temporal_conv: int = 3,
         temporal_expand: int = 2,
+        flow_refine_contract_version: int = 1,
     ) -> None:
         super().__init__()
         self.base = base
@@ -664,6 +684,13 @@ class AuroraFlowRefine(nn.Module):
         self.hidden = hidden
         self.sampling_steps = int(sampling_steps)
         self.sigma_min = float(sigma_min)
+        if (
+            isinstance(flow_refine_contract_version, bool)
+            or not isinstance(flow_refine_contract_version, int)
+            or flow_refine_contract_version < 1
+        ):
+            raise ValueError("flow_refine_contract_version must be a positive integer.")
+        self.flow_refine_contract_version = flow_refine_contract_version
         self.doy_cond = bool(doy_cond)
         self.lead_time_cond = bool(lead_time_cond)
         self.lead_time_scale_hours = float(lead_time_scale_hours)
@@ -1029,6 +1056,7 @@ class AuroraFlowRefine(nn.Module):
         lon: torch.Tensor | None = None,
         valid_mask: torch.Tensor | None = None,
         lead_time_hours: float | torch.Tensor | None = None,
+        generator: torch.Generator | None = None,
     ) -> torch.Tensor:
         """Conditional residual regression at a sampled noise level.
 
@@ -1125,7 +1153,9 @@ class AuroraFlowRefine(nn.Module):
         # Cyclic longitude conditioning maps (shared across the flattened axis).
         coords = self._lon_coords(lon, N, H, W, device, dtype)
 
-        x0 = torch.randn(N, 1, H, W, device=device, dtype=dtype)
+        x0 = torch.randn(
+            N, 1, H, W, device=device, dtype=dtype, generator=generator,
+        )
         # FM z-score: standardise the target residual so it is ~unit-variance,
         # scale-matched to the unit-variance noise x0. σ_r = 1 when the feature
         # is disabled, recovering the original residual-MSE objective exactly.
@@ -1140,7 +1170,13 @@ class AuroraFlowRefine(nn.Module):
         # uninformative) or near-clean (t ≈ 1, tiny gradients). This
         # distribution (sigmoid of N(-0.5, 1.2)) has median ≈ 0.38 and is
         # empirically known to accelerate flow matching convergence.
-        log_t = torch.randn(N, device=device, dtype=torch.float32) * 1.2 - 0.5
+        log_t = (
+            torch.randn(
+                N, device=device, dtype=torch.float32, generator=generator,
+            )
+            * 1.2
+            - 0.5
+        )
         t = torch.sigmoid(log_t).clamp(self.sigma_min, 1.0 - self.sigma_min)
         t_b = t.view(N, 1, 1, 1).to(dtype)
 
@@ -1245,15 +1281,19 @@ class AuroraFlowRefine(nn.Module):
         w_wass = float(cfg.get("dist_wasserstein_weight", 0.0))
         w_bias = float(cfg.get("bias_weight", 0.0))
         w_vert = float(cfg.get("vertical_weight", 0.0))
+        extreme_tail = str(cfg.get("extreme_tail", "both")).strip().lower()
 
         if w_extreme > 0.0:
             total = total + w_extreme * _extreme_weighted_mse(
                 refined_flat, target_flat,
                 quantile=float(cfg.get("extreme_quantile", 0.95)),
                 intensity=float(cfg.get("extreme_intensity", 4.0)),
+                tail=extreme_tail,
             )
         if w_peak > 0.0:
-            total = total + w_peak * _peak_loss(refined_flat, target_flat)
+            total = total + w_peak * _peak_loss(
+                refined_flat, target_flat, tail=extreme_tail,
+            )
         if w_grad > 0.0:
             total = total + w_grad * _spatial_gradient_loss(
                 refined_flat, target_flat, lon_periodic=self.lon_periodic,
@@ -1286,21 +1326,29 @@ class AuroraFlowRefine(nn.Module):
         lead_hours: torch.Tensor | None = None,
         coords: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Predict the conditional-mean residual at the source endpoint.
+        """Predict a deterministic residual using the versioned endpoint.
 
         The training interpolant is ``x_t=(1-t)x0+t*r`` with source noise
         independent of ``r``. At ``t=0`` the squared-error-optimal x1
         prediction is therefore ``E[r | cond]``. We evaluate at the source
-        mean ``x0=0`` for deterministic bias correction.
+        mean ``x0=0`` for deterministic bias correction in contract v2+.
+
+        Contract v1 intentionally retains the historical clean-endpoint query
+        ``x=0, t=1`` so old checkpoints and configurations keep their exact
+        inference behaviour. Contract v2+ uses the mathematically consistent
+        source query ``x=0, t=0``.
         """
         n, _, h, w = cond_norm.shape
-        x_source_mean = torch.zeros(
+        x_query = torch.zeros(
             n, 1, h, w, device=cond_norm.device, dtype=cond_norm.dtype,
         )
-        t_source = torch.zeros(n, device=cond_norm.device, dtype=torch.float32)
+        endpoint = 1.0 if self.flow_refine_contract_version == 1 else 0.0
+        t_query = torch.full(
+            (n,), endpoint, device=cond_norm.device, dtype=torch.float32,
+        )
         return head(
-            x_source_mean,
-            t_source,
+            x_query,
+            t_query,
             cond_norm,
             doy=doy,
             lead_hours=lead_hours,
@@ -1314,9 +1362,10 @@ class AuroraFlowRefine(nn.Module):
     ) -> torch.Tensor:
         """Deterministic refined estimate E[r|ŷ] added to ``pred_norm``.
 
-        Runs the head once at the source mean (``x_t = 0``, ``t = 0``) — the
-        same single-step regression :meth:`_sample_residual` uses — but with
-        gradients enabled. Returns the refined field in normalised space.
+        Runs the head once at the contract's deterministic endpoint — the same
+        single-step regression :meth:`_sample_residual` uses — but with
+        gradients enabled. Returns the refined field in normalised space. V1
+        retains ``x=0, t=1``; v2+ uses the source mean ``x=0, t=0``.
         """
         heads = self.surf_flow if kind == "surf" else self.atmos_flow
         if var_name not in heads:
@@ -1527,16 +1576,18 @@ class AuroraFlowRefine(nn.Module):
         doy: torch.Tensor | None = None,
         lead_hours: torch.Tensor | None = None,
         coords: torch.Tensor | None = None,
+        generator: torch.Generator | None = None,
     ) -> torch.Tensor:
         """Iterative refinement of the residual prediction.
 
         Uses the **data (x₁) parameterisation**: at each step the head
         predicts r̂ from a noise-perturbed input ``x_t`` (with decreasing
         noise level), and the result is re-noised at the next lower level
-        and re-predicted. With ``sampling_steps == 1`` and the source mean
-        (``x_t = 0, t = 0``) this reduces to a single deterministic
-        regression; with more steps the model can express multi-modal
-        residual distributions.
+        and re-predicted. With ``sampling_steps == 1`` this reduces to a
+        single deterministic regression; with more steps the model can express
+        multi-modal residual distributions. The endpoint is versioned: v1
+        retains historical ``x=0, t=1`` behaviour, while v2+ uses the source
+        mean ``x=0, t=0``.
 
         Args:
           cond_norm: (N, 1, H, W) — normalised Aurora prediction (cond).
@@ -1556,8 +1607,7 @@ class AuroraFlowRefine(nn.Module):
         steps = max(1, self.sampling_steps)
 
         if steps == 1:
-            # Single-step deterministic regression E[r | ŷ]:
-            # x_t = E[x0] = 0 at t=0, where source noise is independent of r.
+            # Contract-versioned single-step deterministic regression.
             return self._deterministic_residual(
                 cond_norm, head, doy=doy, lead_hours=lead_hours, coords=coords,
             )
@@ -1575,7 +1625,9 @@ class AuroraFlowRefine(nn.Module):
         t_schedule = torch.linspace(
             0.0, 1.0 - self.sigma_min, steps + 1, device=device
         )
-        x = torch.randn(N, 1, H, W, device=device, dtype=dtype)
+        x = torch.randn(
+            N, 1, H, W, device=device, dtype=dtype, generator=generator,
+        )
         r_hat = torch.zeros_like(x)
         for i in range(steps):
             t_curr = float(t_schedule[i].item())
@@ -1610,7 +1662,10 @@ class AuroraFlowRefine(nn.Module):
             return pred
         return self.refine_prediction(
             pred,
-            deterministic=False,
+            # Contract v1 preserves historical sampler dispatch exactly.
+            # V2+ defaults point refinement to a deterministic source query;
+            # rollout offers an explicit stochastic opt-in when requested.
+            deterministic=self.flow_refine_contract_version >= 2,
             forecast_lead_time_hours=forecast_lead_time_hours,
         )
 
@@ -1620,6 +1675,7 @@ class AuroraFlowRefine(nn.Module):
         *,
         deterministic: bool = True,
         forecast_lead_time_hours: float | torch.Tensor | None = None,
+        generator: torch.Generator | None = None,
     ) -> Batch:
         """Apply refinement to an already-computed Aurora prediction.
 
@@ -1644,7 +1700,12 @@ class AuroraFlowRefine(nn.Module):
                     cond, head, doy=doy, lead_hours=lead_hours, coords=coords,
                 )
             return self._sample_residual(
-                cond, head, doy=doy, lead_hours=lead_hours, coords=coords,
+                cond,
+                head,
+                doy=doy,
+                lead_hours=lead_hours,
+                coords=coords,
+                generator=generator,
             )
 
         # Eval / inference: integrate the FM ODE and add the sampled

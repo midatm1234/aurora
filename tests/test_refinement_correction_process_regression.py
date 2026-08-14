@@ -122,6 +122,76 @@ def test_training_process_target_is_correction_minus_detached_mean():
     assert torch.count_nonzero(refiner.mean_net.out_proj.bias.grad) > 0
 
 
+@pytest.mark.parametrize(
+    "kind",
+    (
+        "diffusion_unet",
+        "diffusion_transformer",
+        "flow_matching_conv_unet",
+        "flow_matching_transformer",
+    ),
+)
+def test_shared_process_head_is_the_deployed_point_model(kind):
+    model = build_refiner_model(
+        kind,
+        height=8,
+        width=8,
+        deterministic_head="shared_process",
+        target_space={"residual_scaling": "none"},
+        loss={"deterministic_weight": 1.0},
+        diffusion={"prediction_type": "sample"},
+        flow_matching={"interpolation_path": "existing_aurora"},
+    )
+    refiner = model.refiner
+    assert refiner.mean_net is None
+    assert refiner.uses_shared_process_parameterization
+    assert not refiner.uses_innovation_parameterization
+    _set_output_bias(refiner.net, 0.25)
+    conditioning = torch.randn(2, model.conditioning_channels(), 8, 8)
+    lead = torch.tensor([24.0, 48.0])
+
+    correction = refiner.deterministic_residual(
+        conditioning, forecast_lead_time=lead
+    )
+
+    torch.testing.assert_close(correction, torch.full_like(correction, 0.25))
+
+
+def test_shared_process_training_uses_the_complete_correction_target():
+    model = build_refiner_model(
+        "diffusion_unet",
+        height=8,
+        width=8,
+        deterministic_head="shared_process",
+        target_space={"residual_scaling": "none"},
+    )
+    refiner = model.refiner
+    captured = {}
+
+    def fake_training_loss(
+        self,
+        process_target,
+        conditioning,
+        *,
+        forecast_lead_time,
+        mask,
+        generator,
+    ):
+        captured["target"] = process_target.detach().clone()
+        return (
+            RefinerOutput(generative_loss=process_target.square().mean()),
+            torch.zeros_like(process_target),
+        )
+
+    refiner._training_loss = MethodType(fake_training_loss, refiner)
+    conditioning = torch.randn(2, model.conditioning_channels(), 8, 8)
+    correction = torch.full((2, model.packing.num_channels, 8, 8), 0.75)
+    output = refiner.compute_training_loss(correction, conditioning)
+
+    torch.testing.assert_close(captured["target"], correction)
+    assert float(output.total_loss) == pytest.approx(0.75**2)
+
+
 def test_sampling_composes_mean_and_shift_free_innovation_once():
     model = build_refiner_model(
         "diffusion_unet",

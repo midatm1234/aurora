@@ -1,4 +1,5 @@
-"""
+"""Copyright (c) Microsoft Corporation. Licensed under the MIT license.
+
 Sanitized test script to diagnose connectivity to a Foundry endpoint.
 
 Usage:
@@ -29,8 +30,13 @@ import sys
 from urllib.parse import urlparse
 
 import requests
-from requests.exceptions import ConnectionError as ReqConnectionError, RequestException, Timeout
-
+from requests.exceptions import (
+    ConnectionError as ReqConnectionError,
+)
+from requests.exceptions import (
+    RequestException,
+    Timeout,
+)
 
 LOG = logging.getLogger("foundry_test")
 

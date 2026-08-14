@@ -298,6 +298,10 @@ class AuroraTwoPhaseRefiner(nn.Module):
                 if static_fields is None
                 else static_fields
             )
+        if cond.latitude:
+            total += 1
+        if cond.longitude:
+            total += 2
         if cond.masks:
             total += 1
         return total
@@ -329,6 +333,31 @@ class AuroraTwoPhaseRefiner(nn.Module):
     # ------------------------------------------------------------------
     # Conditioning
     # ------------------------------------------------------------------
+    @staticmethod
+    def _coordinate_vector(
+        name: str,
+        values: Sequence[float],
+        expected_size: int,
+        reference: torch.Tensor,
+    ) -> torch.Tensor:
+        """Validate one FieldPacking coordinate axis and move it to the field device."""
+        if len(values) != int(expected_size):
+            raise ValueError(
+                f"refinement.conditioning.{name} requires one FieldPacking {name} "
+                f"coordinate per grid cell; expected {expected_size}, got {len(values)}."
+            )
+        coordinate = torch.as_tensor(
+            tuple(values),
+            device=reference.device,
+            dtype=torch.float32,
+        )
+        if coordinate.ndim != 1 or not bool(torch.isfinite(coordinate).all()):
+            raise ValueError(
+                f"FieldPacking {name} coordinates must be a finite one-dimensional "
+                "sequence."
+            )
+        return coordinate
+
     def build_conditioning(
         self,
         rollout_normalized: torch.Tensor,
@@ -341,9 +370,16 @@ class AuroraTwoPhaseRefiner(nn.Module):
 
         Only fields available *at the forecast valid time without looking at the
         target* are used. The ground-truth mask is never conditioning: that
-        would leak target information.
+        would leak target information. Enabled coordinate channels are appended
+        after dynamic/static fields in latitude, sin(longitude), cos(longitude)
+        order, followed by the validity mask.
         """
         cond_cfg = self.refinement_config.conditioning
+        if (cond_cfg.latitude or cond_cfg.longitude) and rollout_normalized.ndim != 4:
+            raise ValueError(
+                "Coordinate conditioning requires rollout_normalized shaped "
+                f"[B, C, H, W], got {tuple(rollout_normalized.shape)}."
+            )
         size = (int(rollout_normalized.shape[-2]), int(rollout_normalized.shape[-1]))
         dtype = rollout_normalized.dtype
         parts: list[torch.Tensor] = []
@@ -369,6 +405,43 @@ class AuroraTwoPhaseRefiner(nn.Module):
                 )
             statics = torch.nan_to_num(static_fields.to(dtype), nan=0.0)
             parts.append(_align_to(statics, size))
+
+        if cond_cfg.latitude:
+            latitude = self._coordinate_vector(
+                "latitude",
+                self.packing.lat,
+                size[0],
+                rollout_normalized,
+            )
+            if bool((latitude.abs() > 90.0).any()):
+                raise ValueError(
+                    "FieldPacking latitude coordinates must lie within "
+                    "[-90, 90] degrees."
+                )
+            latitude = (latitude / 90.0).to(dtype=dtype)
+            parts.append(
+                latitude.view(1, 1, size[0], 1).expand(
+                    rollout_normalized.shape[0], 1, size[0], size[1]
+                )
+            )
+
+        if cond_cfg.longitude:
+            longitude = self._coordinate_vector(
+                "longitude",
+                self.packing.lon,
+                size[1],
+                rollout_normalized,
+            )
+            longitude_radians = torch.deg2rad(longitude)
+            for periodic_coordinate in (
+                torch.sin(longitude_radians),
+                torch.cos(longitude_radians),
+            ):
+                parts.append(
+                    periodic_coordinate.to(dtype=dtype)
+                    .view(1, 1, 1, size[1])
+                    .expand(rollout_normalized.shape[0], 1, size[0], size[1])
+                )
 
         if cond_cfg.masks:
             if input_valid_mask is None:
@@ -865,6 +938,12 @@ class AuroraTwoPhaseRefiner(nn.Module):
                     else (n if perf.batch_members else 1)
                 )
             chunk_size = max(1, min(int(chunk_size), n))
+            # The legacy adapter owns a single-generator sampler rather than
+            # the common noise-source interface. Serialize its members so each
+            # member-specific generator is forwarded without changing member
+            # ordering when callers request batched chunks.
+            if self.refinement_config.is_legacy_flow_matching:
+                chunk_size = 1
 
             # Dedicated member generators keep serial and chunked draws identical.
             gen_device = (
@@ -906,6 +985,7 @@ class AuroraTwoPhaseRefiner(nn.Module):
                             forecast_lead_time,
                             num_steps,
                             mean_process_output,
+                            generator=member_generators[drawn],
                         )
                     sampled_innovations.append(innovation.float().unsqueeze(1))
                 else:
@@ -932,6 +1012,7 @@ class AuroraTwoPhaseRefiner(nn.Module):
                             lead_rep,
                             num_steps,
                             mean_rep,
+                            generator=None,
                         )
                     innovation = innovation.float().reshape(
                         batch, member_count, *innovation.shape[1:]
@@ -943,6 +1024,17 @@ class AuroraTwoPhaseRefiner(nn.Module):
         member_corrections = (
             conditional_mean_correction.unsqueeze(1) + member_innovations
         )
+        if (
+            self.refinement_config.target_space.residual_clip_standard_deviations
+            > 0.0
+        ):
+            member_corrections = self._guard_deployed_member_corrections(
+                member_corrections
+            )
+            member_innovations = (
+                member_corrections
+                - conditional_mean_correction.unsqueeze(1)
+            )
         member_normalized = rollout.unsqueeze(1) + member_corrections
         if self.temporal is not None:
             history = temporal_history if temporal_history is not None else []
@@ -978,6 +1070,17 @@ class AuroraTwoPhaseRefiner(nn.Module):
             ).reshape(batch_size, members, channels, height, width).float()
             member_normalized = member_normalized.float() + temporal_correction
             member_corrections = member_normalized - rollout.unsqueeze(1)
+            # Temporal post-processing is itself a residual correction. Guard
+            # the complete deployed amplitude again after it has been added so
+            # Mamba cannot bypass the training-residual range safeguard.
+            if (
+                self.refinement_config.target_space.residual_clip_standard_deviations
+                > 0.0
+            ):
+                member_corrections = self._guard_deployed_member_corrections(
+                    member_corrections
+                )
+                member_normalized = rollout.unsqueeze(1) + member_corrections
             member_innovations = (
                 member_corrections
                 - conditional_mean_correction.unsqueeze(1)
@@ -1121,6 +1224,29 @@ class AuroraTwoPhaseRefiner(nn.Module):
         )
         return out
 
+    def _guard_deployed_member_corrections(
+        self, corrections: torch.Tensor
+    ) -> torch.Tensor:
+        """Apply the unified scaled-space safeguard to complete ensemble members."""
+        if self.refinement_config.backend != "unified":
+            return corrections
+        assert self.refiner is not None
+        guard = getattr(self.refiner, "guard_correction_normalized", None)
+        if guard is None:
+            raise RuntimeError(
+                "Unified refiner does not expose its residual amplitude safeguard."
+            )
+        if corrections.ndim != 5:
+            raise ValueError(
+                "Member corrections must have shape [B, member, C, H, W], "
+                f"got {tuple(corrections.shape)}."
+            )
+        batch, members, channels, height, width = corrections.shape
+        guarded = guard(
+            corrections.reshape(batch * members, channels, height, width)
+        )
+        return guarded.reshape(batch, members, channels, height, width)
+
     def _deterministic_mean_process(
         self,
         conditioning: torch.Tensor,
@@ -1145,12 +1271,15 @@ class AuroraTwoPhaseRefiner(nn.Module):
         forecast_lead_time: torch.Tensor | None,
         num_steps: int | None,
         mean_process_output: torch.Tensor,
+        *,
+        generator: torch.Generator | None,
     ) -> torch.Tensor:
         assert self.refiner is not None
         if self.refinement_config.is_legacy_flow_matching:
             sample = self.refiner.sample_residual(
                 conditioning,
                 forecast_lead_time=forecast_lead_time,
+                generator=generator,
                 num_steps=num_steps,
                 rollout_normalized=rollout,
             )

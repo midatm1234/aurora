@@ -498,6 +498,7 @@ def build_refinement_checkpoint(
         "rng_state": {
             "cpu": torch.get_rng_state(),
             "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+            "cuda_current": torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
         },
     }
     temporal_config = getattr(model, "temporal_config", None)

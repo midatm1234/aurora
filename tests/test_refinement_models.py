@@ -39,6 +39,36 @@ def test_one_flow_training_step(refiner_type: str) -> None:
     assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in model.refiner.parameters())
 
 
+def test_legacy_flow_adapter_consumes_supplied_sampling_generator() -> None:
+    model = build_refiner_model(
+        "flow_matching_unet",
+        height=16,
+        width=16,
+        flow_matching={"integration_steps": 2},
+    )
+    rollout = torch.zeros(2, model.packing.num_channels, 16, 16)
+    lead = torch.tensor([24.0, 48.0])
+    generator_a = torch.Generator().manual_seed(23)
+    generator_b = torch.Generator().manual_seed(23)
+    initial_state = generator_a.get_state().clone()
+
+    model.refiner.sample_residual(
+        rollout,
+        forecast_lead_time=lead,
+        generator=generator_a,
+        rollout_normalized=rollout,
+    )
+    model.refiner.sample_residual(
+        rollout,
+        forecast_lead_time=lead,
+        generator=generator_b,
+        rollout_normalized=rollout,
+    )
+
+    assert not torch.equal(generator_a.get_state(), initial_state)
+    assert torch.equal(generator_a.get_state(), generator_b.get_state())
+
+
 def test_flow_time_sampling_stays_inside_the_open_unit_interval() -> None:
     model = build_refiner_model("flow_matching_transformer")
     refiner = model.refiner

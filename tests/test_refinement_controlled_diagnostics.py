@@ -94,6 +94,69 @@ def test_direct_transformer_tiny_fit_uses_exact_correction_interface() -> None:
     json.dumps(result.history, allow_nan=False)
 
 
+@pytest.mark.parametrize(
+    "head",
+    (
+        "diffusion_unet",
+        "diffusion_transformer",
+        "flow_matching_conv_unet",
+        "flow_matching_transformer",
+    ),
+)
+def test_every_refinement_head_overfits_a_known_tiny_correction(head: str) -> None:
+    data = make_smooth_synthetic_dataset(samples=2, height=12, width=12)
+    result = fit_tiny_dataset(
+        head,
+        data,
+        train_steps=12,
+        batch_size=2,
+        learning_rate=3.0e-3,
+        device="cpu",
+        seed=20,
+        overrides={
+            "unet": {
+                "hidden_channels": 8,
+                "num_levels": 2,
+                "num_residual_blocks": 1,
+                "time_embedding_dim": 16,
+                "bottleneck_attention": False,
+                "attention_heads": 2,
+            },
+            "transformer": {
+                "patch_size": [3, 3],
+                "embedding_dim": 16,
+                "num_heads": 4,
+                "num_blocks": 1,
+                "mlp_ratio": 1.0,
+                "local_refinement": False,
+            },
+            "diffusion": {
+                "training_timesteps": 8,
+                "inference_steps": 2,
+                "deterministic_training_steps": 1,
+            },
+            "flow_matching": {"integration_steps": 1},
+            "loss": {
+                "generative": "mse",
+                "deterministic_weight": 4.0,
+                "bias_weight": 0.0,
+                "mae_weight": 0.0,
+                "gradient_weight": 0.0,
+                "pattern_correlation_weight": 0.0,
+                "variance_weight": 0.0,
+                "extreme_weight": 0.0,
+                "quantile_weight": 0.0,
+                "degradation_weight": 0.0,
+            },
+        },
+        verbose=False,
+    )
+    before = float(result.history[0]["relative_correction_rmse"])
+    after = float(result.history[-1]["relative_correction_rmse"])
+    assert after < 0.97 * before
+    assert torch.isfinite(result.predicted_correction).all()
+
+
 @pytest.mark.parametrize("samples", [0, 9])
 def test_synthetic_tiny_sample_limit_is_explicit(samples: int) -> None:
     with pytest.raises(ValueError, match=r"samples must be in \[1, 8\]"):

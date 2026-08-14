@@ -12,8 +12,8 @@ and builds exactly the packed, normalized residual-refinement problem that
 :mod:`finetune.refinement.two_phase` solves during training::
 
     rollout_norm = encode(aurora_rollout)
-    target_norm  = encode(cams_truth)
-    residual     = target_norm - rollout_norm
+    target_norm = encode(cams_truth)
+    residual = target_norm - rollout_norm
 
 Because Aurora itself is frozen in Phase 2 and its raw rollout is already on disk,
 the benchmark trains and scores refiner heads without re-running Aurora. That
@@ -53,6 +53,7 @@ from typing import Any, Iterable, Mapping, Sequence
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from finetune.refinement.base import build_refiner, masked_loss
 from finetune.refinement.config import RefinementConfig, resolve_refinement_config
@@ -140,13 +141,14 @@ class BenchmarkDataset:
     lon: np.ndarray
     case: BenchmarkCase
     static: torch.Tensor | None = None
+    # Rollout-only finiteness, retained separately from ``valid`` so the
+    # conditioning mask cannot reveal missing CAMS targets.
+    rollout_valid: torch.Tensor | None = None
     initialization_ids: tuple[str, ...] = ()
     initialization_times: np.ndarray = field(
         default_factory=lambda: np.asarray([], dtype="datetime64[ns]")
     )
-    valid_times: np.ndarray = field(
-        default_factory=lambda: np.asarray([], dtype="datetime64[ns]")
-    )
+    valid_times: np.ndarray = field(default_factory=lambda: np.asarray([], dtype="datetime64[ns]"))
     source_files: tuple[str, ...] = ()
     source_validation: Mapping[str, Any] = field(default_factory=dict)
 
@@ -157,9 +159,7 @@ class BenchmarkDataset:
         positions = list(indices)
         idx = torch.as_tensor(positions, dtype=torch.long)
         init_ids = (
-            tuple(self.initialization_ids[i] for i in positions)
-            if self.initialization_ids
-            else ()
+            tuple(self.initialization_ids[i] for i in positions) if self.initialization_ids else ()
         )
         return BenchmarkDataset(
             packing=self.packing,
@@ -169,6 +169,7 @@ class BenchmarkDataset:
             lead_hours=self.lead_hours[idx],
             lead_index=self.lead_index[idx],
             lat=self.lat,
+            rollout_valid=(None if self.rollout_valid is None else self.rollout_valid[idx]),
             lon=self.lon,
             case=self.case,
             static=self.static,
@@ -179,9 +180,7 @@ class BenchmarkDataset:
                 else self.initialization_times.copy()
             ),
             valid_times=(
-                self.valid_times[positions]
-                if self.valid_times.size
-                else self.valid_times.copy()
+                self.valid_times[positions] if self.valid_times.size else self.valid_times.copy()
             ),
             source_files=self.source_files,
             source_validation=dict(self.source_validation),
@@ -257,11 +256,15 @@ def _manifest_enables_refinement(value: Any) -> bool:
             key_text = str(key).lower()
             if key_text in {"flow_refine_enabled", "conv_refine_enabled"} and item is True:
                 return True
-            if key_text == "refinement" and isinstance(item, Mapping):
-                if item.get("enabled") is True or str(item.get("type", "none")).lower() not in {
-                    "", "none", "off", "disabled",
-                }:
-                    return True
+            if (
+                key_text == "refinement"
+                and isinstance(item, Mapping)
+                and (
+                    item.get("enabled") is True
+                    or str(item.get("type", "none")).lower() not in {"", "none", "off", "disabled"}
+                )
+            ):
+                return True
             if _manifest_enables_refinement(item):
                 return True
     elif isinstance(value, (list, tuple)):
@@ -298,7 +301,9 @@ def _validate_raw_source_directory(root: Path, case: BenchmarkCase) -> dict[str,
             "This is the repository's raw pretrained-Aurora rollout collection; "
             "a stage-1 fine-tuned, explicitly no-refinement rollout was not substituted."
         ),
-        "validation": "per-file Aurora initialization_time/step_hours attributes; no member dimension",
+        "validation": (
+            "per-file Aurora initialization_time/step_hours attributes; " "no member dimension"
+        ),
         "manifests_checked": manifests,
     }
 
@@ -341,9 +346,7 @@ def load_case(
             "'rollout_predictions_init_*'. Supply genuine unrefined Aurora rollouts."
         )
     if max_initializations < 1:
-        raise ValueError(
-            f"max_initializations must be >= 1, actual {max_initializations}."
-        )
+        raise ValueError(f"max_initializations must be >= 1, actual {max_initializations}.")
     if stride < 1 or lat_stride < 1 or lon_stride < 1:
         raise ValueError(
             "stride, lat_stride, and lon_stride must each be >= 1; actual "
@@ -466,12 +469,12 @@ def load_case(
         ):
             roll.close()
             truth.close()
-            raise ValueError(f"Raw Aurora grid changed between source files; offending file={path}.")
+            raise ValueError(
+                f"Raw Aurora grid changed between source files; offending file={path}."
+            )
 
         times = roll.time.values.astype("datetime64[ns]")
-        lead_values = ((times - initialization) / np.timedelta64(1, "h")).astype(
-            np.float64
-        )
+        lead_values = ((times - initialization) / np.timedelta64(1, "h")).astype(np.float64)
         if len(lead_values) != len(expected) or not np.allclose(
             lead_values, expected, rtol=0.0, atol=1e-6
         ):
@@ -485,9 +488,7 @@ def load_case(
         if "lead_time" in roll.coords:
             coordinate_leads = np.asarray(roll.lead_time.values)
             if np.issubdtype(coordinate_leads.dtype, np.timedelta64):
-                coordinate_leads = (
-                    coordinate_leads / np.timedelta64(1, "h")
-                ).astype(np.float64)
+                coordinate_leads = (coordinate_leads / np.timedelta64(1, "h")).astype(np.float64)
             else:
                 coordinate_leads = coordinate_leads.astype(np.float64)
             if not np.allclose(coordinate_leads, lead_values, rtol=0.0, atol=1e-6):
@@ -574,7 +575,8 @@ def load_case(
 
     rollout_norm = space.encode(rollout_physical)
     target_norm = space.encode(target_physical)
-    valid = torch.isfinite(rollout_norm) & torch.isfinite(target_norm)
+    rollout_valid = torch.isfinite(rollout_norm)
+    valid = rollout_valid & torch.isfinite(target_norm)
     rollout_norm = torch.nan_to_num(rollout_norm, nan=0.0, posinf=0.0, neginf=0.0)
     target_norm = torch.nan_to_num(target_norm, nan=0.0, posinf=0.0, neginf=0.0)
 
@@ -587,6 +589,7 @@ def load_case(
         lead_index=torch.tensor(lead_ids, dtype=torch.long, device=device),
         lat=lat_values,
         lon=lon_values,
+        rollout_valid=rollout_valid.to(device),
         case=case,
         initialization_ids=tuple(initialization_ids),
         initialization_times=np.asarray(initialization_times, dtype="datetime64[ns]"),
@@ -663,10 +666,7 @@ def grouped_purged_split(
     overlap_ids = [
         item
         for item in train_ids
-        if any(
-            np.datetime64(data.valid_times[index], "ns") in test_valid
-            for index in groups[item]
-        )
+        if any(np.datetime64(data.valid_times[index], "ns") in test_valid for index in groups[item])
     ]
     if overlap_ids:
         train_ids = [item for item in train_ids if item not in overlap_ids]
@@ -786,7 +786,9 @@ def evaluate_fields(
     obs_var = (mask * obs_anom.pow(2)).sum(dim=dims)
     ok = (pred_var > 1e-24) & (obs_var > 1e-24)
     correlation = (
-        float((cov[ok] / (pred_var[ok].sqrt() * obs_var[ok].sqrt())).mean()) if bool(ok.any()) else float("nan")
+        float((cov[ok] / (pred_var[ok].sqrt() * obs_var[ok].sqrt())).mean())
+        if bool(ok.any())
+        else float("nan")
     )
     std_ratio = (
         float((pred_var[ok].sqrt() / obs_var[ok].sqrt()).mean()) if bool(ok.any()) else float("nan")
@@ -803,7 +805,9 @@ def evaluate_fields(
         threshold = oq[1]
         tail = flat_obs >= threshold
         tail_mae = (
-            float((flat_pred[tail] - flat_obs[tail]).abs().mean()) if bool(tail.any()) else float("nan")
+            float((flat_pred[tail] - flat_obs[tail]).abs().mean())
+            if bool(tail.any())
+            else float("nan")
         )
     else:  # pragma: no cover - empty mask
         p90_bias = p95_bias = p99_bias = tail_mae = float("nan")
@@ -924,7 +928,9 @@ def format_lead_table(
         cells = []
         for lead in leads:
             base = baseline[lead].mae
-            cells.append(f"{100.0 * (rows[lead].mae - base) / base:>16.2f}" if base else f"{'nan':>16}")
+            cells.append(
+                f"{100.0 * (rows[lead].mae - base) / base:>16.2f}" if base else f"{'nan':>16}"
+            )
         lines.append(f"{name:<28}" + "".join(cells))
     lines.append(f"RMSE change vs {baseline_key} (%)")
     for name, rows in per_lead.items():
@@ -961,9 +967,14 @@ def _base_refinement_block(head: str, *, lon_periodic: bool) -> dict[str, Any]:
         "seed": 1234,
         "ensemble_size": 4,
         "deterministic_inference": True,
+        # Train and deploy the same diffusion/flow network for point forecasts;
+        # this also halves the backbone parameter count relative to the former
+        # independent mean head.
+        "deterministic_head": "shared_process",
         "target_space": {
             "residual_scaling": "per_channel",
             "residual_scaling_center": True,
+            "residual_clip_standard_deviations": 4.0,
         },
         "conditioning": {
             "aurora_rollout": True,
@@ -971,6 +982,8 @@ def _base_refinement_block(head: str, *, lon_periodic: bool) -> dict[str, Any]:
             "static_fields": False,
             "masks": True,
             "forecast_lead_time": True,
+            "latitude": True,
+            "longitude": True,
         },
         "loss": {
             "generative": "mse",
@@ -979,12 +992,15 @@ def _base_refinement_block(head: str, *, lon_periodic: bool) -> dict[str, Any]:
             # representative holdout period for the selected case.
             # LOSS_ABLATIONS provides isolated term-by-term experiments.
             "deterministic_weight": 1.0,
+            "mae_weight": 1.0,
             "bias_weight": 1.0,
             "variance_weight": 2.0,
             "extreme_weight": 1.0,
+            "extreme_tail": "upper",
             "quantile_weight": 1.0,
             "gradient_weight": 0.25,
             "pattern_correlation_weight": 0.5,
+            "degradation_weight": 1.0,
             "aux_on_deterministic": True,
         },
         "unet": {
@@ -996,7 +1012,7 @@ def _base_refinement_block(head: str, *, lon_periodic: bool) -> dict[str, Any]:
             "zero_init_output": True,
         },
         "transformer": {
-            "patch_size": [5, 5] if not lon_periodic else [6, 6],
+            "patch_size": [4, 4] if not lon_periodic else [6, 6],
             "embedding_dim": 192,
             "num_heads": 6,
             "num_blocks": 4,
@@ -1033,7 +1049,12 @@ def _base_refinement_block(head: str, *, lon_periodic: bool) -> dict[str, Any]:
 #: weighting, no deterministic anchor and ensemble-mean inference.
 LEGACY_PRESET: dict[str, Any] = {
     "deterministic_inference": False,
-    "target_space": {"residual_scaling": "none"},
+    "deterministic_head": "separate_mean",
+    "target_space": {
+        "residual_scaling": "none",
+        "residual_clip_standard_deviations": 0.0,
+    },
+    "conditioning": {"latitude": False, "longitude": False},
     "loss": {
         "generative": "mse",
         "deterministic_weight": 0.0,
@@ -1132,7 +1153,9 @@ def isolated_ablation_overrides(name: str) -> dict[str, Any]:
     return out
 
 
-def build_config(head: str, *, lon_periodic: bool, overrides: Mapping[str, Any] | None = None) -> RefinementConfig:
+def build_config(
+    head: str, *, lon_periodic: bool, overrides: Mapping[str, Any] | None = None
+) -> RefinementConfig:
     block = _base_refinement_block(head, lon_periodic=lon_periodic)
     if overrides:
         _deep_update(block, overrides)
@@ -1157,9 +1180,113 @@ def _deep_update(base: dict[str, Any], other: Mapping[str, Any]) -> dict[str, An
 # ---------------------------------------------------------------------------
 
 
-def _conditioning(rollout: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
-    mask = valid.all(dim=1, keepdim=True).to(rollout.dtype)
-    return torch.cat([rollout, mask], dim=1)
+def _align_conditioning_to(tensor: torch.Tensor, size: tuple[int, int]) -> torch.Tensor:
+    """Match production's crop/interpolation semantics for auxiliary fields."""
+    if tuple(tensor.shape[-2:]) == tuple(size):
+        return tensor
+    height, width = tensor.shape[-2], tensor.shape[-1]
+    if height >= size[0] and width >= size[1]:
+        return tensor[..., : size[0], : size[1]]
+    return F.interpolate(tensor, size=size, mode="bilinear", align_corners=False)
+
+
+def _conditioning(
+    rollout: torch.Tensor,
+    *,
+    packing: FieldPacking,
+    config: RefinementConfig,
+    input_state_normalized: torch.Tensor | None = None,
+    static_fields: torch.Tensor | None = None,
+    input_valid_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Build target-independent conditioning in production channel order."""
+    cond = config.conditioning
+    if (cond.latitude or cond.longitude) and rollout.ndim != 4:
+        raise ValueError(
+            "Coordinate conditioning requires rollout shaped [B, C, H, W], "
+            f"got {tuple(rollout.shape)}."
+        )
+    batch = rollout.shape[0]
+    height, width = int(rollout.shape[-2]), int(rollout.shape[-1])
+    size = (height, width)
+    dtype = rollout.dtype
+    parts: list[torch.Tensor] = []
+
+    if cond.aurora_rollout:
+        parts.append(rollout)
+
+    if cond.aurora_input_state:
+        if input_state_normalized is None:
+            raise RuntimeError(
+                "refinement.conditioning.aurora_input_state is enabled but no "
+                "input state was supplied. It must be the Aurora input state of "
+                "the rollout step (never a future target)."
+            )
+        state = torch.nan_to_num(input_state_normalized.to(dtype), nan=0.0)
+        parts.append(_align_conditioning_to(state, size))
+
+    if cond.static_fields:
+        if static_fields is None:
+            raise RuntimeError(
+                "refinement.conditioning.static_fields is enabled but no static "
+                "fields were supplied."
+            )
+        statics = torch.nan_to_num(static_fields.to(dtype), nan=0.0)
+        parts.append(_align_conditioning_to(statics, size))
+
+    if cond.latitude:
+        if len(packing.lat) != height:
+            raise ValueError(
+                "refinement.conditioning.latitude requires one FieldPacking "
+                f"latitude coordinate per grid cell; expected {height}, "
+                f"got {len(packing.lat)}."
+            )
+        latitude = torch.as_tensor(tuple(packing.lat), device=rollout.device, dtype=torch.float32)
+        if latitude.ndim != 1 or not bool(torch.isfinite(latitude).all()):
+            raise ValueError(
+                "FieldPacking latitude coordinates must be a finite " "one-dimensional sequence."
+            )
+        if bool((latitude.abs() > 90.0).any()):
+            raise ValueError(
+                "FieldPacking latitude coordinates must lie within " "[-90, 90] degrees."
+            )
+        parts.append(
+            (latitude / 90.0).to(dtype=dtype).view(1, 1, height, 1).expand(batch, 1, height, width)
+        )
+
+    if cond.longitude:
+        if len(packing.lon) != width:
+            raise ValueError(
+                "refinement.conditioning.longitude requires one FieldPacking "
+                f"longitude coordinate per grid cell; expected {width}, "
+                f"got {len(packing.lon)}."
+            )
+        longitude = torch.as_tensor(tuple(packing.lon), device=rollout.device, dtype=torch.float32)
+        if longitude.ndim != 1 or not bool(torch.isfinite(longitude).all()):
+            raise ValueError(
+                "FieldPacking longitude coordinates must be a finite " "one-dimensional sequence."
+            )
+        radians = torch.deg2rad(longitude)
+        for periodic_coordinate in (torch.sin(radians), torch.cos(radians)):
+            parts.append(
+                periodic_coordinate.to(dtype=dtype)
+                .view(1, 1, 1, width)
+                .expand(batch, 1, height, width)
+            )
+
+    if cond.masks:
+        if input_valid_mask is None:
+            mask = torch.isfinite(rollout).all(dim=1, keepdim=True).to(dtype)
+        else:
+            mask = input_valid_mask.to(dtype)
+            if mask.dim() == 3:
+                mask = mask.unsqueeze(1)
+            if mask.shape[1] != 1:
+                mask = mask.all(dim=1, keepdim=True).to(dtype)
+        parts.append(_align_conditioning_to(mask, size))
+
+    conditioning = torch.cat(parts, dim=1)
+    return torch.nan_to_num(conditioning, nan=0.0, posinf=0.0, neginf=0.0)
 
 
 @dataclass
@@ -1204,28 +1331,31 @@ def _predict_refined(
         for begin in range(0, len(test), eval_batch):
             end = min(begin + eval_batch, len(test))
             rollout = test.rollout[begin:end].to(device)
-            valid = test.valid[begin:end].to(device)
+            input_valid_mask = (
+                None if test.rollout_valid is None else test.rollout_valid[begin:end].to(device)
+            )
+            static_fields = None if test.static is None else test.static[begin:end].to(device)
             lead = test.lead_hours[begin:end].to(device)
-            cond = _conditioning(rollout, valid)
+            cond = _conditioning(
+                rollout,
+                packing=test.packing,
+                config=config,
+                static_fields=static_fields,
+                input_valid_mask=input_valid_mask,
+            )
             common: dict[str, Any] = {"forecast_lead_time": lead}
             if config.is_legacy_flow_matching:
                 common["rollout_normalized"] = rollout
             if direct_regression:
-                process_time = torch.zeros(
-                    rollout.shape[0], device=device, dtype=torch.float32
-                )
-                predicted_scaled = refiner.net(
-                    torch.zeros_like(rollout), cond, process_time, lead
-                )
+                process_time = torch.zeros(rollout.shape[0], device=device, dtype=torch.float32)
+                predicted_scaled = refiner.net(torch.zeros_like(rollout), cond, process_time, lead)
                 residual = refiner.residual_scaler.decode(predicted_scaled)
             elif config.deterministic_inference:
                 residual = refiner.deterministic_residual(cond, **common)
             else:
                 accumulator = torch.zeros_like(rollout)
                 for generator in generators:
-                    residual_member = refiner.sample_residual(
-                        cond, generator=generator, **common
-                    )
+                    residual_member = refiner.sample_residual(cond, generator=generator, **common)
                     accumulator = accumulator + residual_member
                 residual = accumulator / members
             refined_chunks.append(space.decode(rollout + residual).cpu())
@@ -1233,9 +1363,7 @@ def _predict_refined(
         "inference_mode": (
             "direct_regression"
             if direct_regression
-            else (
-                "deterministic_correction" if config.deterministic_inference else "ensemble_mean"
-            )
+            else ("deterministic_correction" if config.deterministic_inference else "ensemble_mean")
         ),
         "configured_ensemble_size": int(config.ensemble_size),
         "evaluated_ensemble_size": 0 if config.deterministic_inference else members,
@@ -1289,9 +1417,7 @@ def train_and_evaluate(
     if batch_size < 1:
         raise ValueError(f"batch_size must be >= 1; actual {batch_size}.")
     if not math.isfinite(float(learning_rate)) or learning_rate <= 0.0:
-        raise ValueError(
-            f"learning_rate must be finite and > 0; actual {learning_rate}."
-        )
+        raise ValueError(f"learning_rate must be finite and > 0; actual {learning_rate}.")
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -1304,7 +1430,14 @@ def train_and_evaluate(
         configured_head, lon_periodic=train.case.lon_periodic, overrides=overrides
     )
     packing = train.packing
-    cond_channels = packing.num_channels + 1
+    conditioning_example = _conditioning(
+        train.rollout[:1],
+        packing=packing,
+        config=config,
+        static_fields=None if train.static is None else train.static[:1],
+        input_valid_mask=(None if train.rollout_valid is None else train.rollout_valid[:1]),
+    )
+    cond_channels = int(conditioning_example.shape[1])
 
     refiner = build_refiner(
         config,
@@ -1317,7 +1450,9 @@ def train_and_evaluate(
     parameters = sum(p.numel() for p in refiner.parameters() if p.requires_grad)
 
     space = NormalizedTargetSpace(packing)
-    area = area_weights_from_latitudes(packing.lat, len(packing.lat), device=device, dtype=torch.float32)
+    area = area_weights_from_latitudes(
+        packing.lat, len(packing.lat), device=device, dtype=torch.float32
+    )
 
     optimizer = torch.optim.AdamW(refiner.parameters(), lr=learning_rate, weight_decay=0.0)
     n = len(train)
@@ -1333,7 +1468,6 @@ def train_and_evaluate(
     # Fixed training-only statistics must include every grouped training case.
     _fit_training_correction_scaler(refiner, train)
 
-
     start = time.time()
     final_loss = float("nan")
     refiner.train()
@@ -1345,26 +1479,32 @@ def train_and_evaluate(
             idx = order[step * batch_size : (step + 1) * batch_size]
             if idx.numel() == 0:
                 continue
+            input_valid_mask = (
+                None if train.rollout_valid is None else train.rollout_valid[idx].to(device)
+            )
             rollout = train.rollout[idx].to(device)
             target = train.target[idx].to(device)
             valid = train.valid[idx].to(device)
             lead = train.lead_hours[idx].to(device)
             lead_id = train.lead_index[idx].to(device)
-            cond = _conditioning(rollout, valid)
+            static_fields = None if train.static is None else train.static[idx].to(device)
+            cond = _conditioning(
+                rollout,
+                packing=packing,
+                config=config,
+                static_fields=static_fields,
+                input_valid_mask=input_valid_mask,
+            )
             residual = torch.where(valid, target - rollout, torch.zeros_like(target))
 
             if direct_regression:
                 scaled_target = refiner.residual_scaler.encode(residual)
-                process_time = torch.zeros(
-                    rollout.shape[0], device=device, dtype=torch.float32
-                )
+                process_time = torch.zeros(rollout.shape[0], device=device, dtype=torch.float32)
                 predicted_scaled = refiner.net(
                     torch.zeros_like(scaled_target), cond, process_time, lead
                 )
                 predicted_correction = refiner.residual_scaler.decode(predicted_scaled)
-                loss = masked_loss(
-                    predicted_correction, residual, valid, "mse"
-                )
+                loss = masked_loss(predicted_correction, residual, valid, "mse")
             else:
                 out = refiner.compute_training_loss(
                     residual,
@@ -1462,9 +1602,7 @@ def correction_statistics(data: BenchmarkDataset) -> list[dict[str, Any]]:
         valid = data.valid[:, spec.index]
         values = correction_normalized[:, spec.index][valid].double()
         if values.numel() == 0:
-            raise ValueError(
-                f"Training correction channel {spec.key!r} has no valid cells."
-            )
+            raise ValueError(f"Training correction channel {spec.key!r} has no valid cells.")
         physical = values * float(spec.std)
         rows.append(
             {
@@ -1484,10 +1622,7 @@ def correction_statistics(data: BenchmarkDataset) -> list[dict[str, Any]]:
 
 
 def format_correction_statistics(rows: Sequence[Mapping[str, Any]]) -> str:
-    header = (
-        f"{'channel':<20}{'mean':>14}{'std':>14}"
-        f"{'q01':>14}{'median':>14}{'q99':>14}"
-    )
+    header = f"{'channel':<20}{'mean':>14}{'std':>14}" f"{'q01':>14}{'median':>14}{'q99':>14}"
     lines = [header, "-" * len(header)]
     for row in rows:
         level = "surface" if row["level_hpa"] is None else f"{row['level_hpa']:g}hPa"
@@ -1531,9 +1666,7 @@ def _source_provenance(data: BenchmarkDataset) -> dict[str, Any]:
                 "channel_index": int(spec.index),
                 "variable": spec.dataset_name,
                 "kind": spec.kind,
-                "pressure_level_hpa": (
-                    None if spec.level is None else float(spec.level)
-                ),
+                "pressure_level_hpa": (None if spec.level is None else float(spec.level)),
             }
             for spec in data.packing.channels
         ],
@@ -1637,10 +1770,7 @@ def format_channel_tables(
     sections: list[str] = []
     for channel, base in baseline.items():
         rows = [_relabel(base, baseline_label)]
-        rows.extend(
-            _relabel(metrics[channel], name)
-            for name, metrics in comparisons.items()
-        )
+        rows.extend(_relabel(metrics[channel], name) for name, metrics in comparisons.items())
         sections.append(f"channel: {channel}\n{format_table(rows, rows[0])}")
     return "\n\n".join(sections)
 
@@ -1689,9 +1819,7 @@ def run_loss_ablation(
     area_cpu = area_weights_from_latitudes(
         data.packing.lat, len(data.packing.lat), dtype=torch.float64
     )
-    baseline_label = str(
-        data.source_validation.get("baseline_label", "raw_pretrained_aurora")
-    )
+    baseline_label = str(data.source_validation.get("baseline_label", "raw_pretrained_aurora"))
     baseline = evaluate_channels(
         space.decode(test.rollout),
         space.decode(test.target),
@@ -1774,9 +1902,7 @@ def run_loss_ablation(
             "isolated_overrides": arm_overrides,
         }
         results["provenance"]["resolved_config"][name] = result.resolved_config
-    table = format_channel_tables(
-        baseline, comparison_rows, baseline_label=baseline_label
-    )
+    table = format_channel_tables(baseline, comparison_rows, baseline_label=baseline_label)
     results["table"] = table
     if verbose:
         print(table)
@@ -1836,19 +1962,21 @@ def run_benchmark(
         data, test_fraction=test_fraction, purge_hours=purge_hours
     )
     if verbose:
-        print(f"  samples: train={len(train)} test={len(test)} channels={data.packing.num_channels}")
+        print(
+            f"  samples: train={len(train)} test={len(test)} channels={data.packing.num_channels}"
+        )
     training_correction_stats = correction_statistics(train)
     if verbose:
-        print("\nTraining correction statistics (CAMS - Aurora):\n" + format_correction_statistics(training_correction_stats))
-
+        print(
+            "\nTraining correction statistics (CAMS - Aurora):\n"
+            + format_correction_statistics(training_correction_stats)
+        )
 
     space = NormalizedTargetSpace(data.packing)
     area_cpu = area_weights_from_latitudes(
         data.packing.lat, len(data.packing.lat), dtype=torch.float64
     )
-    baseline_label = str(
-        data.source_validation.get("baseline_label", "raw_pretrained_aurora")
-    )
+    baseline_label = str(data.source_validation.get("baseline_label", "raw_pretrained_aurora"))
     baseline = evaluate_channels(
         space.decode(test.rollout),
         space.decode(test.target),
@@ -1951,9 +2079,7 @@ def run_benchmark(
             results["heads"][head]["artifacts"] = artifacts
         results["provenance"]["resolved_config"][head] = result.resolved_config
 
-    table = format_channel_tables(
-        baseline, comparison_rows, baseline_label=baseline_label
-    )
+    table = format_channel_tables(baseline, comparison_rows, baseline_label=baseline_label)
     results["table"] = table
     if verbose:
         print(table)
@@ -1979,9 +2105,7 @@ def format_table(rows: Iterable[MetricRow], baseline: MetricRow) -> str:
             f"{row.p99_bias:>12.4g}{row.tail_mae:>12.5g}"
         )
     lines.append("")
-    lines.append(
-        f"d% is relative to {baseline.label}; negative is better for MAE/RMSE."
-    )
+    lines.append(f"d% is relative to {baseline.label}; negative is better for MAE/RMSE.")
     return "\n".join(lines)
 
 

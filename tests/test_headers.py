@@ -33,5 +33,11 @@ def test_presence_of_copyright_header(python_file: Path) -> None:
     with open(python_file) as f:
         lines = list(f.read().splitlines())
 
-    if not lines or not lines[0].startswith(COPYRIGHT_NOTICE):
-        raise AssertionError(f"`{python_file}` must start with the copyright notice.")
+    header_index = 1 if lines and lines[0].startswith("#!") else 0
+    if len(lines) <= header_index or not lines[header_index].startswith(
+        COPYRIGHT_NOTICE
+    ):
+        raise AssertionError(
+            f"`{python_file}` must start with the copyright notice, after an "
+            "optional executable shebang."
+        )

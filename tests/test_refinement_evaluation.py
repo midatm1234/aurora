@@ -24,6 +24,13 @@ def make_case(steps: int = 2, batch: int = 1, height: int = 6, width: int = 8):
     return packing, truth, lead_index, lead_hours
 
 
+def make_linear_case(width: int = 10):
+    packing = build_packing(1, width)
+    values = torch.arange(width, dtype=torch.float32).reshape(1, 1, 1, width)
+    truth = values.expand(1, packing.num_channels, 1, width).clone()
+    return packing, truth, torch.tensor([0])
+
+
 def test_metrics_are_reported_per_variable_level_and_lead() -> None:
     packing, truth, lead_index, lead_hours = make_case(steps=3)
     prediction = truth + 0.1
@@ -97,9 +104,130 @@ def test_no_valid_cells_are_reported_as_nan_not_zero() -> None:
     )
 
     for row in rows:
-        assert math.isnan(row["bias"])
-        assert math.isnan(row["mae"])
-        assert math.isnan(row["rmse"])
+        for metric in (
+            "bias",
+            "mae",
+            "rmse",
+            "centered_rmse",
+            "pattern_correlation",
+            "anomaly_correlation",
+            "prediction_std",
+            "truth_std",
+            "std_ratio",
+            "p90_bias",
+            "p95_error",
+            "p99_tail_mae",
+            "p95_exceedance_frequency_bias",
+            "p99_exceedance_frequency_ratio",
+            "wasserstein_distance",
+            "prediction_skewness",
+            "truth_skewness",
+        ):
+            assert math.isnan(row[metric])
+
+
+def test_scientific_metrics_have_exact_distribution_and_tail_semantics() -> None:
+    packing, truth, lead_index = make_linear_case()
+    prediction = 2.0 * truth + 1.0
+
+    rows = evaluate_packed(
+        prediction,
+        truth,
+        packing=packing,
+        lead_index=lead_index,
+        area_weighted=False,
+    )
+
+    expected_std = math.sqrt(8.25)
+    expected_quantiles = {
+        90: (8.1, 17.2, 9.1),
+        95: (8.55, 18.1, 9.55),
+        99: (8.91, 18.82, 9.91),
+    }
+    for row in rows:
+        assert row["centered_rmse"] == pytest.approx(expected_std)
+        assert row["prediction_std"] == pytest.approx(2.0 * expected_std)
+        assert row["truth_std"] == pytest.approx(expected_std)
+        assert row["std_ratio"] == pytest.approx(2.0)
+        assert row["anomaly_correlation"] == row["pattern_correlation"]
+        assert row["anomaly_correlation"] == pytest.approx(1.0)
+        assert row["wasserstein_distance"] == pytest.approx(5.5)
+        assert row["prediction_skewness"] == pytest.approx(0.0, abs=1.0e-12)
+        assert row["truth_skewness"] == pytest.approx(0.0, abs=1.0e-12)
+        for percentile, (truth_q, prediction_q, bias_q) in expected_quantiles.items():
+            assert row[f"truth_p{percentile}"] == pytest.approx(truth_q)
+            assert row[f"prediction_p{percentile}"] == pytest.approx(prediction_q)
+            assert row[f"p{percentile}_bias"] == pytest.approx(bias_q)
+            assert row[f"p{percentile}_error"] == pytest.approx(bias_q)
+            assert row[
+                f"p{percentile}_prediction_exceedance_frequency"
+            ] == pytest.approx(0.6)
+            assert row[
+                f"p{percentile}_truth_exceedance_frequency"
+            ] == pytest.approx(0.1)
+            assert row[
+                f"p{percentile}_exceedance_frequency_bias"
+            ] == pytest.approx(0.5)
+            assert row[
+                f"p{percentile}_exceedance_frequency_ratio"
+            ] == pytest.approx(6.0)
+        assert row["p95_tail_mae"] == pytest.approx(10.0)
+        assert row["p99_tail_mae"] == pytest.approx(10.0)
+
+
+def test_scientific_metrics_share_one_mask_for_nonfinite_and_masked_cells() -> None:
+    packing, truth, lead_index = make_linear_case(width=6)
+    prediction = 2.0 * truth
+    truth[..., 0] = float("nan")
+    prediction[..., 1] = float("inf")
+    mask = torch.ones_like(truth, dtype=torch.bool)
+    mask[..., 5] = False
+
+    rows = evaluate_packed(
+        prediction,
+        truth,
+        packing=packing,
+        lead_index=lead_index,
+        mask=mask,
+        area_weighted=False,
+    )
+
+    for row in rows:
+        assert row["centered_rmse"] == pytest.approx(math.sqrt(2.0 / 3.0))
+        assert row["prediction_std"] == pytest.approx(2.0 * math.sqrt(2.0 / 3.0))
+        assert row["truth_std"] == pytest.approx(math.sqrt(2.0 / 3.0))
+        assert row["std_ratio"] == pytest.approx(2.0)
+        assert row["p90_bias"] == pytest.approx(3.8)
+        assert row["p95_bias"] == pytest.approx(3.9)
+        assert row["p99_bias"] == pytest.approx(3.98)
+        assert row["p95_tail_mae"] == pytest.approx(4.0)
+        assert row["p99_tail_mae"] == pytest.approx(4.0)
+        assert row["p95_prediction_exceedance_frequency"] == pytest.approx(1.0)
+        assert row["p95_truth_exceedance_frequency"] == pytest.approx(1.0 / 3.0)
+        assert row["p95_exceedance_frequency_bias"] == pytest.approx(2.0 / 3.0)
+        assert row["p95_exceedance_frequency_ratio"] == pytest.approx(3.0)
+        assert row["wasserstein_distance"] == pytest.approx(3.0)
+        assert row["prediction_skewness"] == pytest.approx(0.0, abs=1.0e-12)
+        assert row["truth_skewness"] == pytest.approx(0.0, abs=1.0e-12)
+        assert row["anomaly_correlation"] == pytest.approx(1.0)
+
+
+def test_anomaly_correlation_is_scale_independent_for_trace_gas_fields() -> None:
+    packing, truth, lead_index = make_linear_case()
+    truth = truth * 1.0e-10
+    prediction = 2.0 * truth + 1.0e-9
+
+    rows = evaluate_packed(
+        prediction,
+        truth,
+        packing=packing,
+        lead_index=lead_index,
+        area_weighted=False,
+    )
+
+    for row in rows:
+        assert row["pattern_correlation"] == pytest.approx(1.0, abs=1.0e-6)
+        assert row["anomaly_correlation"] == row["pattern_correlation"]
 
 
 def test_area_weighting_changes_the_score() -> None:
@@ -197,6 +325,49 @@ def test_summary_flags_a_bias_only_improvement_as_a_tradeoff() -> None:
     assert entry["bias_improved"] is True
     assert entry["degraded_groups"], "RMSE degradation must be reported"
     assert entry["improvement"] is False
+
+
+def test_summary_understands_tail_distribution_and_ratio_improvements() -> None:
+    packing, truth, lead_index = make_linear_case()
+    raw = 2.0 * truth + 1.0
+    refined = truth + 0.1
+    metrics = (
+        "bias",
+        "centered_rmse",
+        "anomaly_correlation",
+        "std_ratio",
+        "p95_error",
+        "p95_tail_mae",
+        "p95_exceedance_frequency_bias",
+        "p95_exceedance_frequency_ratio",
+        "wasserstein_distance",
+        "prediction_skewness",
+    )
+    rows = compare_raw_and_refined(
+        truth,
+        packing=packing,
+        candidates={"raw": raw, "refined": refined},
+        lead_index=lead_index,
+        area_weighted=False,
+    )
+
+    entry = summarize(rows, baseline="raw", metrics=metrics)["models"]["refined"]
+
+    assert entry["bias_improved"] is True
+    assert entry["degraded_groups"] == []
+    assert entry["improvement"] is True
+    improvements = entry["metric_improvements"]
+    for metric in (
+        "bias",
+        "centered_rmse",
+        "std_ratio",
+        "p95_error",
+        "p95_tail_mae",
+        "p95_exceedance_frequency_bias",
+        "p95_exceedance_frequency_ratio",
+        "wasserstein_distance",
+    ):
+        assert improvements[metric] > 0
 
 
 def test_summary_accepts_a_genuine_improvement() -> None:

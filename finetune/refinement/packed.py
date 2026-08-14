@@ -75,12 +75,26 @@ class PackedRefiner(ResidualRefiner):
             warmup_batches=target_space.residual_scaling_warmup_batches,
             target_std=target_space.residual_scaling_target_std,
         )
+        self.residual_clip_standard_deviations = float(
+            target_space.residual_clip_standard_deviations
+        )
         self.net = self._build_net(config)
-        self.mean_net = self._build_net(config)
-        self._zero_output_projection(self.mean_net)
+        # Version 1 used an independent full-size network for the deployed
+        # conditional mean and let ``net`` model only stochastic innovations.
+        # Version 2 shares the process network with the point product, so the
+        # diffusion/flow objective and its deterministic query train the model
+        # that is actually scored. Keep v1 as the omitted-key default so old
+        # checkpoints remain byte-for-byte compatible.
+        if config.deterministic_head == "separate_mean":
+            self.mean_net: torch.nn.Module | None = self._build_net(config)
+            self._zero_output_projection(self.mean_net)
+            parameterization_version = 1
+        else:
+            self.mean_net = None
+            parameterization_version = 2
         self.register_buffer(
             "innovation_parameterization_version",
-            torch.tensor(1, dtype=torch.long),
+            torch.tensor(parameterization_version, dtype=torch.long),
         )
 
     # -- construction ----------------------------------------------------
@@ -158,11 +172,12 @@ class PackedRefiner(ResidualRefiner):
             state_dict[version_key] = torch.zeros(
                 (), dtype=self.innovation_parameterization_version.dtype
             )
-        mean_state = self.mean_net.state_dict()
-        for name, value in mean_state.items():
-            full_name = prefix + "mean_net." + name
-            if full_name not in state_dict:
-                state_dict[full_name] = value.detach().clone()
+        if self.mean_net is not None:
+            mean_state = self.mean_net.state_dict()
+            for name, value in mean_state.items():
+                full_name = prefix + "mean_net." + name
+                if full_name not in state_dict:
+                    state_dict[full_name] = value.detach().clone()
         super()._load_from_state_dict(
             state_dict,
             prefix,
@@ -175,6 +190,8 @@ class PackedRefiner(ResidualRefiner):
 
     def set_attention_implementation(self, implementation: str) -> None:
         for network in (self.net, self.mean_net):
+            if network is None:
+                continue
             setter = getattr(network, "set_attention_implementation", None)
             if setter is None:
                 raise AttributeError(
@@ -190,6 +207,36 @@ class PackedRefiner(ResidualRefiner):
 
     def freeze_residual_scale(self, value: bool = True) -> None:
         self.residual_scaler.freeze(value)
+
+    def _guard_scaled_correction(self, scaled: torch.Tensor) -> torch.Tensor:
+        """Clamp a complete correction in standardized training-residual units."""
+        value = scaled.float()
+        standard_deviations = self.residual_clip_standard_deviations
+        if standard_deviations <= 0.0:
+            return value
+        if not self.residual_scaler.is_active:
+            raise RuntimeError(
+                "Residual amplitude clipping requires an active ResidualScaler."
+            )
+        # ResidualScaler maps the raw training standard deviation to target_std
+        # in generative space, so k raw standard deviations equal
+        # k * target_std scaled units.
+        limit = standard_deviations * float(self.residual_scaler.target_std)
+        return value.clamp(min=-limit, max=limit)
+
+    def _decode_deployed_correction(self, scaled: torch.Tensor) -> torch.Tensor:
+        """Apply the one scaled-space guard immediately before deployment decode."""
+        return self.residual_scaler.decode(self._guard_scaled_correction(scaled))
+
+    def guard_correction_normalized(self, correction: torch.Tensor) -> torch.Tensor:
+        """Guard an already-decoded complete correction without changing units."""
+        if self.residual_clip_standard_deviations <= 0.0:
+            # Preserve the exact legacy arithmetic path when the new option is
+            # omitted or explicitly disabled; even an encode/decode round trip
+            # could otherwise introduce an avoidable rounding difference.
+            return correction.float()
+        scaled = self.residual_scaler.encode(correction)
+        return self._decode_deployed_correction(scaled)
 
     # -- shared helpers --------------------------------------------------
     def _lead_for(self, forecast_lead_time: torch.Tensor | None) -> torch.Tensor | None:
@@ -212,6 +259,19 @@ class PackedRefiner(ResidualRefiner):
             for parameter in parameters
         )
 
+    def _deterministic_projection_is_exactly_zero(self) -> bool:
+        """Whether deployed deterministic inference uses its identity shortcut."""
+        if self.uses_innovation_parameterization:
+            assert self.mean_net is not None
+            return self._output_projection_is_exactly_zero(self.mean_net)
+        if self.uses_shared_process_parameterization:
+            return self._output_projection_is_exactly_zero(self.net)
+        return False
+
+    def _scaled_literal_zero(self, reference: torch.Tensor) -> torch.Tensor:
+        """Represent a literal zero correction in centered generative space."""
+        return self.residual_scaler.encode(torch.zeros_like(reference))
+
     def _mean_correction_scaled(
         self,
         conditioning: torch.Tensor,
@@ -220,6 +280,11 @@ class PackedRefiner(ResidualRefiner):
         differentiable: bool,
     ) -> torch.Tensor:
         """Direct supervised conditional mean in generative correction space."""
+        if self.mean_net is None:
+            raise RuntimeError(
+                "The separate deterministic mean head is disabled; query the "
+                "shared process network through _deterministic instead."
+            )
         shape = self.residual_shape(conditioning)
         state = torch.zeros(
             shape, device=conditioning.device, dtype=conditioning.dtype
@@ -249,7 +314,12 @@ class PackedRefiner(ResidualRefiner):
 
     @property
     def uses_innovation_parameterization(self) -> bool:
-        return int(self.innovation_parameterization_version.item()) >= 1
+        return int(self.innovation_parameterization_version.item()) == 1
+
+    @property
+    def uses_shared_process_parameterization(self) -> bool:
+        """Whether the deployed point correction comes from ``net`` itself."""
+        return int(self.innovation_parameterization_version.item()) >= 2
 
     # -- public API (scaling boundary) -----------------------------------
     def compute_training_loss(
@@ -328,9 +398,10 @@ class PackedRefiner(ResidualRefiner):
         correction_estimate_scaled = process_estimate_scaled
         if mean_scaled is not None:
             correction_estimate_scaled = mean_scaled + process_estimate_scaled
-        correction_estimate = self.residual_scaler.decode(
+        deployed_estimate_scaled = self._guard_scaled_correction(
             correction_estimate_scaled
         )
+        correction_estimate = self.residual_scaler.decode(deployed_estimate_scaled)
         output.predicted_correction_normalized = correction_estimate
         output.predicted_residual = correction_estimate
 
@@ -338,15 +409,30 @@ class PackedRefiner(ResidualRefiner):
             output.total_loss = output.generative_loss
         else:
             deterministic_estimate = mean_scaled
+            deterministic_is_identity = False
             if deterministic_estimate is None and loss_cfg.needs_deterministic_estimate:
                 deterministic_estimate = self._deterministic(
                     conditioning,
                     forecast_lead_time=forecast_lead_time,
                     differentiable=True,
                 )
+            if deterministic_estimate is not None:
+                if self._deterministic_projection_is_exactly_zero():
+                    # Inference returns a literal zero before centered decode.
+                    # Use the same forward value for scientific auxiliaries but
+                    # retain the network gradient via a straight-through shift.
+                    identity = self._scaled_literal_zero(deterministic_estimate)
+                    deterministic_estimate = deterministic_estimate + (
+                        identity - deterministic_estimate
+                    ).detach()
+                    deterministic_is_identity = True
+                if not deterministic_is_identity:
+                    deterministic_estimate = self._guard_scaled_correction(
+                        deterministic_estimate
+                    )
             output = self._finish(
                 output,
-                residual_estimate=correction_estimate_scaled,
+                residual_estimate=deployed_estimate_scaled,
                 residual_target=scaled_target,
                 mask=mask,
                 lead_index=lead_index,
@@ -399,7 +485,9 @@ class PackedRefiner(ResidualRefiner):
                 num_steps=num_steps,
                 mean_correction_normalized=mean,
             )
-            return mean.float() + innovation.float()
+            return self.guard_correction_normalized(
+                mean.float() + innovation.float()
+            )
         if self._output_projection_is_exactly_zero(self.net):
             return torch.zeros(
                 self.residual_shape(conditioning),
@@ -412,7 +500,7 @@ class PackedRefiner(ResidualRefiner):
             generator=generator,
             num_steps=num_steps,
         )
-        return self.residual_scaler.decode(scaled)
+        return self._decode_deployed_correction(scaled)
 
     @torch.no_grad()
     def sample_innovation_normalized(
@@ -453,23 +541,27 @@ class PackedRefiner(ResidualRefiner):
         *,
         forecast_lead_time: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if self._deterministic_projection_is_exactly_zero():
+            # Scaled zero decodes to the fitted residual mean when centering is
+            # active. An untouched zero-init head instead means "do no harm":
+            # emit a literal zero correction, matching stochastic inference.
+            return torch.zeros(
+                self.residual_shape(conditioning),
+                device=conditioning.device,
+                dtype=torch.float32,
+            )
         if self.uses_innovation_parameterization:
-            if self._output_projection_is_exactly_zero(self.mean_net):
-                return torch.zeros(
-                    self.residual_shape(conditioning),
-                    device=conditioning.device,
-                    dtype=torch.float32,
-                )
+            assert self.mean_net is not None
             scaled = self._mean_correction_scaled(
                 conditioning,
                 forecast_lead_time=forecast_lead_time,
                 differentiable=False,
             )
-            return self.residual_scaler.decode(scaled)
+            return self._decode_deployed_correction(scaled)
         scaled = self._deterministic(
             conditioning, forecast_lead_time=forecast_lead_time, differentiable=False
         )
-        return self.residual_scaler.decode(scaled)
+        return self._decode_deployed_correction(scaled)
 
     # -- subclass API (generative space) ---------------------------------
     def _training_loss(

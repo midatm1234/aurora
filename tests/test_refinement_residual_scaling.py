@@ -17,11 +17,13 @@ import warnings
 
 import pytest
 import torch
-
 from finetune.refinement import config as refinement_config
-from finetune.refinement.base import build_refiner
 from finetune.refinement.backbones import sincos_2d_positional_encoding
-from finetune.refinement.config import ConfigValidationError, resolve_refinement_config
+from finetune.refinement.base import build_refiner
+from finetune.refinement.config import (
+    ConfigValidationError,
+    resolve_refinement_config,
+)
 from finetune.refinement.packing import ChannelSpec, FieldPacking
 from finetune.refinement.residual_scaling import ResidualScaler
 from finetune.refinement.target_space import NormalizedTargetSpace
@@ -486,6 +488,303 @@ def test_exact_distributed_calibration_reduces_only_once_at_finalize(monkeypatch
 
 
 
+def _build_clipped_shared_refiner():
+    refiner, _ = _build(
+        "flow_matching_conv_unet",
+        deterministic_head="shared_process",
+        target_space={
+            "residual_scaling": "per_channel",
+            "residual_scaling_center": True,
+            "residual_scaling_target_std": 2.0,
+            "residual_clip_standard_deviations": 1.5,
+        },
+        loss={
+            "deterministic_weight": 1.0,
+            "reconstruction_weight": 1.0,
+            "mae_weight": 1.0,
+            "bias_weight": 1.0,
+            "gradient_weight": 1.0,
+            "magnitude_weight": 1.0,
+            "degradation_weight": 1.0,
+            "aux_on_deterministic": True,
+        },
+    )
+    calibration = torch.tensor(
+        [
+            [
+                [[-2.0, 0.0], [2.0, 4.0]],
+                [[-1.0, 1.0], [3.0, 5.0]],
+                [[-4.0, -2.0], [0.0, 2.0]],
+            ]
+        ]
+    )
+    refiner.fit_residual_scale(calibration)
+    refiner.eval()
+    return refiner
+
+
+def _clipped_bounds(refiner) -> tuple[torch.Tensor, torch.Tensor]:
+    raw_std = refiner.residual_scaler.scale * refiner.residual_scaler.target_std
+    radius = refiner.residual_clip_standard_deviations * raw_std
+    shift = refiner.residual_scaler.shift
+    return shift - radius, shift + radius
+
+
+def _mark_output_projection_trained(refiner) -> None:
+    projection = refiner.net.out_proj
+    parameters = tuple(projection.parameters(recurse=False))
+    assert parameters
+    with torch.no_grad():
+        parameters[0].reshape(-1)[0] = 1.0e-6
+
+
+def _build_centered_shared_refiner(head: str):
+    refiner, _ = _build(
+        head,
+        deterministic_head="shared_process",
+        target_space={
+            "residual_scaling": "per_channel",
+            "residual_scaling_center": True,
+        },
+    )
+    base = torch.tensor([[[[-2.0, 0.0], [2.0, 4.0]]]])
+    calibration = torch.cat([base, base + 1.0, base - 2.0], dim=1)
+    refiner.fit_residual_scale(calibration)
+    refiner.eval()
+    assert bool((refiner.residual_scaler.shift != 0.0).all())
+    return refiner
+
+
+@pytest.mark.parametrize("head", PACKED_HEADS)
+def test_shared_zero_init_is_literal_identity_with_centered_scaling(head: str) -> None:
+    refiner = _build_centered_shared_refiner(head)
+    conditioning = torch.zeros(2, CHANNELS + 1, HEIGHT, WIDTH)
+
+    deterministic = refiner.deterministic_residual(conditioning)
+    sampled = refiner.sample_residual(conditioning)
+
+    assert torch.count_nonzero(deterministic) == 0
+    assert torch.count_nonzero(sampled) == 0
+
+
+@pytest.mark.parametrize("head", PACKED_HEADS)
+def test_trained_shared_head_decodes_scaled_zero_to_centered_mean(
+    head: str, monkeypatch
+) -> None:
+    refiner = _build_centered_shared_refiner(head)
+    _mark_output_projection_trained(refiner)
+    conditioning = torch.zeros(2, CHANNELS + 1, HEIGHT, WIDTH)
+
+    def deterministic(conditioning, **kwargs):
+        del kwargs
+        return torch.zeros(refiner.residual_shape(conditioning))
+
+    monkeypatch.setattr(refiner, "_deterministic", deterministic)
+    prediction = refiner.deterministic_residual(conditioning)
+    expected = refiner.residual_scaler.shift.expand_as(prediction)
+    torch.testing.assert_close(prediction, expected)
+
+
+def test_training_auxiliaries_use_literal_zero_for_shared_identity_init(
+    monkeypatch,
+) -> None:
+    from finetune.refinement.base import RefinerOutput
+
+    refiner = _build_clipped_shared_refiner()
+    refiner.train()
+    conditioning = torch.zeros(1, CHANNELS + 1, HEIGHT, WIDTH)
+    target = torch.zeros(1, CHANNELS, HEIGHT, WIDTH)
+
+    def training_loss(residual_target, conditioning, **kwargs):
+        del residual_target, kwargs
+        estimate = torch.full(refiner.residual_shape(conditioning), -100.0)
+        return RefinerOutput(generative_loss=estimate.sum() * 0.0), estimate
+
+    def deterministic(conditioning, **kwargs):
+        del kwargs
+        return torch.zeros(
+            refiner.residual_shape(conditioning), requires_grad=True
+        )
+
+    monkeypatch.setattr(refiner, "_training_loss", training_loss)
+    monkeypatch.setattr(refiner, "_deterministic", deterministic)
+    output = refiner.compute_training_loss(
+        target,
+        conditioning,
+        mask=torch.ones_like(target, dtype=torch.bool),
+        rollout_normalized=torch.zeros_like(target),
+    )
+
+    for value in (
+        output.reconstruction_loss,
+        output.deterministic_loss,
+        output.mae_loss,
+        output.bias_loss,
+        output.gradient_loss,
+        output.magnitude_loss,
+        output.degradation_loss,
+    ):
+        assert value is not None
+        assert float(value.detach()) == pytest.approx(0.0, abs=1.0e-12)
+
+
+def test_centered_residual_guard_uses_training_mean_and_raw_standard_deviation() -> None:
+    refiner = _build_clipped_shared_refiner()
+    scaled = torch.full((1, CHANNELS, HEIGHT, WIDTH), 100.0)
+    scaled[..., 1::2] = -100.0
+
+    guarded = refiner._decode_deployed_correction(scaled)
+    lower, upper = _clipped_bounds(refiner)
+
+    assert bool((refiner.residual_scaler.shift != 0.0).all())
+    torch.testing.assert_close(guarded[..., 0::2], upper.expand_as(guarded)[..., 0::2])
+    torch.testing.assert_close(guarded[..., 1::2], lower.expand_as(guarded)[..., 1::2])
+
+
+def test_deterministic_deployment_is_clipped_after_centered_scaling(monkeypatch) -> None:
+    refiner = _build_clipped_shared_refiner()
+    _mark_output_projection_trained(refiner)
+    conditioning = torch.zeros(2, CHANNELS + 1, HEIGHT, WIDTH)
+
+    def deterministic(conditioning, **kwargs):
+        del kwargs
+        return torch.full(refiner.residual_shape(conditioning), 100.0)
+
+    monkeypatch.setattr(refiner, "_deterministic", deterministic)
+    prediction = refiner.deterministic_residual(conditioning)
+    _, upper = _clipped_bounds(refiner)
+    torch.testing.assert_close(prediction, upper.expand_as(prediction))
+
+
+def test_stochastic_sample_is_clipped_after_centered_scaling(monkeypatch) -> None:
+    refiner = _build_clipped_shared_refiner()
+    conditioning = torch.zeros(2, CHANNELS + 1, HEIGHT, WIDTH)
+
+    monkeypatch.setattr(
+        refiner, "_output_projection_is_exactly_zero", lambda network=None: False
+    )
+
+    def sample(conditioning, **kwargs):
+        del kwargs
+        return torch.full(refiner.residual_shape(conditioning), -100.0)
+
+    monkeypatch.setattr(refiner, "_sample", sample)
+    prediction = refiner.sample_residual(conditioning)
+    lower, _ = _clipped_bounds(refiner)
+    torch.testing.assert_close(prediction, lower.expand_as(prediction))
+
+
+def test_training_forecast_auxiliaries_score_guarded_deployed_estimate(
+    monkeypatch,
+) -> None:
+    from finetune.refinement.base import RefinerOutput
+
+    refiner = _build_clipped_shared_refiner()
+    _mark_output_projection_trained(refiner)
+    refiner.train()
+    conditioning = torch.zeros(1, CHANNELS + 1, HEIGHT, WIDTH)
+    target = refiner.residual_scaler.shift.expand(
+        1, CHANNELS, HEIGHT, WIDTH
+    ).clone()
+
+    def training_loss(residual_target, conditioning, **kwargs):
+        del residual_target, kwargs
+        estimate = torch.full(refiner.residual_shape(conditioning), -100.0)
+        return RefinerOutput(generative_loss=estimate.sum() * 0.0), estimate
+
+    def deterministic(conditioning, **kwargs):
+        del kwargs
+        return torch.full(refiner.residual_shape(conditioning), 100.0)
+
+    monkeypatch.setattr(refiner, "_training_loss", training_loss)
+    monkeypatch.setattr(refiner, "_deterministic", deterministic)
+    output = refiner.compute_training_loss(
+        target,
+        conditioning,
+        mask=torch.ones_like(target, dtype=torch.bool),
+        rollout_normalized=torch.zeros_like(target),
+    )
+
+    lower, _ = _clipped_bounds(refiner)
+    assert output.predicted_correction_normalized is not None
+    torch.testing.assert_close(
+        output.predicted_correction_normalized,
+        lower.expand_as(output.predicted_correction_normalized),
+    )
+    assert float(output.reconstruction_loss) == pytest.approx(9.0)
+    assert float(output.deterministic_loss) == pytest.approx(9.0)
+    assert float(output.mae_loss) == pytest.approx(3.0)
+    assert float(output.bias_loss) == pytest.approx(9.0)
+    assert float(output.gradient_loss) == pytest.approx(0.0)
+    assert float(output.magnitude_loss) < 100.0
+    assert float(output.degradation_loss) < 100.0
+
+
+def test_two_phase_ensemble_guards_complete_mean_plus_innovation(monkeypatch) -> None:
+    from tests.refinement_fixtures import build_refiner_model
+
+    model = build_refiner_model(
+        "flow_matching_conv_unet",
+        height=HEIGHT,
+        width=WIDTH,
+        deterministic_head="shared_process",
+        deterministic_inference=False,
+        ensemble_size=2,
+        target_space={
+            "residual_scaling": "per_channel",
+            "residual_scaling_center": True,
+            "residual_scaling_target_std": 2.0,
+            "residual_clip_standard_deviations": 1.5,
+        },
+    )
+    assert model.refiner is not None
+    calibration = torch.tensor(
+        [[
+            [[-2.0, 0.0], [2.0, 4.0]],
+            [[-1.0, 1.0], [3.0, 5.0]],
+            [[-4.0, -2.0], [0.0, 2.0]],
+        ]]
+    )
+    model.refiner.fit_residual_scale(calibration)
+    model.eval()
+    rollout = torch.zeros(1, CHANNELS, HEIGHT, WIDTH)
+    conditioning = torch.cat(
+        [rollout, torch.ones(1, 1, HEIGHT, WIDTH)], dim=1
+    )
+    mean = model.refiner.residual_scaler.shift.expand_as(rollout).clone()
+
+    monkeypatch.setattr(
+        model,
+        "_deterministic_mean_process",
+        lambda conditioning, rollout, forecast_lead_time: mean,
+    )
+
+    def innovation(
+        conditioning,
+        rollout,
+        forecast_lead_time,
+        num_steps,
+        mean_output,
+        *,
+        generator,
+    ):
+        del rollout, forecast_lead_time, num_steps, mean_output, generator
+        return torch.full(
+            (conditioning.shape[0], CHANNELS, HEIGHT, WIDTH), 100.0
+        )
+
+    monkeypatch.setattr(model, "_sample_innovation", innovation)
+    output = model.refine(
+        rollout, conditioning=conditioning, ensemble_size=2, return_members=True
+    )
+    assert output.member_corrections_normalized is not None
+    _, upper = _clipped_bounds(model.refiner)
+    torch.testing.assert_close(
+        output.member_corrections_normalized,
+        upper.unsqueeze(1).expand_as(output.member_corrections_normalized),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Identity at initialization
 # ---------------------------------------------------------------------------
@@ -792,7 +1091,9 @@ def test_synthetic_known_residual_is_learned(head: str) -> None:
     # 3. The reconstruction must actually be better than doing nothing.
     before = (test_rollout - test_target).pow(2).mean()
     after = (test_rollout + predicted - test_target).pow(2).mean()
-    assert float(after) < 0.7 * float(before), f"{head}: MSE {float(before):.5f} -> {float(after):.5f}"
+    assert float(after) < 0.7 * float(before), (
+        f"{head}: MSE {float(before):.5f} -> {float(after):.5f}"
+    )
 
 
 @pytest.mark.parametrize("head", PACKED_HEADS)
@@ -978,6 +1279,108 @@ def test_degradation_term_is_zero_for_a_perfect_correction() -> None:
         mask=torch.ones_like(residual, dtype=torch.bool),
     )
     assert float(terms.degradation) == pytest.approx(0.0, abs=1e-12)
+
+
+def test_no_harm_losses_use_physical_zero_with_centered_residual_scaling() -> None:
+    from finetune.refinement.config import LossConfig
+    from finetune.refinement.losses import compute_auxiliary_losses
+
+    scaler = ResidualScaler(1, mode="per_channel", center=True)
+    scaler.fit(torch.tensor([[[[2.0, 4.0], [6.0, 8.0]]]]))
+    physical_zero = torch.zeros(1, 1, 2, 2)
+    scaled_zero_correction = scaler.encode(physical_zero)
+    assert not torch.equal(scaled_zero_correction, torch.zeros_like(physical_zero))
+
+    config = LossConfig(magnitude_weight=1.0, degradation_weight=1.0)
+    identity = compute_auxiliary_losses(
+        scaled_zero_correction,
+        scaled_zero_correction,
+        config=config,
+        decode=scaler.decode,
+    )
+    normalized_origin = compute_auxiliary_losses(
+        torch.zeros_like(scaled_zero_correction),
+        scaled_zero_correction,
+        config=config,
+        decode=scaler.decode,
+    )
+
+    assert float(identity.magnitude) == pytest.approx(0.0, abs=1e-12)
+    assert float(identity.degradation) == pytest.approx(0.0, abs=1e-12)
+    assert float(normalized_origin.magnitude) > 0.0
+    assert float(normalized_origin.degradation) > 0.0
+
+
+def test_no_harm_losses_preserve_legacy_uncentered_scaled_numerics() -> None:
+    from finetune.refinement.config import LossConfig
+    from finetune.refinement.losses import compute_auxiliary_losses
+
+    estimate = torch.tensor([[[[1.0, -2.0], [3.0, -4.0]]]])
+    target = torch.tensor([[[[0.5, 0.5], [-0.5, -0.5]]]])
+    terms = compute_auxiliary_losses(
+        estimate,
+        target,
+        config=LossConfig(magnitude_weight=1.0, degradation_weight=1.0),
+    )
+
+    expected_magnitude = estimate.square().mean()
+    expected_degradation = torch.relu(
+        (estimate - target).square() - target.square()
+    ).mean()
+    torch.testing.assert_close(terms.magnitude, expected_magnitude)
+    torch.testing.assert_close(terms.degradation, expected_degradation)
+
+
+def test_aux_on_deterministic_routes_all_forecast_quality_residual_terms() -> None:
+    from finetune.refinement.config import LossConfig
+    from finetune.refinement.losses import compute_auxiliary_losses
+
+    scaler = ResidualScaler(1, mode="per_channel", center=True)
+    scaler.fit(torch.tensor([[[[2.0, 4.0], [6.0, 8.0]]]]))
+    physical_zero = torch.zeros(1, 1, 2, 2)
+    target = scaler.encode(physical_zero)
+    deterministic = target.clone()
+    stochastic = scaler.encode(
+        torch.tensor([[[[1.0, 2.0], [3.0, 4.0]]]])
+    )
+    weights = {
+        "reconstruction_weight": 1.0,
+        "mae_weight": 1.0,
+        "bias_weight": 1.0,
+        "gradient_weight": 1.0,
+        "magnitude_weight": 1.0,
+        "degradation_weight": 1.0,
+    }
+
+    deterministic_terms = compute_auxiliary_losses(
+        stochastic,
+        target,
+        config=LossConfig(aux_on_deterministic=True, **weights),
+        deterministic_estimate=deterministic,
+        decode=scaler.decode,
+    )
+    stochastic_terms = compute_auxiliary_losses(
+        stochastic,
+        target,
+        config=LossConfig(aux_on_deterministic=False, **weights),
+        deterministic_estimate=deterministic,
+        decode=scaler.decode,
+    )
+
+    for name in (
+        "reconstruction",
+        "mae",
+        "bias",
+        "gradient",
+        "magnitude",
+        "degradation",
+    ):
+        deterministic_value = getattr(deterministic_terms, name)
+        stochastic_value = getattr(stochastic_terms, name)
+        assert deterministic_value is not None
+        assert stochastic_value is not None
+        assert float(deterministic_value) == pytest.approx(0.0, abs=1e-12)
+        assert float(stochastic_value) > 0.0
 
 
 def test_masked_cells_never_enter_any_loss() -> None:

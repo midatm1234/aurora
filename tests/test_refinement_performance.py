@@ -18,7 +18,12 @@ from finetune.refinement.cache import RolloutCache, build_cache_key
 
 from tests.refinement_fixtures import build_refiner_model
 
-REFINERS = ["flow_matching_transformer", "diffusion_unet", "diffusion_transformer"]
+REFINERS = [
+    "flow_matching_unet",
+    "flow_matching_transformer",
+    "diffusion_unet",
+    "diffusion_transformer",
+]
 
 
 def build_model(refiner_type: str, **kwargs):
@@ -36,7 +41,17 @@ def build_model(refiner_type: str, **kwargs):
             overrides[key] = {**overrides[key], **value}
         else:
             overrides[key] = value
-    return build_refiner_model(refiner_type, **overrides)
+    model = build_refiner_model(refiner_type, **overrides)
+    if refiner_type == "flow_matching_unet":
+        # The legacy head has its own mandatory identity-at-init projection,
+        # independent of UNetRefinerConfig.zero_init_output. Make it nonzero so
+        # these parity checks exercise source-noise generator propagation.
+        assert model.refiner is not None
+        legacy = model.refiner.legacy
+        with torch.no_grad():
+            for head in (*legacy.surf_flow.values(), *legacy.atmos_flow.values()):
+                head.out.weight.fill_(0.01)
+    return model
 
 
 # --------------------------------------------------------------------------

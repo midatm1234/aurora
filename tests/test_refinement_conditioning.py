@@ -4,6 +4,7 @@ Shared input-state/static conditioning contracts for unified refinement."""
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime
 from types import SimpleNamespace
 
@@ -93,6 +94,90 @@ def _model(*, temporal: bool = False):
     )
     model.initialize_refiner(model.conditioning_channels())
     return model
+
+
+def _coordinate_model(packing=None):
+    config = refinement_config(
+        "diffusion_transformer",
+        conditioning={
+            "aurora_rollout": True,
+            "aurora_input_state": False,
+            "static_fields": False,
+            "masks": False,
+            "forecast_lead_time": True,
+            "latitude": True,
+            "longitude": True,
+        },
+    )
+    return build_two_phase_refiner(
+        None,
+        build_packing(height=3, width=4, lon_periodic=True)
+        if packing is None
+        else packing,
+        config,
+    )
+
+
+def test_coordinate_conditioning_has_exact_normalized_periodic_channels() -> None:
+    packing = replace(
+        build_packing(height=3, width=4, lon_periodic=True),
+        lon=(0.0, 90.0, 180.0, 360.0),
+    )
+    model = _coordinate_model(packing)
+    rollout = torch.arange(2 * 3 * 3 * 4, dtype=torch.float32).reshape(
+        2, 3, 3, 4
+    )
+
+    conditioning = model.build_conditioning(rollout)
+
+    assert model.conditioning_channels() == 6
+    assert conditioning.shape == (2, 6, 3, 4)
+    assert torch.equal(conditioning[:, :3], rollout)
+    expected_latitude = torch.tensor([1.0, 0.0, -1.0]).view(1, 1, 3, 1)
+    expected_latitude = expected_latitude.expand(2, 1, 3, 4)
+    expected_sine = torch.tensor([0.0, 1.0, 0.0, 0.0]).view(1, 1, 1, 4)
+    expected_sine = expected_sine.expand(2, 1, 3, 4)
+    expected_cosine = torch.tensor([1.0, 0.0, -1.0, 1.0]).view(1, 1, 1, 4)
+    expected_cosine = expected_cosine.expand(2, 1, 3, 4)
+    torch.testing.assert_close(conditioning[:, 3:4], expected_latitude)
+    torch.testing.assert_close(
+        conditioning[:, 4:5], expected_sine, rtol=0.0, atol=2.0e-7
+    )
+    torch.testing.assert_close(
+        conditioning[:, 5:6], expected_cosine, rtol=0.0, atol=2.0e-7
+    )
+    # Equivalent 0- and 360-degree longitudes have identical periodic features.
+    torch.testing.assert_close(
+        conditioning[:, 4:6, :, 0],
+        conditioning[:, 4:6, :, -1],
+        rtol=0.0,
+        atol=2.0e-7,
+    )
+
+
+@pytest.mark.parametrize(
+    "axis,bad_values,message",
+    [
+        ("lat", (90.0, 0.0), "latitude.*expected 3, got 2"),
+        (
+            "lon",
+            (0.0, 90.0, float("nan"), 270.0),
+            "longitude coordinates must be.*finite",
+        ),
+    ],
+)
+def test_coordinate_conditioning_validates_metadata_shape_and_finiteness(
+    axis: str,
+    bad_values: tuple[float, ...],
+    message: str,
+) -> None:
+    model = _coordinate_model()
+    # Simulate malformed restored metadata, bypassing FieldPacking's constructor
+    # guard so build_conditioning's defensive checks are exercised directly.
+    object.__setattr__(model.packing, axis, bad_values)
+
+    with pytest.raises(ValueError, match=message):
+        model.build_conditioning(torch.zeros(1, 3, 3, 4))
 
 
 def test_conditioning_packer_uses_latest_state_selected_levels_and_static_order() -> None:

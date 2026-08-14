@@ -9,10 +9,10 @@ from dataclasses import replace
 import numpy as np
 import pytest
 import torch
-
 from finetune.refinement import benchmark as bench
 from finetune.refinement.packing import ChannelSpec, FieldPacking
 from finetune.refinement.target_space import NormalizedTargetSpace
+from finetune.refinement.two_phase import AuroraTwoPhaseRefiner
 
 
 def _surface_packing() -> FieldPacking:
@@ -95,7 +95,99 @@ def test_override_merge_does_not_mutate_shared_preset() -> None:
     merged: dict[str, object] = {}
     bench._deep_update(merged, bench.LEGACY_PRESET)
     bench._deep_update(merged, {"loss": {"bias_weight": 99.0}})
-    assert bench.LEGACY_PRESET == before
+    assert before == bench.LEGACY_PRESET
+
+
+def test_benchmark_presets_use_geophysical_conditioning_contract() -> None:
+    packing = FieldPacking(
+        channels=_surface_packing().channels,
+        lat=(90.0, 0.0, -90.0),
+        lon=(0.0, 90.0, 180.0, 270.0, 360.0),
+        lon_periodic=True,
+    )
+    raw_rollout = torch.arange(30, dtype=torch.float32).reshape(2, 1, 3, 5)
+    raw_rollout[0, 0, 1, 2] = float("nan")
+    rollout_valid = torch.isfinite(raw_rollout)
+    rollout = torch.nan_to_num(raw_rollout, nan=0.0)
+    target_valid = torch.ones_like(rollout_valid)
+    target_valid[1, :, -1, -1] = False
+
+    improved = bench.build_config(
+        "flow_matching_conv_unet",
+        lon_periodic=True,
+        overrides=bench.PRESETS["improved"],
+    )
+    improved_conditioning = bench._conditioning(
+        rollout,
+        packing=packing,
+        config=improved,
+        input_valid_mask=rollout_valid,
+    )
+    production_improved = AuroraTwoPhaseRefiner(None, packing, refinement=improved)
+    production_conditioning = production_improved.build_conditioning(
+        rollout,
+        input_valid_mask=rollout_valid,
+    )
+    improved_channels = production_improved.conditioning_channels()
+    torch.testing.assert_close(improved_conditioning, production_conditioning)
+
+    assert improved.conditioning.latitude is True
+    assert improved.conditioning.longitude is True
+    assert improved.target_space.residual_clip_standard_deviations == 4.0
+    assert improved_channels == 5
+    assert improved_conditioning.shape == (2, improved_channels, 3, 5)
+    torch.testing.assert_close(improved_conditioning[:, :1], rollout)
+
+    latitude = (torch.tensor(packing.lat) / 90.0).view(1, 1, 3, 1)
+    expected_latitude = latitude.expand(2, 1, 3, 5)
+    torch.testing.assert_close(improved_conditioning[:, 1:2], expected_latitude)
+
+    longitude = torch.deg2rad(torch.tensor(packing.lon)).view(1, 1, 1, 5)
+    expected_sine = torch.sin(longitude).expand(2, 1, 3, 5)
+    expected_cosine = torch.cos(longitude).expand(2, 1, 3, 5)
+    torch.testing.assert_close(improved_conditioning[:, 2:3], expected_sine)
+    torch.testing.assert_close(improved_conditioning[:, 3:4], expected_cosine)
+    torch.testing.assert_close(
+        improved_conditioning[:, 2:4, :, 0],
+        improved_conditioning[:, 2:4, :, -1],
+        rtol=0.0,
+        atol=2.0e-6,
+    )
+
+    expected_mask = rollout_valid.all(dim=1, keepdim=True).to(rollout.dtype)
+    torch.testing.assert_close(improved_conditioning[:, 4:5], expected_mask)
+    assert not bool(target_valid[1, 0, -1, -1])
+    assert float(improved_conditioning[1, 4, -1, -1]) == 1.0
+
+    legacy = bench.build_config(
+        "flow_matching_conv_unet",
+        lon_periodic=True,
+        overrides=bench.PRESETS["legacy"],
+    )
+    legacy_conditioning = bench._conditioning(
+        rollout,
+        packing=packing,
+        config=legacy,
+        input_valid_mask=rollout_valid,
+    )
+    production_legacy = AuroraTwoPhaseRefiner(None, packing, refinement=legacy)
+    legacy_expected = production_legacy.build_conditioning(
+        rollout,
+        input_valid_mask=rollout_valid,
+    )
+    legacy_channels = production_legacy.conditioning_channels()
+    torch.testing.assert_close(legacy_conditioning, legacy_expected)
+
+    assert legacy.conditioning.latitude is False
+    assert legacy.conditioning.longitude is False
+    assert legacy.target_space.residual_clip_standard_deviations == 0.0
+    assert legacy.target_space.resolved_residual_scaling() == "none"
+    assert legacy_channels == 2
+    assert legacy_conditioning.shape == (2, legacy_channels, 3, 5)
+    torch.testing.assert_close(
+        legacy_conditioning,
+        torch.cat([rollout, expected_mask], dim=1),
+    )
 
 
 def test_refined_manifest_is_rejected_as_raw_baseline(tmp_path) -> None:

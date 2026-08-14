@@ -36,6 +36,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import math
 import threading
 import warnings
 from dataclasses import dataclass, field
@@ -142,10 +143,12 @@ _ATTENTION_MODES = ("global_2d", "windowed_2d")
 _ATTENTION_IMPLEMENTATIONS = ("auto", "sdpa", "math")
 _PRECISION_MODES = ("fp32", "bf16", "fp16")
 _GENERATIVE_LOSSES = ("mse", "l1", "huber")
+_EXTREME_TAILS = ("both", "upper")
 _RESIDUAL_SPACES = ("normalized",)
 _RESIDUAL_SCALINGS = ("auto", "none", "global", "per_channel")
 _SNR_WEIGHTINGS = ("auto", "none", "min_snr", "snr", "truncated_snr")
 _DETERMINISTIC_ESTIMATORS = ("auto", "ode", "posterior_mean")
+_DETERMINISTIC_HEADS = ("separate_mean", "shared_process")
 _TIMESTEP_DISTRIBUTIONS = ("auto", "uniform", "low_noise", "high_noise")
 
 
@@ -220,7 +223,7 @@ def _as_float(
         out = float(value)
     except (TypeError, ValueError) as exc:
         raise ConfigValidationError(f"{section}.{key} must be a number, got {value!r}") from exc
-    if out != out:  # NaN
+    if not math.isfinite(out):
         raise ConfigValidationError(f"{section}.{key} must be finite, got {value!r}")
     if minimum is not None and out < minimum:
         raise ConfigValidationError(f"{section}.{key} must be >= {minimum}, got {out}")
@@ -284,6 +287,9 @@ class TargetSpaceConfig:
     residual_scaling_momentum: float = 0.05
     residual_scaling_warmup_batches: int = 32
     residual_scaling_target_std: float = 1.0
+    #: Hard deployment bound in training-residual standard deviations. Zero
+    #: disables clipping for exact backward compatibility.
+    residual_clip_standard_deviations: float = 0.0
 
     _KEYS = (
         "use_existing_normalization",
@@ -293,6 +299,7 @@ class TargetSpaceConfig:
         "residual_scaling_momentum",
         "residual_scaling_warmup_batches",
         "residual_scaling_target_std",
+        "residual_clip_standard_deviations",
     )
 
     @classmethod
@@ -313,7 +320,7 @@ class TargetSpaceConfig:
                 "must be built in the same normalized target space that Aurora's "
                 "supervised loss and the existing flow-matching refiner use."
             )
-        return cls(
+        out = cls(
             use_existing_normalization=use_existing,
             residual_space=_as_choice(
                 sec,
@@ -357,7 +364,23 @@ class TargetSpaceConfig:
                 d.residual_scaling_target_std,
                 minimum=1.0e-6,
             ),
+            residual_clip_standard_deviations=_as_float(
+                sec,
+                "residual_clip_standard_deviations",
+                raw.get("residual_clip_standard_deviations"),
+                d.residual_clip_standard_deviations,
+                minimum=0.0,
+            ),
         )
+        if (
+            out.residual_clip_standard_deviations > 0.0
+            and out.resolved_residual_scaling() == "none"
+        ):
+            raise ConfigValidationError(
+                f"{sec}.residual_clip_standard_deviations requires active "
+                "residual_scaling ('global', 'per_channel', or 'auto')."
+            )
+        return out
 
     def resolved_residual_scaling(self) -> str:
         """``auto`` resolved to a concrete mode."""
@@ -377,6 +400,10 @@ class ConditioningConfig:
     static_fields: bool = True
     masks: bool = True
     forecast_lead_time: bool = True
+    #: Add latitude / 90 as one explicit geophysical conditioning channel.
+    latitude: bool = False
+    #: Add periodic sin/cos longitude as two conditioning channels.
+    longitude: bool = False
 
     _KEYS = (
         "aurora_rollout",
@@ -385,6 +412,8 @@ class ConditioningConfig:
         "static_fields",
         "masks",
         "forecast_lead_time",
+        "latitude",
+        "longitude",
     )
     _SPATIAL_KEYS = (
         "aurora_rollout",
@@ -444,6 +473,9 @@ class LossConfig:
     extreme_weight: float = 0.0
     extreme_quantile: float = 0.95
     extreme_intensity: float = 4.0
+    #: Select whether the tail-weighted loss emphasises both tails (the legacy
+    #: behaviour) or only high-concentration extremes.
+    extreme_tail: str = "both"
     peak_weight: float = 0.0
     #: Sorted-value (1-D Wasserstein-2) distance between the refined and true
     #: field distributions. Matches the full PDF, not just the tails.
@@ -458,14 +490,11 @@ class LossConfig:
     degradation_weight: float = 0.0
     #: L2 shrinkage on the predicted residual magnitude.
     magnitude_weight: float = 0.0
-    #: Evaluate the structural terms (pattern correlation, extreme, peak,
-    #: quantile, variance, spectral) on the **deterministic** residual estimate
-    #: rather than on the generative estimate drawn at a random noise level.
-    #: The deterministic estimate is what inference emits, so this is the field
-    #: whose spread, tails and spectrum actually reach the forecast; scoring the
-    #: noisy training estimate instead optimises a quantity nobody consumes.
-    #: Requires ``deterministic_weight > 0`` (which is what computes the
-    #: estimate); ignored otherwise.
+    #: Evaluate forecast-quality auxiliaries on the **deterministic** residual
+    #: estimate, when one is supplied, rather than on the generative estimate
+    #: drawn at a random noise level. The deterministic estimate is what
+    #: inference emits, so it is the correction whose errors, magnitude,
+    #: spatial structure, spread, tails, and spectrum should be scored.
     aux_on_deterministic: bool = True
     area_weighted: bool = True
     separate_by_variable: bool = True
@@ -483,6 +512,7 @@ class LossConfig:
         "extreme_weight",
         "extreme_quantile",
         "extreme_intensity",
+        "extreme_tail",
         "peak_weight",
         "quantile_weight",
         "variance_weight",
@@ -542,6 +572,13 @@ class LossConfig:
                 d.extreme_intensity,
                 minimum=0.0,
             ),
+            extreme_tail=_as_choice(
+                sec,
+                "extreme_tail",
+                raw.get("extreme_tail"),
+                d.extreme_tail,
+                _EXTREME_TAILS,
+            ),
             area_weighted=_as_bool(sec, "area_weighted", raw.get("area_weighted"), d.area_weighted),
             aux_on_deterministic=_as_bool(
                 sec,
@@ -593,9 +630,7 @@ class LossConfig:
     @property
     def needs_deterministic_estimate(self) -> bool:
         """Whether an extra deterministic forward pass is required."""
-        return self.deterministic_weight > 0.0 or (
-            self.aux_on_deterministic and self.needs_rollout
-        )
+        return self.deterministic_weight > 0.0 or (self.aux_on_deterministic and self.needs_rollout)
 
     def to_dict(self) -> dict[str, Any]:
         return {key: getattr(self, key) for key in self._KEYS}
@@ -863,9 +898,7 @@ class DiffusionConfig:
                 d.snr_weighting,
                 _SNR_WEIGHTINGS,
             ),
-            snr_gamma=_as_float(
-                sec, "snr_gamma", raw.get("snr_gamma"), d.snr_gamma, minimum=0.0
-            ),
+            snr_gamma=_as_float(sec, "snr_gamma", raw.get("snr_gamma"), d.snr_gamma, minimum=0.0),
             timestep_distribution=_as_choice(
                 sec,
                 "timestep_distribution",
@@ -1264,6 +1297,17 @@ class RefinementConfig:
     #: Enable this when the product is a single deterministic forecast, and leave
     #: it off when calibrated ensemble spread is the objective.
     deterministic_inference: bool = False
+    #: Network used for the deterministic point forecast.
+    #:
+    #: ``separate_mean`` preserves the schema-v2 implementation: a second full
+    #: backbone is supervised as the conditional mean while the stochastic
+    #: process models innovations around it. ``shared_process`` queries the
+    #: diffusion/flow network itself and directly supervises that exact query.
+    #: The latter is recommended for scientific point products because sampler,
+    #: process parameterisation, conditioning and spatial representation then
+    #: belong to the model that is actually evaluated. The legacy-safe default
+    #: keeps checkpoints/configurations that omit this key unchanged.
+    deterministic_head: str = "separate_mean"
     target_space: TargetSpaceConfig = field(default_factory=TargetSpaceConfig)
     conditioning: ConditioningConfig = field(default_factory=ConditioningConfig)
     loss: LossConfig = field(default_factory=LossConfig)
@@ -1287,6 +1331,7 @@ class RefinementConfig:
         "ensemble_size",
         "seed",
         "deterministic_inference",
+        "deterministic_head",
         "target_space",
         "conditioning",
         "loss",
@@ -1338,6 +1383,7 @@ class RefinementConfig:
             "ensemble_size": self.ensemble_size,
             "seed": self.seed,
             "deterministic_inference": self.deterministic_inference,
+            "deterministic_head": self.deterministic_head,
             "target_space": self.target_space.to_dict(),
             "conditioning": self.conditioning.to_dict(),
             "loss": self.loss.to_dict(),
@@ -1658,6 +1704,15 @@ def _legacy_refinement_config(config: Any) -> RefinementConfig:
     if not bool(model_cfg.get("flow_refine_enabled", False)):
         return RefinementConfig()
 
+    feedback_to_rollout = training_cfg.get(
+        "flow_refine_autoregressive_feedback", False
+    )
+    if not isinstance(feedback_to_rollout, bool):
+        raise ConfigValidationError(
+            "training.flow_refine_autoregressive_feedback must be a boolean, "
+            f"got {feedback_to_rollout!r}"
+        )
+
     sampling_steps = _as_int(
         "model", "flow_refine_sampling_steps", model_cfg.get("flow_refine_sampling_steps"), 1
     )
@@ -1687,7 +1742,7 @@ def _legacy_refinement_config(config: Any) -> RefinementConfig:
         type="flow_matching_unet",
         # The legacy inference path applies refinement inline in the rollout
         # loop; record that faithfully instead of silently changing behaviour.
-        feedback_to_rollout=bool(training_cfg.get("flow_refine_autoregressive_feedback", False)),
+        feedback_to_rollout=feedback_to_rollout,
         flow_matching=flow,
         unet=unet,
         conditioning=ConditioningConfig(
@@ -1792,6 +1847,13 @@ def resolve_refinement_config(config: Any) -> RefinementConfig:
     deterministic_inference = _as_bool(
         "refinement", "deterministic_inference", raw.get("deterministic_inference"), False
     )
+    deterministic_head = _as_choice(
+        "refinement",
+        "deterministic_head",
+        raw.get("deterministic_head"),
+        "separate_mean",
+        _DETERMINISTIC_HEADS,
+    )
 
     flow_matching = FlowMatchingConfig.from_mapping(raw.get("flow_matching"))
     diffusion = DiffusionConfig.from_mapping(raw.get("diffusion"))
@@ -1811,6 +1873,7 @@ def resolve_refinement_config(config: Any) -> RefinementConfig:
         ensemble_size=ensemble_size,
         seed=seed,
         deterministic_inference=deterministic_inference,
+        deterministic_head=deterministic_head,
         target_space=TargetSpaceConfig.from_mapping(raw.get("target_space")),
         conditioning=ConditioningConfig.from_mapping(raw.get("conditioning")),
         loss=loss,
@@ -1841,6 +1904,36 @@ def resolve_refinement_config(config: Any) -> RefinementConfig:
             RuntimeWarning,
             stacklevel=2,
         )
+    if (
+        cfg.backend == "unified"
+        and cfg.is_flow_matching
+        and cfg.flow_matching.interpolation_path == "existing_aurora"
+        and cfg.flow_matching.solver != "euler"
+    ):
+        warnings.warn(
+            "refinement.flow_matching.solver is ignored for the existing_aurora "
+            "data parameterization; use solver='euler' for an explicit no-op "
+            "placeholder, or select interpolation_path='rectified_flow' for ODE "
+            "integration.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    training_section = _as_mapping(_locate_section(config, "training") or {})
+    legacy_aux = _as_mapping(training_section.get("flow_aux_loss"))
+    if cfg.backend == "unified" and bool(legacy_aux.get("enabled", False)):
+        warnings.warn(
+            "training.flow_aux_loss is implemented only by the legacy "
+            "flow_matching_unet and is ignored by unified refinement heads. Move "
+            "the desired weights to model.refinement.loss.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    if cfg.target_space.residual_clip_standard_deviations > 0.0 and cfg.backend != "unified":
+        raise ConfigValidationError(
+            "refinement.target_space.residual_clip_standard_deviations is "
+            "implemented only by unified refinement heads. Select a unified "
+            "head or leave the safeguard disabled at 0.0."
+        )
     if cfg.is_legacy_flow_matching:
         if cfg.flow_matching.interpolation_path != "existing_aurora":
             raise ConfigValidationError(
@@ -1848,6 +1941,30 @@ def resolve_refinement_config(config: Any) -> RefinementConfig:
                 "rectified-flow implementation and only supports "
                 "flow_matching.interpolation_path='existing_aurora'. Use "
                 "'flow_matching_transformer' to select another documented path."
+            )
+        legacy_supported = {
+            "solver": "euler",
+            "stochastic_initialization": True,
+            "time_sampling": "logit_normal",
+            "logit_normal_mean": -0.5,
+            "logit_normal_std": 1.2,
+            "deterministic_training_steps": 4,
+        }
+        ignored_overrides = [
+            (key, getattr(cfg.flow_matching, key), expected)
+            for key, expected in legacy_supported.items()
+            if getattr(cfg.flow_matching, key) != expected
+        ]
+        if ignored_overrides:
+            detail = ", ".join(
+                f"{key}={actual!r} (supported value {expected!r})"
+                for key, actual, expected in ignored_overrides
+            )
+            raise ConfigValidationError(
+                "refinement.type='flow_matching_unet' does not implement these "
+                f"FlowMatchingConfig overrides: {detail}. Use the supported values "
+                "or select 'flow_matching_transformer'; options must not be silently "
+                "ignored."
             )
         if cfg.loss.has_auxiliary_terms:
             raise ConfigValidationError(

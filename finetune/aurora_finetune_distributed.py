@@ -412,6 +412,16 @@ def _optimizer_updates_per_epoch(
     )
 
 
+_PHYSICAL_VALIDATION_STAT_NAMES = (
+    "count",
+    "error_sum",
+    "abs_error_sum",
+    "sq_error_sum",
+    "spatial_correlation_sum",
+    "spatial_correlation_count",
+)
+
+
 def _checkpoint_candidate_improves(
     *,
     should_validate: bool,
@@ -420,15 +430,196 @@ def _checkpoint_candidate_improves(
     physical_channel_coverage_complete: bool,
     best_value: float,
     min_delta: float,
+    checkpoint_guards_passed: bool = True,
 ) -> bool:
-    """Reject checkpoint candidates unless physical metric coverage is exact."""
+    """Reject checkpoint candidates unless coverage and all safety gates pass."""
     return bool(
         should_validate
         and physical_channel_coverage_complete
         and np.isfinite(checkpoint_metric_value)
         and non_degrading
+        and checkpoint_guards_passed
         and checkpoint_metric_value < (best_value - min_delta)
     )
+
+
+def _merge_physical_validation_sums(target, batch_metrics) -> None:
+    """Merge one validation batch, accepting legacy error-only accumulators."""
+    for channel, values in batch_metrics.get("physical_error_sums", {}).items():
+        slot = target.setdefault(
+            channel,
+            {name: 0.0 for name in _PHYSICAL_VALIDATION_STAT_NAMES},
+        )
+        for name in _PHYSICAL_VALIDATION_STAT_NAMES:
+            slot[name] = float(slot.get(name, 0.0)) + float(
+                values.get(name, 0.0)
+            )
+
+
+def _finalize_physical_validation_channel(sums) -> dict[str, float]:
+    """Convert additive cell errors and sample correlations to channel metrics."""
+    count = float(sums.get("count", 0.0))
+    correlation_count = float(sums.get("spatial_correlation_count", 0.0))
+    if count <= 0:
+        return {
+            "count": 0.0,
+            "bias": math.nan,
+            "mae": math.nan,
+            "rmse": math.nan,
+            "pattern_correlation_count": correlation_count,
+            "pattern_correlation": math.nan,
+        }
+    correlation = (
+        float(sums.get("spatial_correlation_sum", 0.0)) / correlation_count
+        if correlation_count > 0
+        else math.nan
+    )
+    return {
+        "count": count,
+        "bias": float(sums.get("error_sum", 0.0)) / count,
+        "mae": float(sums.get("abs_error_sum", 0.0)) / count,
+        "rmse": math.sqrt(max(0.0, float(sums.get("sq_error_sum", 0.0)) / count)),
+        "pattern_correlation_count": correlation_count,
+        "pattern_correlation": correlation,
+    }
+
+
+def _evaluate_checkpoint_guards(
+    *,
+    physical_channels,
+    expected_channels,
+    metrics,
+    relative_tolerance: float,
+    correlation_tolerance: float,
+    bias_rmse_floor_fraction: float,
+) -> dict[str, object]:
+    """Evaluate additive scientific guards for every expected physical channel."""
+    configured_metrics = [str(metric).strip().lower() for metric in metrics]
+    allowed_metrics = {"mae", "absolute_bias", "pattern_correlation"}
+    unknown = sorted(set(configured_metrics) - allowed_metrics)
+    if unknown:
+        raise ValueError(f"Unknown checkpoint guard metrics: {unknown}.")
+    report: dict[str, object] = {
+        "status": "disabled" if not configured_metrics else "passed",
+        "passed": True,
+        "configured_metrics": configured_metrics,
+        "relative_tolerance": float(relative_tolerance),
+        "correlation_tolerance": float(correlation_tolerance),
+        "bias_rmse_floor_fraction": float(bias_rmse_floor_fraction),
+        "channels": {},
+        "failures": [],
+        "failed_channels": [],
+    }
+    if not configured_metrics:
+        return report
+
+    channel_details: dict[str, dict[str, object]] = {}
+    failures: list[dict[str, object]] = []
+    for channel in sorted(set(expected_channels)):
+        comparison = physical_channels.get(channel, {})
+        baseline = comparison.get("baseline", {})
+        candidate = comparison.get("refined", {})
+        metric_details: dict[str, object] = {}
+        for metric in configured_metrics:
+            detail: dict[str, object]
+            if metric == "mae":
+                baseline_value = float(baseline.get("mae", math.nan))
+                candidate_value = float(candidate.get("mae", math.nan))
+                threshold = baseline_value * (1.0 + relative_tolerance)
+                comparison_name = "candidate <= baseline * (1 + tolerance)"
+                finite = all(
+                    np.isfinite(value)
+                    for value in (baseline_value, candidate_value, threshold)
+                )
+                passed = bool(finite and candidate_value <= threshold)
+                detail = {
+                    "baseline": baseline_value,
+                    "candidate": candidate_value,
+                    "threshold": threshold,
+                    "comparison": comparison_name,
+                    "passed": passed,
+                }
+            elif metric == "absolute_bias":
+                baseline_value = abs(float(baseline.get("bias", math.nan)))
+                candidate_value = abs(float(candidate.get("bias", math.nan)))
+                baseline_rmse = float(baseline.get("rmse", math.nan))
+                relative_threshold = baseline_value * (1.0 + relative_tolerance)
+                rmse_floor_threshold = (
+                    bias_rmse_floor_fraction * baseline_rmse
+                )
+                threshold = max(relative_threshold, rmse_floor_threshold)
+                comparison_name = (
+                    "abs(candidate bias) <= max(abs(baseline bias) * "
+                    "(1 + tolerance), floor * baseline RMSE)"
+                )
+                finite = all(
+                    np.isfinite(value)
+                    for value in (
+                        baseline_value,
+                        candidate_value,
+                        baseline_rmse,
+                        threshold,
+                    )
+                )
+                passed = bool(finite and candidate_value <= threshold)
+                detail = {
+                    "baseline": baseline_value,
+                    "candidate": candidate_value,
+                    "baseline_rmse": baseline_rmse,
+                    "relative_threshold": relative_threshold,
+                    "rmse_floor_threshold": rmse_floor_threshold,
+                    "threshold": threshold,
+                    "comparison": comparison_name,
+                    "passed": passed,
+                }
+            else:
+                baseline_value = float(
+                    baseline.get("pattern_correlation", math.nan)
+                )
+                candidate_value = float(
+                    candidate.get("pattern_correlation", math.nan)
+                )
+                threshold = baseline_value - correlation_tolerance
+                comparison_name = (
+                    "candidate >= baseline - correlation tolerance"
+                )
+                finite = all(
+                    np.isfinite(value)
+                    for value in (baseline_value, candidate_value, threshold)
+                )
+                passed = bool(finite and candidate_value >= threshold)
+                detail = {
+                    "baseline": baseline_value,
+                    "candidate": candidate_value,
+                    "threshold": threshold,
+                    "comparison": comparison_name,
+                    "passed": passed,
+                }
+            metric_details[metric] = detail
+            if not passed:
+                failures.append(
+                    {
+                        "channel": channel,
+                        "metric": metric,
+                        **detail,
+                        "reason": (
+                            "threshold_failed" if finite else "non_finite_metric"
+                        ),
+                    }
+                )
+        channel_details[channel] = metric_details
+
+    failed_channels = sorted({str(item["channel"]) for item in failures})
+    report.update(
+        {
+            "status": "failed" if failures else "passed",
+            "passed": not failures,
+            "channels": channel_details,
+            "failures": failures,
+            "failed_channels": failed_channels,
+        }
+    )
+    return report
 
 
 # ---------------------------------------------------------------------------
@@ -566,15 +757,6 @@ def _distributed_validation(
     refined_physical_sums: dict[str, dict[str, float]] = {}
     baseline_physical_sums: dict[str, dict[str, float]] = {}
 
-    def merge_physical_sums(target, batch_metrics):
-        for channel, values in batch_metrics.get("physical_error_sums", {}).items():
-            slot = target.setdefault(
-                channel,
-                {name: 0.0 for name in ("count", "error_sum", "abs_error_sum", "sq_error_sum")},
-            )
-            for name in slot:
-                slot[name] += float(values[name])
-
     baseline_model = _validation_baseline_model(model)
     refinement_generator = ft._validation_refinement_generator(
         model, device, stream=rank,
@@ -589,7 +771,9 @@ def _distributed_validation(
                 norm_stats=norm_stats,
                 refinement_generator=refinement_generator,
             )
-            merge_physical_sums(refined_physical_sums, refined_batch_metrics)
+            _merge_physical_validation_sums(
+                refined_physical_sums, refined_batch_metrics
+            )
             loss_sum += loss.detach().cpu()
             if baseline_model is not None:
                 baseline_loss, baseline_batch_metrics = ft.compute_supervised_loss(
@@ -600,7 +784,9 @@ def _distributed_validation(
             else:
                 baseline_loss = loss
                 baseline_batch_metrics = refined_batch_metrics
-            merge_physical_sums(baseline_physical_sums, baseline_batch_metrics)
+            _merge_physical_validation_sums(
+                baseline_physical_sums, baseline_batch_metrics
+            )
             baseline_loss_sum += baseline_loss.detach().cpu()
             count += 1
             if pbar is not None and rank == 0:
@@ -636,7 +822,7 @@ def _distributed_validation(
     channel_names = sorted(
         expected_channels | observed_refined | observed_baseline
     )
-    stat_names = ("count", "error_sum", "abs_error_sum", "sq_error_sum")
+    stat_names = _PHYSICAL_VALIDATION_STAT_NAMES
 
     def reduce_channel(source, channel):
         local = source.get(channel, {})
@@ -646,22 +832,6 @@ def _distributed_validation(
         )
         dist.all_reduce(packed, op=dist.ReduceOp.SUM)
         return {name: float(value) for name, value in zip(stat_names, packed.tolist())}
-
-    def finalize_channel(sums):
-        n = sums["count"]
-        if n <= 0:
-            return {
-                "count": 0.0,
-                "bias": math.nan,
-                "mae": math.nan,
-                "rmse": math.nan,
-            }
-        return {
-            "count": n,
-            "bias": sums["error_sum"] / n,
-            "mae": sums["abs_error_sum"] / n,
-            "rmse": math.sqrt(max(0.0, sums["sq_error_sum"] / n)),
-        }
 
     def metric_ratio(refined, baseline, metric, *, absolute=False):
         numerator = float(refined[metric])
@@ -680,10 +850,10 @@ def _distributed_validation(
     physical_channels = {}
     rmse_ratios = []
     for channel in channel_names:
-        refined_channel = finalize_channel(
+        refined_channel = _finalize_physical_validation_channel(
             reduce_channel(refined_physical_sums, channel)
         )
-        baseline_channel = finalize_channel(
+        baseline_channel = _finalize_physical_validation_channel(
             reduce_channel(baseline_physical_sums, channel)
         )
         bias_ratio = metric_ratio(
@@ -699,6 +869,13 @@ def _distributed_validation(
             "absolute_bias_ratio": bias_ratio,
             "mae_ratio": mae_ratio,
             "rmse_ratio": rmse_ratio,
+            "pattern_correlation_improvement": (
+                refined_channel["pattern_correlation"]
+                - baseline_channel["pattern_correlation"]
+                if np.isfinite(refined_channel["pattern_correlation"])
+                and np.isfinite(baseline_channel["pattern_correlation"])
+                else math.nan
+            ),
             "absolute_bias_improvement_percent": (
                 100.0 * (1.0 - bias_ratio)
                 if np.isfinite(bias_ratio)
@@ -1091,6 +1268,19 @@ def _worker(rank: int, world_size: int, local_gpu: int, cfg: dict):
     save_best_only = bool(train_cfg.get("save_best_only", True))
     save_last = bool(train_cfg.get("save_last", True))
     diagnostics_enabled = bool(train_cfg.get("diagnostics_enabled", False))
+    checkpoint_guard_metrics = tuple(
+        str(metric).strip().lower()
+        for metric in train_cfg.get("checkpoint_guard_metrics", ())
+    )
+    checkpoint_guard_relative_tolerance = float(
+        train_cfg.get("checkpoint_guard_relative_tolerance", 0.0)
+    )
+    checkpoint_guard_correlation_tolerance = float(
+        train_cfg.get("checkpoint_guard_correlation_tolerance", 0.0)
+    )
+    checkpoint_guard_bias_rmse_floor_fraction = float(
+        train_cfg.get("checkpoint_guard_bias_rmse_floor_fraction", 0.0)
+    )
 
     # The scheduler advances once per *optimizer update*, not once per sample
     # batch. Account for both data-parallel sharding and gradient accumulation;
@@ -1117,6 +1307,7 @@ def _worker(rank: int, world_size: int, local_gpu: int, cfg: dict):
     latest_validation: dict[str, object] | None = None
     global_step = 0
     start_epoch = 0
+    resume_checkpoint: dict | None = None
 
     # ---- resume from checkpoint ----
     resume_training = bool(train_cfg.get("resume_training", False))
@@ -1133,6 +1324,7 @@ def _worker(rank: int, world_size: int, local_gpu: int, cfg: dict):
     if resume_path and resume_path.exists():
         _print0(rank, f"Resuming from checkpoint: {resume_path}")
         ckpt = torch.load(str(resume_path), map_location=device, weights_only=False)
+        resume_checkpoint = ckpt
         saved_run_id = (
             ckpt.get("config", {}).get("runtime", {}).get("training_run_id")
         )
@@ -1288,9 +1480,14 @@ def _worker(rank: int, world_size: int, local_gpu: int, cfg: dict):
                         f"{channel['units']}",
                         flush=True,
                     )
-    # The pre-pass exercises stochastic training forwards; restore the configured
-    # RNG stream so it cannot alter optimization or sampling reproducibility.
-    ft.set_seed(int(train_cfg.get("seed", 42)))
+    # The pre-pass exercises stochastic training forwards. A resumed job must
+    # continue the exact serialized stream; a fresh job starts from its
+    # configured seed after the pre-pass.
+    if resume_checkpoint is None or not ft.restore_checkpoint_rng_state(
+        resume_checkpoint,
+        device=device,
+    ):
+        ft.set_seed(int(train_cfg.get("seed", 42)))
 
     # Mark the current logical run independently of best/last. Inference uses
     # this marker to reject a stale best checkpoint when a fresh run produces
@@ -1537,6 +1734,36 @@ def _worker(rank: int, world_size: int, local_gpu: int, cfg: dict):
             val_pbar.close()
             model.train()
 
+        if should_validate:
+            checkpoint_guards = _evaluate_checkpoint_guards(
+                physical_channels=physical_channels,
+                expected_channels=physical_channel_coverage["expected"],
+                metrics=checkpoint_guard_metrics,
+                relative_tolerance=checkpoint_guard_relative_tolerance,
+                correlation_tolerance=checkpoint_guard_correlation_tolerance,
+                bias_rmse_floor_fraction=(
+                    checkpoint_guard_bias_rmse_floor_fraction
+                ),
+            )
+        else:
+            checkpoint_guards = {
+                "status": (
+                    "not_evaluated" if checkpoint_guard_metrics else "disabled"
+                ),
+                "passed": not checkpoint_guard_metrics,
+                "configured_metrics": list(checkpoint_guard_metrics),
+                "relative_tolerance": checkpoint_guard_relative_tolerance,
+                "correlation_tolerance": (
+                    checkpoint_guard_correlation_tolerance
+                ),
+                "bias_rmse_floor_fraction": (
+                    checkpoint_guard_bias_rmse_floor_fraction
+                ),
+                "channels": {},
+                "failures": [],
+                "failed_channels": [],
+            }
+
         row = {
             "epoch": epoch,
             "global_step": global_step,
@@ -1547,6 +1774,12 @@ def _worker(rank: int, world_size: int, local_gpu: int, cfg: dict):
             "mean_physical_rmse_ratio": mean_physical_rmse_ratio,
             "physical_channel_coverage_complete": bool(physical_channel_coverage["complete"]),
             "physical_rmse_improvement_percent": 100.0 * (1.0 - mean_physical_rmse_ratio),
+            "checkpoint_guard_status": checkpoint_guards["status"],
+            "checkpoint_guard_passed": bool(checkpoint_guards["passed"]),
+            "checkpoint_guard_failed_channels": checkpoint_guards[
+                "failed_channels"
+            ],
+            "checkpoint_guards": checkpoint_guards,
             "lr": float(optimizer.param_groups[0]["lr"]),
         }
         history.append(row)
@@ -1558,6 +1791,7 @@ def _worker(rank: int, world_size: int, local_gpu: int, cfg: dict):
             f"val_loss={val_loss:.4f} | baseline_val_loss={baseline_val_loss:.4f} | "
             f"improvement={val_improvement_percent:+.2f}% | "
             f"physical_RMSE_improvement={100.0 * (1.0 - mean_physical_rmse_ratio):+.2f}% | "
+            f"checkpoint_guard={checkpoint_guards['status']} | "
             f"mem={torch.cuda.memory_allocated(device) / 1e9:.1f}GB",
         )
 
@@ -1597,6 +1831,7 @@ def _worker(rank: int, world_size: int, local_gpu: int, cfg: dict):
             checkpoint_metric_value=checkpoint_metric_value,
             non_degrading=non_degrading,
             physical_channel_coverage_complete=coverage_complete,
+            checkpoint_guards_passed=bool(checkpoint_guards["passed"]),
             best_value=best_val_loss,
             min_delta=min_delta,
         )
@@ -1607,6 +1842,8 @@ def _worker(rank: int, world_size: int, local_gpu: int, cfg: dict):
                 validation_status = "non_finite_checkpoint_metric"
             elif require_all_channels and not all_physical_channels_improved:
                 validation_status = "physical_channel_degradation"
+            elif not bool(checkpoint_guards["passed"]):
+                validation_status = "checkpoint_guard_failed"
             elif require_improvement and checkpoint_metric_value > checkpoint_baseline_value:
                 validation_status = "degrades_deterministic_baseline"
             elif not improved:
@@ -1635,7 +1872,13 @@ def _worker(rank: int, world_size: int, local_gpu: int, cfg: dict):
                 "min_delta": float(min_delta),
                 "require_refinement_improvement": bool(require_improvement),
                 "require_all_physical_channels_improve": bool(require_all_channels),
+                "checkpoint_guards": checkpoint_guards,
             }
+            row["checkpoint_promotion_status"] = validation_status
+            row["checkpoint_promoted"] = bool(improved)
+        else:
+            row["checkpoint_promotion_status"] = "not_validated"
+            row["checkpoint_promoted"] = False
         if improved:
             best_val_loss = checkpoint_metric_value
             no_improve_epochs = 0

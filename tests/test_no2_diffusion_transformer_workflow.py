@@ -1021,6 +1021,9 @@ def test_temporal_config_defaults_off_and_rejects_invalid_sequence_contract() ->
     no_refinement["model"]["refinement"].update(
         {"enabled": False, "type": "none"}
     )
+    no_refinement["model"]["refinement"]["target_space"][
+        "residual_clip_standard_deviations"
+    ] = 0.0
     with pytest.raises(
         ValueError,
         match="mamba_temporal_enabled requires an active refinement backend",
@@ -1135,10 +1138,13 @@ def test_optional_conditioning_flows_through_shared_training_and_rollout(
     )
     assert isinstance(model, AuroraTwoPhaseRefiner)
     assert model.refiner is not None
+    conditioning_cfg = model.refinement_config.conditioning
     expected_width = (
         2 * model.packing.num_channels
         + len(specs.static)
         + 1  # configured finite-input mask
+        + int(conditioning_cfg.latitude)
+        + 2 * int(conditioning_cfg.longitude)
     )
     assert model.refiner.cond_channels == expected_width
 

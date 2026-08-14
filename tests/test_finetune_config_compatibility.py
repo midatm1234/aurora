@@ -14,19 +14,28 @@ import pytest
 import torch
 import xarray as xr
 import yaml
-
-from aurora import Batch, Metadata
 from finetune import aurora_finetune_utils as ft
 
+from aurora import Batch, Metadata
 
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG_DIR = ROOT / "finetune"
 NO2_CONFIG = CONFIG_DIR / "aurora_NO2_finetune_US-WEST_3day_lead_config.yaml"
 NO2_DT_CONFIG = (
-    CONFIG_DIR
-    / "aurora_NO2_finetune_US-WEST_3day_lead_diffusion_transformer_config.yaml"
+    CONFIG_DIR / "aurora_NO2_finetune_US-WEST_3day_lead_diffusion_transformer_config.yaml"
+)
+NO2_DIFFUSION_CONFIG = CONFIG_DIR / "aurora_NO2_finetune_US-WEST_3day_lead_diffusion_config.yaml"
+NO2_FLOW_TRANSFORMER_CONFIG = (
+    CONFIG_DIR / "aurora_NO2_finetune_US-WEST_3day_lead_flow_matching_transformer_config.yaml"
 )
 O3_CONFIG = CONFIG_DIR / "aurora_O3_global_finetune_3day_lead_config.yaml"
+PRIMARY_FINETUNE_CONFIGS = (
+    NO2_CONFIG,
+    NO2_DIFFUSION_CONFIG,
+    NO2_DT_CONFIG,
+    NO2_FLOW_TRANSFORMER_CONFIG,
+    O3_CONFIG,
+)
 
 
 @pytest.mark.parametrize(
@@ -108,9 +117,12 @@ def _synthetic_dataset(config: dict) -> xr.Dataset:
     return xr.Dataset(variables, coords=coords)
 
 
-@pytest.mark.parametrize("path", [NO2_CONFIG, NO2_DT_CONFIG, O3_CONFIG])
+@pytest.mark.parametrize("path", PRIMARY_FINETUNE_CONFIGS)
 def test_repository_configs_pass_shared_schema_and_dataset_contract(path: Path) -> None:
-    config = _raw_config(path)
+    # load_config is the production entrypoint and includes schema validation;
+    # call validate_config explicitly as a regression guard for callers that
+    # already hold a parsed mapping.
+    config = ft.load_config(path)
     ft.validate_config(config, path)
     dataset = _synthetic_dataset(config)
     specs = ft.resolve_variable_specs(dataset, config)
@@ -119,24 +131,44 @@ def test_repository_configs_pass_shared_schema_and_dataset_contract(path: Path) 
     assert tuple(dataset.level.values) == tuple(config["data"]["atmos_levels"])
 
 
-def test_no2_config_uses_no2_auxiliary_and_plot_targets() -> None:
+def test_shared_validation_rejects_string_legacy_feedback_boolean() -> None:
+    config = _raw_config(O3_CONFIG)
+    config["training"]["flow_refine_autoregressive_feedback"] = "false"
+
+    with pytest.raises(
+        ValueError,
+        match="training.flow_refine_autoregressive_feedback must be a boolean",
+    ):
+        ft.validate_config(config, O3_CONFIG)
+
+
+def test_no2_config_uses_unified_packed_flow_and_no2_targets() -> None:
     config = _raw_config(NO2_CONFIG)
-    aux = config["training"]["flow_aux_loss"]
-    assert aux["coherence_column_var"] == "tcno2"
-    assert aux["coherence_profile_var"] == "no2"
+    refinement = config["model"]["refinement"]
+    assert refinement["type"] == "flow_matching_conv_unet"
+    assert refinement["deterministic_head"] == "shared_process"
+    assert refinement["conditioning"]["latitude"] is True
+    assert refinement["conditioning"]["longitude"] is True
+    assert refinement["loss"]["extreme_tail"] == "upper"
+    assert config["data"]["nonnegative_target_variables"] == ["no2", "tcno2"]
+    assert "flow_refine_enabled" not in config["model"]
+    assert "flow_aux_loss" not in config["training"]
     assert config["notebook"]["plot_variables"] == ["no2", "tcno2"]
     ft.validate_config(config, NO2_CONFIG)
 
 
 def test_config_validation_rejects_o3_names_in_no2_recipe() -> None:
     config = _raw_config(NO2_CONFIG)
-    config["training"]["flow_aux_loss"]["coherence_column_var"] = "gtco3"
-    with pytest.raises(ValueError, match="coherence_column_var.*not a configured target"):
-        ft.validate_config(config)
-
-    config = _raw_config(NO2_CONFIG)
     config["notebook"]["plot_variables"] = ["go3", "gtco3"]
     with pytest.raises(ValueError, match="notebook.plot_variables"):
+        ft.validate_config(config)
+
+
+def test_unified_extreme_tail_rejects_unknown_mode() -> None:
+    config = _raw_config(NO2_CONFIG)
+    config["model"]["refinement"]["loss"]["extreme_tail"] = "lower"
+
+    with pytest.raises(ValueError, match="refinement.loss.extreme_tail"):
         ft.validate_config(config)
 
 
@@ -155,19 +187,43 @@ def test_config_validation_rejects_missing_levels_and_unused_normalization() -> 
 
 def test_legacy_no2_checkpoint_reports_temporal_contract_mismatch() -> None:
     config = _raw_config(NO2_CONFIG)
+    config["model"].pop("refinement")
+    config["model"].update(
+        {
+            "flow_refine_enabled": True,
+            "flow_refine_contract_version": 3,
+            "flow_refine_hidden": 64,
+            "flow_refine_time_dim": 128,
+            "flow_refine_sampling_steps": 1,
+            "flow_refine_residual_zscore": True,
+            "flow_refine_lead_time_cond": True,
+            "flow_refine_lead_time_scale_hours": 72,
+            "flow_refine_lon_encoding": True,
+        }
+    )
+    # Exercise the migration contract independently of the repository recipe's
+    # current temporal default. A legacy checkpoint omits these keys, whereas
+    # the model being constructed here explicitly enables temporal refinement.
+    config["model"]["mamba_temporal_enabled"] = True
+    config["training"]["mamba_temporal_weight"] = 1.0
     ft.validate_config(config)
     dataset = _synthetic_dataset(config)
     specs = ft.resolve_variable_specs(dataset, config)
     model = ft.maybe_wrap_flow_refine(
-        torch.nn.Identity(), config, specs, lon=dataset.longitude.values,
+        torch.nn.Identity(),
+        config,
+        specs,
+        lon=dataset.longitude.values,
     )
 
     saved_config = copy.deepcopy(config)
     for key in tuple(saved_config["model"]):
         if key.startswith("mamba_temporal_"):
             saved_config["model"].pop(key)
-    saved_config["model"].pop("lon_periodic_resolved", None)
-    saved_config["model"].pop("longitude_grid_signature", None)
+    # This fixture isolates a checkpoint that predates the temporal module,
+    # not one that predates longitude-aware training. Retain the resolved
+    # longitude contract so strict longitude validation passes before the
+    # intended temporal-contract mismatch is checked.
     checkpoint = {
         "config": saved_config,
         "best_val_loss": 1.0,

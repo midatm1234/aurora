@@ -4,15 +4,34 @@ Focused contracts for distributed residual calibration and validation."""
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 import xarray as xr
+import yaml
 
 import finetune.aurora_finetune_distributed as trainer
 from finetune.refinement.packing import ChannelSpec, FieldPacking
 from finetune.refinement.residual_scaling import ResidualScaler
+
+
+ROOT = Path(__file__).resolve().parents[1]
+NO2_CONFIGS = (
+    "aurora_NO2_finetune_US-WEST_3day_lead_config.yaml",
+    "aurora_NO2_finetune_US-WEST_3day_lead_diffusion_config.yaml",
+    "aurora_NO2_finetune_US-WEST_3day_lead_diffusion_transformer_config.yaml",
+    "aurora_NO2_finetune_US-WEST_3day_lead_flow_matching_transformer_config.yaml",
+)
+
+
+def _raw_no2_config(name: str = NO2_CONFIGS[2]) -> dict:
+    config = yaml.safe_load((ROOT / "finetune" / name).read_text())
+    assert isinstance(config, dict)
+    return config
 
 
 def _packing(*, leads=(6.0, 12.0)) -> FieldPacking:
@@ -213,6 +232,82 @@ def test_trained_resume_rejects_non_exact_scaler_without_recalibrating(monkeypat
     assert called is False
 
 
+def test_spatial_pattern_correlation_is_per_sample_masked_and_scale_independent() -> None:
+    truth = 1.0e-10 * torch.tensor(
+        [
+            [[[0.0, 1.0, 2.0, 3.0]]],
+            [[[0.0, 1.0, 2.0, 3.0]]],
+            [[[1.0, 1.0, 1.0, 1.0]]],
+        ]
+    )
+    prediction = 1.0e-10 * torch.tensor(
+        [
+            [[[0.0, 2.0, 4.0, 6.0]]],
+            [[[3.0, 2.0, 1.0, 0.0]]],
+            [[[2.0, 2.0, 2.0, 2.0]]],
+        ]
+    )
+    valid = torch.ones_like(truth, dtype=torch.bool)
+    prediction[0, ..., -1] = float("inf")
+    valid[0, ..., -1] = False
+
+    correlation_sum, correlation_count = (
+        trainer.ft._spatial_pattern_correlation_sum_count(
+            prediction,
+            truth,
+            valid,
+        )
+    )
+
+    assert correlation_count == 2.0
+    assert correlation_sum == pytest.approx(0.0, abs=1.0e-12)
+
+
+def test_physical_validation_merge_and_finalize_include_spatial_correlation() -> None:
+    sums: dict[str, dict[str, float]] = {}
+    trainer._merge_physical_validation_sums(
+        sums,
+        {
+            "physical_error_sums": {
+                "tcno2@surface@lead24h": {
+                    "count": 2.0,
+                    "error_sum": 2.0,
+                    "abs_error_sum": 2.0,
+                    "sq_error_sum": 2.0,
+                    "spatial_correlation_sum": 1.5,
+                    "spatial_correlation_count": 2.0,
+                }
+            }
+        },
+    )
+    # Old batch/checkpoint producers have no correlation keys; merging them
+    # remains valid and does not dilute the sample-correlation mean.
+    trainer._merge_physical_validation_sums(
+        sums,
+        {
+            "physical_error_sums": {
+                "tcno2@surface@lead24h": {
+                    "count": 2.0,
+                    "error_sum": 0.0,
+                    "abs_error_sum": 2.0,
+                    "sq_error_sum": 2.0,
+                }
+            }
+        },
+    )
+
+    result = trainer._finalize_physical_validation_channel(
+        sums["tcno2@surface@lead24h"]
+    )
+
+    assert result["count"] == 4.0
+    assert result["bias"] == pytest.approx(0.5)
+    assert result["mae"] == pytest.approx(1.0)
+    assert result["rmse"] == pytest.approx(1.0)
+    assert result["pattern_correlation_count"] == 2.0
+    assert result["pattern_correlation"] == pytest.approx(0.75)
+
+
 def test_expected_validation_channels_cover_variable_level_and_lead_product() -> None:
     channels = (
         ChannelSpec(0, "tcno2", "tcno2", "surf", None, None),
@@ -238,6 +333,198 @@ def test_expected_validation_channels_cover_variable_level_and_lead_product() ->
         for lead in (24, 48, 72)
     }
     assert set(actual) == expected
+
+
+def _guard_channels(**candidate_overrides) -> dict:
+    candidate = {
+        "count": 100.0,
+        "bias": 0.1,
+        "mae": 1.01,
+        "rmse": 1.8,
+        "pattern_correlation": 0.79,
+    }
+    candidate.update(candidate_overrides)
+    return {
+        "tcno2@surface@lead24h": {
+            "baseline": {
+                "count": 100.0,
+                "bias": 0.001,
+                "mae": 1.0,
+                "rmse": 2.0,
+                "pattern_correlation": 0.8,
+            },
+            "refined": candidate,
+        }
+    }
+
+
+def _evaluate_guards(channels: dict) -> dict[str, object]:
+    return trainer._evaluate_checkpoint_guards(
+        physical_channels=channels,
+        expected_channels={"tcno2@surface@lead24h"},
+        metrics=("mae", "absolute_bias", "pattern_correlation"),
+        relative_tolerance=0.01,
+        correlation_tolerance=0.01,
+        bias_rmse_floor_fraction=0.05,
+    )
+
+
+def test_checkpoint_guards_apply_tolerances_and_bias_rmse_floor() -> None:
+    passing = _evaluate_guards(_guard_channels())
+    assert passing["status"] == "passed"
+    assert passing["passed"] is True
+    bias_detail = passing["channels"]["tcno2@surface@lead24h"][
+        "absolute_bias"
+    ]
+    assert bias_detail["relative_threshold"] == pytest.approx(0.00101)
+    assert bias_detail["rmse_floor_threshold"] == pytest.approx(0.1)
+    assert bias_detail["threshold"] == pytest.approx(0.1)
+
+    failures = {
+        "mae": _guard_channels(mae=1.011),
+        "absolute_bias": _guard_channels(bias=0.101),
+        "pattern_correlation": _guard_channels(pattern_correlation=0.789),
+    }
+    for expected_metric, channels in failures.items():
+        report = _evaluate_guards(channels)
+        assert report["status"] == "failed"
+        assert report["passed"] is False
+        assert report["failed_channels"] == ["tcno2@surface@lead24h"]
+        failed_metrics = {item["metric"] for item in report["failures"]}
+        assert expected_metric in failed_metrics
+
+
+def test_checkpoint_guards_are_opt_in_and_veto_promotion_when_enabled() -> None:
+    disabled = trainer._evaluate_checkpoint_guards(
+        physical_channels=_guard_channels(mae=100.0),
+        expected_channels={"tcno2@surface@lead24h"},
+        metrics=(),
+        relative_tolerance=0.0,
+        correlation_tolerance=0.0,
+        bias_rmse_floor_fraction=0.0,
+    )
+    assert disabled["status"] == "disabled"
+    assert disabled["passed"] is True
+    assert not trainer._checkpoint_candidate_improves(
+        should_validate=True,
+        checkpoint_metric_value=0.5,
+        non_degrading=True,
+        physical_channel_coverage_complete=True,
+        checkpoint_guards_passed=False,
+        best_value=1.0,
+        min_delta=0.0,
+    )
+
+
+def test_checkpoint_guard_detail_is_structured_in_metadata_and_history(
+    tmp_path: Path,
+) -> None:
+    report = _evaluate_guards(_guard_channels(mae=1.011))
+    model = torch.nn.Linear(1, 1)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    checkpoint_path = tmp_path / "best.ckpt"
+    trainer.ft.save_checkpoint(
+        checkpoint_path,
+        model,
+        optimizer,
+        None,
+        epoch=1,
+        global_step=2,
+        best_val_loss=0.9,
+        config={
+            "model": {},
+            "training": {
+                "checkpoint_guard_metrics": [
+                    "mae",
+                    "absolute_bias",
+                    "pattern_correlation",
+                ]
+            },
+            "runtime": {"training_run_id": "guard-test"},
+        },
+        validation={
+            "status": "checkpoint_guard_failed",
+            "checkpoint_guards": report,
+        },
+        validated_for_inference=False,
+    )
+    metadata = json.loads(
+        checkpoint_path.with_suffix(".ckpt.metadata.json").read_text()
+    )
+    stored_report = metadata["validation"]["checkpoint_guards"]
+    assert stored_report["status"] == "failed"
+    assert stored_report["failures"][0]["channel"] == (
+        "tcno2@surface@lead24h"
+    )
+
+    trainer.ft.write_training_history(
+        [{"epoch": 1, "checkpoint_guards": report}],
+        tmp_path / "history",
+    )
+    history = json.loads(
+        (tmp_path / "history" / "training_history.json").read_text()
+    )
+    assert history[0]["checkpoint_guards"]["status"] == "failed"
+
+
+@pytest.mark.parametrize("name", NO2_CONFIGS)
+def test_no2_configs_enable_all_scientific_checkpoint_guards(name: str) -> None:
+    config = _raw_no2_config(name)
+    trainer.ft.validate_config(config, ROOT / "finetune" / name)
+    training = config["training"]
+    assert training["checkpoint_guard_metrics"] == [
+        "mae",
+        "absolute_bias",
+        "pattern_correlation",
+    ]
+    assert training["checkpoint_guard_relative_tolerance"] == pytest.approx(0.0)
+    assert training["checkpoint_guard_correlation_tolerance"] == pytest.approx(0.0)
+    assert training["checkpoint_guard_bias_rmse_floor_fraction"] == pytest.approx(0.05)
+
+
+def test_checkpoint_guard_config_defaults_are_backward_compatible() -> None:
+    config = _raw_no2_config()
+    training = config["training"]
+    for key in (
+        "checkpoint_guard_metrics",
+        "checkpoint_guard_relative_tolerance",
+        "checkpoint_guard_correlation_tolerance",
+        "checkpoint_guard_bias_rmse_floor_fraction",
+    ):
+        training.pop(key, None)
+
+    trainer.ft.validate_config(config)
+
+    assert training["checkpoint_guard_metrics"] == []
+    assert training["checkpoint_guard_relative_tolerance"] == 0.0
+    assert training["checkpoint_guard_correlation_tolerance"] == 0.0
+    assert training["checkpoint_guard_bias_rmse_floor_fraction"] == 0.0
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["mae", ["rmse"], ["mae", "mae"], [1]],
+)
+def test_checkpoint_guard_metric_list_is_strict(value) -> None:
+    config = _raw_no2_config()
+    config["training"]["checkpoint_guard_metrics"] = value
+    with pytest.raises(ValueError, match="checkpoint_guard_metrics"):
+        trainer.ft.validate_config(config)
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "checkpoint_guard_relative_tolerance",
+        "checkpoint_guard_correlation_tolerance",
+        "checkpoint_guard_bias_rmse_floor_fraction",
+    ],
+)
+def test_checkpoint_guard_tolerances_must_be_nonnegative(key: str) -> None:
+    config = _raw_no2_config()
+    config["training"][key] = -0.001
+    with pytest.raises(ValueError, match=key):
+        trainer.ft.validate_config(config)
 
 
 def test_validation_coverage_rejects_missing_extra_and_zero_count_groups() -> None:
