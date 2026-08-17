@@ -4,11 +4,18 @@ Regression coverage shared by legacy and unified temporal Mamba paths."""
 
 from __future__ import annotations
 
+import sysconfig
+from pathlib import Path
+
 import pytest
 import torch
+from finetune import aurora_finetune_utils as ft
 from finetune.flow_refine import AuroraFlowRefine
-from finetune.mamba_temporal import SelectiveSSM
-from finetune.refinement.two_phase import build_two_phase_refiner
+from finetune.mamba_temporal import PackedMambaTemporalAdapter, SelectiveSSM
+from finetune.refinement.two_phase import (
+    build_two_phase_refiner,
+    resolve_temporal_config,
+)
 
 from tests.refinement_fixtures import build_packing, refinement_config
 
@@ -58,6 +65,57 @@ def _unified_model(*, temporal: bool | None):
             lead_times_hours=(12.0, 24.0, 36.0, 48.0, 60.0, 72.0),
         ),
         _unified_config(temporal=temporal),
+    )
+    model.initialize_refiner(model.conditioning_channels())
+    return model
+
+
+PACKED_HEADS = (
+    "diffusion_unet",
+    "diffusion_transformer",
+    "flow_matching_conv_unet",
+    "flow_matching_transformer",
+)
+
+
+def _packed_config(head: str = "diffusion_transformer") -> dict:
+    config = refinement_config(head)
+    config["model"]["refinement"]["deterministic_inference"] = True
+    config["model"]["mamba_temporal"] = {
+        "enabled": True,
+        "mode": "packed_joint",
+        "channels": 4,
+        "state_dim": 2,
+        "num_layers": 1,
+        "conv_kernel": 2,
+        "expansion_factor": 1,
+        "dropout": 0.0,
+        "gated_fusion": True,
+        "gate_init": 0.0,
+        "lead_time_conditioning": True,
+        "mask_conditioning": True,
+        "coordinate_conditioning": True,
+        "causal": True,
+        "learning_rate_multiplier": 2.0,
+        "objective": {
+            "base": "mse",
+            "tendency_weight": 0.0,
+            "structure_weight": 0.0,
+            "extreme_weight": 0.0,
+        },
+    }
+    return config
+
+
+def _packed_model(head: str = "diffusion_transformer"):
+    model = build_two_phase_refiner(
+        None,
+        build_packing(
+            8,
+            8,
+            lead_times_hours=(12.0, 24.0, 36.0),
+        ),
+        _packed_config(head),
     )
     model.initialize_refiner(model.conditioning_channels())
     return model
@@ -377,4 +435,366 @@ def test_selective_scan_bfloat16_forward_backward_is_finite() -> None:
     assert all(
         parameter.grad is None or torch.isfinite(parameter.grad.float()).all()
         for parameter in module.parameters()
+    )
+
+
+_CUDA_TEST_READY = torch.cuda.is_available() and (
+    Path(sysconfig.get_path("include")) / "Python.h"
+).is_file()
+
+
+@pytest.mark.skipif(
+    not _CUDA_TEST_READY, reason="CUDA or Python development headers are unavailable"
+)
+@pytest.mark.parametrize("head", PACKED_HEADS)
+def test_packed_temporal_all_heads_cuda_mixed_precision_forward_backward(
+    head: str,
+) -> None:
+    model = _packed_model(head).cuda()
+    assert model.temporal is not None
+    model.train()
+    with torch.no_grad():
+        model.temporal.core.fusion_gate.fill_(0.1)
+    sequence = torch.randn(
+        2,
+        3,
+        model.packing.num_channels,
+        8,
+        8,
+        device="cuda",
+    )
+    leads = torch.tensor([12.0, 24.0, 36.0], device="cuda")
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        correction = model.temporal.temporal_residual(
+            sequence,
+            lead_hours=leads,
+        )
+        loss = correction.float().square().mean()
+    loss.backward()
+
+    assert torch.isfinite(correction.float()).all()
+    assert any(
+        parameter.grad is not None
+        and torch.isfinite(parameter.grad.float()).all()
+        and torch.count_nonzero(parameter.grad) > 0
+        for parameter in model.temporal.parameters()
+    )
+
+
+def test_temporal_config_flat_nested_and_conflict_contracts() -> None:
+    flat = {
+        "model": {
+            "mamba_temporal_enabled": True,
+            "mamba_temporal_channels": 7,
+            "mamba_temporal_state": 3,
+            "mamba_temporal_layers": 2,
+            "mamba_temporal_conv": 4,
+            "mamba_temporal_expand": 2,
+        }
+    }
+    flat_resolved = resolve_temporal_config(flat)
+    assert flat_resolved["enabled"] is True
+    assert flat_resolved["channels"] == 7
+    assert flat_resolved["state_dim"] == 3
+
+    nested = {
+        "model": {
+            "mamba_temporal": {
+                "enabled": True,
+                "mode": "packed_joint",
+                "channels": 7,
+                "state_dim": 3,
+                "num_layers": 2,
+                "conv_kernel": 4,
+                "expansion_factor": 2,
+                "coordinate_conditioning": True,
+            }
+        }
+    }
+    nested_resolved = resolve_temporal_config(nested)
+    assert nested_resolved["coordinate_conditioning"] is True
+    assert nested_resolved["state"] == flat_resolved["state"]
+    assert nested_resolved["layers"] == flat_resolved["layers"]
+
+    duplicate = {
+        "model": {
+            **flat["model"],
+            "mamba_temporal": {"enabled": True, "channels": 7},
+        }
+    }
+    assert resolve_temporal_config(duplicate)["channels"] == 7
+    duplicate["model"]["mamba_temporal"]["enabled"] = False
+    with pytest.raises(ValueError, match="mamba_temporal_enabled conflicts"):
+        resolve_temporal_config(duplicate)
+    nested["model"]["mamba_temporal"]["unknown_option"] = 1
+    with pytest.raises(ValueError, match="Unknown model.mamba_temporal key"):
+        resolve_temporal_config(nested)
+
+
+@pytest.mark.parametrize("head", PACKED_HEADS)
+def test_packed_joint_all_heads_coordinate_contract_and_identity(head: str) -> None:
+    model = _packed_model(head)
+    assert model.temporal is not None
+    temporal = model.temporal
+    assert temporal.mode == "packed_joint"
+    assert temporal.coordinate_conditioning is True
+    core = temporal.core
+    expected_inputs = model.packing.num_channels * 2 + 2 + 3
+    assert core.encoder[0].in_channels == expected_inputs
+    assert core.coordinate_features.shape == (3, 8, 8)
+    expected_latitude = torch.tensor(model.packing.lat) / 90.0
+    torch.testing.assert_close(
+        core.coordinate_features[0, :, 0], expected_latitude
+    )
+    expected_longitude = torch.deg2rad(torch.tensor(model.packing.lon))
+    torch.testing.assert_close(
+        core.coordinate_features[1, 0], torch.sin(expected_longitude)
+    )
+    torch.testing.assert_close(
+        core.coordinate_features[2, 0], torch.cos(expected_longitude)
+    )
+
+    sequence = torch.randn(2, 3, model.packing.num_channels, 8, 8)
+    leads = torch.tensor([12.0, 24.0, 36.0])
+    correction = temporal.temporal_residual(sequence, lead_hours=leads)
+    assert torch.count_nonzero(correction) == 0
+    torch.testing.assert_close(
+        temporal.corrected_sequence(sequence, lead_hours=leads),
+        sequence,
+        rtol=0.0,
+        atol=0.0,
+    )
+
+
+def test_packed_coordinate_longitude_zero_and_360_are_equivalent() -> None:
+    source = build_packing(2, 2)
+    packing = source.__class__(
+        channels=source.channels,
+        lat=(-30.0, 30.0),
+        lon=(0.0, 360.0),
+        lead_times_hours=source.lead_times_hours,
+        lead_time_scale_hours=source.lead_time_scale_hours,
+        lon_periodic=True,
+    )
+    temporal = PackedMambaTemporalAdapter(
+        packing,
+        channels=4,
+        d_state=2,
+        n_layers=1,
+        d_conv=2,
+        expand=1,
+        mode="packed_joint",
+        coordinate_conditioning=True,
+    )
+    coordinates = temporal.core.coordinate_features
+    torch.testing.assert_close(
+        coordinates[1:, :, 0],
+        coordinates[1:, :, 1],
+        rtol=0.0,
+        atol=2.0e-7,
+    )
+
+
+def test_packed_gate_identity_has_live_first_and_second_step_gradients() -> None:
+    model = _packed_model()
+    assert model.temporal is not None
+    temporal = model.temporal
+    core = temporal.core
+    sequence = torch.randn(2, 3, model.packing.num_channels, 8, 8)
+    leads = torch.tensor([12.0, 24.0, 36.0])
+    target_correction = torch.ones_like(sequence)
+
+    first = temporal.temporal_residual(sequence, lead_hours=leads)
+    assert torch.count_nonzero(first) == 0
+    first_loss = (first - target_correction).square().mean()
+    first_loss.backward()
+    assert core.fusion_gate.grad is not None
+    assert torch.count_nonzero(core.fusion_gate.grad) > 0
+
+    optimizer = torch.optim.SGD(temporal.parameters(), lr=0.1)
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+    second = temporal.temporal_residual(sequence, lead_hours=leads)
+    (second - target_correction).square().mean().backward()
+    assert any(
+        parameter.grad is not None and torch.count_nonzero(parameter.grad) > 0
+        for name, parameter in core.named_parameters()
+        if name != "fusion_gate"
+    )
+
+
+def test_packed_temporal_is_causal_and_validates_sequence_masks() -> None:
+    model = _packed_model()
+    assert model.temporal is not None
+    temporal = model.temporal
+    with torch.no_grad():
+        temporal.core.fusion_gate.fill_(0.5)
+    prefix = torch.randn(1, 2, model.packing.num_channels, 8, 8)
+    first = torch.cat(
+        [prefix, torch.randn(1, 1, model.packing.num_channels, 8, 8)], dim=1
+    )
+    second = first.clone()
+    second[:, 2] += 100.0
+    leads = torch.tensor([12.0, 24.0, 36.0])
+    first_correction = temporal.temporal_residual(first, lead_hours=leads)
+    second_correction = temporal.temporal_residual(second, lead_hours=leads)
+    torch.testing.assert_close(
+        first_correction[:, :2], second_correction[:, :2], rtol=0.0, atol=0.0
+    )
+
+    valid_steps = torch.tensor([[True, True, False]])
+    masked = temporal.temporal_residual(
+        first, lead_hours=leads, valid_step_mask=valid_steps
+    )
+    assert torch.count_nonzero(masked[:, 2]) == 0
+    with pytest.raises(ValueError, match="strictly increasing"):
+        temporal.temporal_residual(
+            first, lead_hours=torch.tensor([12.0, 36.0, 24.0])
+        )
+    with pytest.raises(ValueError, match="contiguous valid prefix"):
+        temporal.temporal_residual(
+            first,
+            lead_hours=leads,
+            valid_step_mask=torch.tensor([[True, False, True]]),
+        )
+
+
+def test_packed_temporal_target_validity_does_not_leak_into_prediction(
+    monkeypatch,
+) -> None:
+    model = _packed_model()
+    assert model.temporal is not None
+    model.train()
+    rollout = torch.randn(3, model.packing.num_channels, 8, 8)
+    target = rollout + 1.0
+    target[0, 0, 0, 0] = rollout[0, 0, 0, 0] + 10.0
+    lead_index = torch.arange(3)
+    lead_hours = torch.tensor([12.0, 24.0, 36.0])
+    conditioning = model.build_conditioning(rollout)
+    seen = []
+    original = model.temporal.temporal_residual
+
+    def capture(sequence, **kwargs):
+        seen.append(
+            (
+                sequence.detach().clone(),
+                kwargs["valid_cell_mask"].detach().clone(),
+                kwargs["valid_step_mask"].detach().clone(),
+            )
+        )
+        return original(sequence, **kwargs)
+
+    monkeypatch.setattr(model.temporal, "temporal_residual", capture)
+    all_valid = torch.ones_like(rollout, dtype=torch.bool)
+    loss_all, _ = model.temporal_training_loss(
+        rollout,
+        target,
+        valid_mask=all_valid,
+        forecast_lead_time=lead_hours,
+        lead_index=lead_index,
+        conditioning=conditioning,
+    )
+    target_nan = target.clone()
+    target_nan[0, 0, 0, 0] = float("nan")
+    target_valid = all_valid.clone()
+    target_valid[0, 0, 0, 0] = False
+    loss_masked, _ = model.temporal_training_loss(
+        rollout,
+        target_nan,
+        valid_mask=target_valid,
+        forecast_lead_time=lead_hours,
+        lead_index=lead_index,
+        conditioning=conditioning,
+    )
+
+    assert len(seen) == 2
+    for first_seen, second_seen in zip(seen[0], seen[1], strict=True):
+        assert torch.equal(first_seen, second_seen)
+    assert not torch.equal(loss_all.detach(), loss_masked.detach())
+
+
+def test_packed_temporal_only_freeze_lr_and_checkpoint_round_trip() -> None:
+    config = _packed_config()
+    config["training"] = {
+        "mamba_temporal_only": True,
+        "optimizer": "adamw",
+        "learning_rate": 1.0e-3,
+    }
+    model = build_two_phase_refiner(
+        None,
+        build_packing(8, 8, lead_times_hours=(12.0, 24.0, 36.0)),
+        config,
+    )
+    model.initialize_refiner(model.conditioning_channels())
+    assert model.temporal is not None
+    summary = ft.configure_trainable_parameters(model, config)
+    temporal_ids = {id(parameter) for parameter in model.temporal.parameters()}
+    trainable_ids = {
+        id(parameter) for parameter in model.parameters() if parameter.requires_grad
+    }
+    assert trainable_ids == temporal_ids
+    assert summary["trainable_parameters"] > 0
+    optimizer = ft.create_optimizer(model, config)
+    assert [group["lr"] for group in optimizer.param_groups] == [2.0e-3]
+
+    with torch.no_grad():
+        model.temporal.core.fusion_gate.fill_(0.25)
+    state = model.state_dict()
+    restored = build_two_phase_refiner(
+        None,
+        build_packing(8, 8, lead_times_hours=(12.0, 24.0, 36.0)),
+        config,
+    )
+    restored.initialize_refiner(restored.conditioning_channels())
+    restored.load_state_dict(state, strict=True)
+    assert restored.temporal is not None
+    sequence = torch.randn(1, 3, model.packing.num_channels, 8, 8)
+    leads = torch.tensor([12.0, 24.0, 36.0])
+    torch.testing.assert_close(
+        restored.temporal.temporal_residual(sequence, lead_hours=leads),
+        model.temporal.temporal_residual(sequence, lead_hours=leads),
+        rtol=0.0,
+        atol=0.0,
+    )
+
+
+def test_temporal_structure_objective_includes_periodic_longitude_seam() -> None:
+    config = _packed_config()
+    config["model"]["mamba_temporal"]["objective"]["structure_weight"] = 1.0
+    regional_packing = build_packing(
+        8, 8, lon_periodic=False, lead_times_hours=(12.0, 24.0)
+    )
+    global_packing = build_packing(
+        8, 8, lon_periodic=True, lead_times_hours=(12.0, 24.0)
+    )
+    regional = build_two_phase_refiner(None, regional_packing, config)
+    global_model = build_two_phase_refiner(None, global_packing, config)
+    regional.initialize_refiner(regional.conditioning_channels())
+    global_model.initialize_refiner(global_model.conditioning_channels())
+    global_model.load_state_dict(regional.state_dict(), strict=True)
+
+    rollout = torch.zeros(2, regional_packing.num_channels, 8, 8)
+    longitude_ramp = torch.arange(8, dtype=rollout.dtype).view(1, 1, 1, 8)
+    target = longitude_ramp.expand_as(rollout).clone()
+    valid = torch.ones_like(rollout, dtype=torch.bool)
+    kwargs = {
+        "valid_mask": valid,
+        "forecast_lead_time": torch.tensor([12.0, 24.0]),
+        "lead_index": torch.tensor([0, 1]),
+    }
+    _, regional_diagnostics = regional.temporal_training_loss(
+        rollout,
+        target,
+        conditioning=regional.build_conditioning(rollout),
+        **kwargs,
+    )
+    _, global_diagnostics = global_model.temporal_training_loss(
+        rollout,
+        target,
+        conditioning=global_model.build_conditioning(rollout),
+        **kwargs,
+    )
+    assert (
+        global_diagnostics["temporal_structure_loss"]
+        > regional_diagnostics["temporal_structure_loss"]
     )

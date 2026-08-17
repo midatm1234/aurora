@@ -52,6 +52,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "MambaTemporalModule",
+    "PackedJointMambaTemporalHead",
     "PackedMambaTemporalAdapter",
     "SelectiveSSM",
     "MambaBlock",
@@ -70,6 +71,7 @@ def _selective_scan_ref(
     B_mat: torch.Tensor,  # (B, S, N)  — input projection
     C_mat: torch.Tensor,  # (B, S, N)  — output projection
     D_skip: torch.Tensor,  # (D,)       — skip connection
+    valid_steps: torch.Tensor | None = None,  # (B, S) — recurrence updates
 ) -> torch.Tensor:
     """Pure-PyTorch selective scan (sequential over the time axis).
 
@@ -95,6 +97,17 @@ def _selective_scan_ref(
     D_skip = D_skip.float()
 
     Bsz, S, Dn = u.shape
+    if valid_steps is not None:
+        if valid_steps.shape != (Bsz, S):
+            raise ValueError(
+                "valid_steps must have shape [batch, lead] matching the "
+                f"selective scan; expected {(Bsz, S)}, got "
+                f"{tuple(valid_steps.shape)}."
+            )
+        if valid_steps.device != u.device:
+            raise ValueError(
+                "valid_steps must be on the same device as the sequence."
+            )
     N = A.shape[1]
 
     # Discretise: dA (B,S,D,N) = exp(delta · A); dB·u (B,S,D,N).
@@ -104,8 +117,14 @@ def _selective_scan_ref(
     h = torch.zeros(Bsz, Dn, N, device=u.device, dtype=u.dtype)
     ys = []
     for s in range(S):
-        h = dA[:, s] * h + dBu[:, s]  # (B,D,N)
+        candidate = dA[:, s] * h + dBu[:, s]  # (B,D,N)
+        if valid_steps is None:
+            h = candidate
+        else:
+            h = torch.where(valid_steps[:, s, None, None], candidate, h)
         y_s = torch.einsum("bdn,bn->bd", h, C_mat[:, s])  # (B,D)
+        if valid_steps is not None:
+            y_s = torch.where(valid_steps[:, s, None], y_s, torch.zeros_like(y_s))
         ys.append(y_s)
     y = torch.stack(ys, dim=1)  # (B,S,D)
     y = y + u * D_skip.view(1, 1, -1)
@@ -154,15 +173,38 @@ class SelectiveSSM(nn.Module):
         self.D = nn.Parameter(torch.ones(self.d_inner))
         self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=False)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Args: x (B, S, d_model). Returns (B, S, d_model)."""
-        B, S, _ = x.shape
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        valid_steps: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Run a causal scan over [batch, lead, feature] tokens."""
+        if x.ndim != 3 or x.shape[-1] != self.d_model:
+            raise ValueError(
+                "SelectiveSSM expects [batch, lead, feature] with feature="
+                f"{self.d_model}, got {tuple(x.shape)}."
+            )
+        batch, steps, _ = x.shape
+        if valid_steps is not None:
+            if valid_steps.shape != (batch, steps):
+                raise ValueError(
+                    "valid_steps must match the SelectiveSSM batch/lead axes; "
+                    f"expected {(batch, steps)}, got {tuple(valid_steps.shape)}."
+                )
+            if valid_steps.device != x.device:
+                raise ValueError(
+                    "valid_steps must be on the same device as the sequence."
+                )
+            valid_steps = valid_steps.to(dtype=torch.bool)
+            x = torch.where(valid_steps.unsqueeze(-1), x, torch.zeros_like(x))
+
         xz = self.in_proj(x)  # (B,S,2*d_inner)
         x_in, z = xz.chunk(2, dim=-1)  # each (B,S,d_inner)
 
         # Causal depthwise temporal conv (truncate the right padding to S).
         xc = x_in.transpose(1, 2)  # (B,d_inner,S)
-        xc = self.conv1d(xc)[..., :S]
+        xc = self.conv1d(xc)[..., :steps]
         x_in = F.silu(xc.transpose(1, 2))  # (B,S,d_inner)
 
         params = self.x_proj(x_in)  # (B,S,dt_rank+2*d_state)
@@ -174,9 +216,22 @@ class SelectiveSSM(nn.Module):
         delta = F.softplus(self.dt_proj(dt))  # (B,S,d_inner)
         A = -torch.exp(self.A_log.float())  # (d_inner,d_state)
 
-        y = _selective_scan_ref(x_in, delta, A, B_mat, C_mat, self.D)
+        y = _selective_scan_ref(
+            x_in,
+            delta,
+            A,
+            B_mat,
+            C_mat,
+            self.D,
+            valid_steps=valid_steps,
+        )
         y = y * F.silu(z)
-        return self.out_proj(y)
+        output = self.out_proj(y)
+        if valid_steps is not None:
+            output = torch.where(
+                valid_steps.unsqueeze(-1), output, torch.zeros_like(output)
+            )
+        return output
 
     def _load_from_state_dict(
         self,
@@ -228,8 +283,13 @@ class MambaBlock(nn.Module):
         self.norm = nn.LayerNorm(d_model)
         self.ssm = SelectiveSSM(d_model, **ssm_kwargs)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x + self.ssm(self.norm(x))
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        valid_steps: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return x + self.ssm(self.norm(x), valid_steps=valid_steps)
 
 
 # ---------------------------------------------------------------------------
@@ -379,6 +439,223 @@ class MambaTemporalModule(nn.Module):
             return head(seq_norm)
 
 
+class PackedJointMambaTemporalHead(nn.Module):
+    """Joint packed-channel temporal corrector with conservative gated fusion.
+
+    Every frame is spatially encoded with all target channels and configured
+    level fields present. Mamba then runs over the lead axis independently at
+    each grid cell. A channel-wise ReZero gate is initialized at (usually) zero,
+    while the decoder remains nonzero, so the first forward is an exact identity
+    and the first backward can immediately train the fusion strength.
+    """
+
+    def __init__(
+        self,
+        packed_channels: int,
+        *,
+        channels: int = 16,
+        d_state: int = 8,
+        n_layers: int = 2,
+        d_conv: int = 3,
+        expand: int = 2,
+        dropout: float = 0.0,
+        lon_periodic: bool = True,
+        gated_fusion: bool = True,
+        gate_init: float = 0.0,
+        lead_time_conditioning: bool = True,
+        mask_conditioning: bool = True,
+        coordinate_conditioning: bool = False,
+        latitude: Sequence[float] = (),
+        longitude: Sequence[float] = (),
+        lead_time_scale_hours: float = 72.0,
+    ) -> None:
+        super().__init__()
+        self.packed_channels = int(packed_channels)
+        self.channels = int(channels)
+        self.gated_fusion = bool(gated_fusion)
+        self.dropout = nn.Dropout(float(dropout))
+        self.lead_time_conditioning = bool(lead_time_conditioning)
+        self.mask_conditioning = bool(mask_conditioning)
+        self.coordinate_conditioning = bool(coordinate_conditioning)
+        self.lead_time_scale_hours = float(lead_time_scale_hours)
+        input_channels = self.packed_channels
+        if self.mask_conditioning:
+            input_channels += self.packed_channels
+        if self.lead_time_conditioning:
+            # Absolute physical lead and the spacing since the previous lead.
+            input_channels += 2
+        if self.coordinate_conditioning:
+            if not latitude or not longitude:
+                raise ValueError(
+                    "coordinate-conditioned packed temporal refinement requires "
+                    "non-empty FieldPacking latitude and longitude coordinates."
+                )
+            latitude_tensor = torch.as_tensor(latitude, dtype=torch.float32)
+            longitude_tensor = torch.as_tensor(longitude, dtype=torch.float32)
+            if not bool(torch.isfinite(latitude_tensor).all()) or not bool(
+                torch.isfinite(longitude_tensor).all()
+            ):
+                raise ValueError(
+                    "Packed temporal latitude/longitude coordinates must be finite."
+                )
+            if bool((latitude_tensor.abs() > 90.0).any()):
+                raise ValueError(
+                    "Packed temporal latitude coordinates must lie in [-90, 90]."
+                )
+            latitude_grid = (latitude_tensor / 90.0)[:, None].expand(
+                latitude_tensor.numel(), longitude_tensor.numel()
+            )
+            longitude_radians = torch.deg2rad(longitude_tensor)
+            sin_longitude = torch.sin(longitude_radians)[None, :].expand_as(
+                latitude_grid
+            )
+            cos_longitude = torch.cos(longitude_radians)[None, :].expand_as(
+                latitude_grid
+            )
+            coordinate_features = torch.stack(
+                (latitude_grid, sin_longitude, cos_longitude), dim=0
+            )
+            input_channels += 3
+        else:
+            coordinate_features = torch.empty(0, dtype=torch.float32)
+        self.register_buffer(
+            "coordinate_features", coordinate_features, persistent=False
+        )
+        groups = max(
+            group
+            for group in range(1, min(8, self.channels) + 1)
+            if self.channels % group == 0
+        )
+        self.encoder = nn.Sequential(
+            PeriodicConv2d(
+                input_channels,
+                self.channels,
+                3,
+                lon_periodic=lon_periodic,
+            ),
+            nn.GroupNorm(groups, self.channels),
+            nn.SiLU(),
+        )
+        self.blocks = nn.ModuleList(
+            MambaBlock(
+                self.channels,
+                d_state=d_state,
+                d_conv=d_conv,
+                expand=expand,
+            )
+            for _ in range(max(1, int(n_layers)))
+        )
+        # Keep this projection nonzero: with an exact-zero fusion gate the
+        # first backward trains the gate, and subsequent steps reach the core.
+        self.decoder = nn.Conv2d(self.channels, self.packed_channels, 1)
+        if self.gated_fusion:
+            self.fusion_gate = nn.Parameter(
+                torch.full((self.packed_channels,), float(gate_init))
+            )
+        else:
+            self.register_parameter("fusion_gate", None)
+            nn.init.zeros_(self.decoder.weight)
+            nn.init.zeros_(self.decoder.bias)
+
+    @property
+    def fusion_strength(self) -> torch.Tensor:
+        """Bounded channel-wise correction strength used for deployment."""
+        if self.fusion_gate is None:
+            return torch.ones_like(self.decoder.bias)
+        return torch.tanh(self.fusion_gate)
+
+    def forward(
+        self,
+        sequence: torch.Tensor,
+        *,
+        lead_hours: torch.Tensor | None,
+        valid_cell_mask: torch.Tensor,
+        valid_step_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return a joint correction for validated [B,S,C,H,W] fields."""
+        batch, steps, channels, height, width = sequence.shape
+        clean = torch.where(
+            valid_cell_mask,
+            sequence,
+            torch.zeros_like(sequence),
+        )
+        encoder_parts = [clean]
+        if self.mask_conditioning:
+            encoder_parts.append(valid_cell_mask.to(dtype=sequence.dtype))
+        if self.lead_time_conditioning:
+            if lead_hours is None:
+                raise ValueError(
+                    "packed_joint temporal lead conditioning requires lead_hours."
+                )
+            spacing = torch.empty_like(lead_hours)
+            spacing[:, 0] = lead_hours[:, 0]
+            if steps > 1:
+                spacing[:, 1:] = lead_hours[:, 1:] - lead_hours[:, :-1]
+            scale = self.lead_time_scale_hours
+            lead_features = torch.stack(
+                (lead_hours / scale, spacing / scale),
+                dim=2,
+            )
+            lead_features = lead_features.to(dtype=sequence.dtype)
+            lead_features = lead_features[:, :, :, None, None].expand(
+                batch, steps, 2, height, width
+            )
+            encoder_parts.append(lead_features)
+
+        if self.coordinate_conditioning:
+            if tuple(self.coordinate_features.shape[1:]) != (height, width):
+                raise ValueError(
+                    "Packed temporal coordinate shape mismatch: FieldPacking "
+                    f"coordinates describe {tuple(self.coordinate_features.shape[1:])}, "
+                    f"but sequence uses {(height, width)}."
+                )
+            coordinates = self.coordinate_features.to(
+                device=sequence.device, dtype=sequence.dtype
+            ).view(1, 1, 3, height, width)
+            encoder_parts.append(
+                coordinates.expand(batch, steps, 3, height, width)
+            )
+
+        frames = torch.cat(encoder_parts, dim=2).reshape(
+            batch * steps, -1, height, width
+        )
+        features = self.encoder(frames)
+        latent = features.shape[1]
+        tokens = (
+            self.dropout(features).reshape(batch, steps, latent, height, width)
+            .permute(0, 3, 4, 1, 2)
+            .reshape(batch * height * width, steps, latent)
+        )
+        pixel_valid = (
+            valid_cell_mask.any(dim=2)
+            & valid_step_mask[:, :, None, None]
+        )
+        token_valid = (
+            pixel_valid.permute(0, 2, 3, 1)
+            .reshape(batch * height * width, steps)
+        )
+        for block in self.blocks:
+            tokens = block(tokens, valid_steps=token_valid)
+        features = (
+            tokens.reshape(batch, height, width, steps, latent)
+            .permute(0, 3, 4, 1, 2)
+            .reshape(batch * steps, latent, height, width)
+        )
+        raw = self.decoder(features).reshape(
+            batch, steps, channels, height, width
+        )
+        correction = raw * self.fusion_strength.view(1, 1, channels, 1, 1)
+        output_valid = (
+            valid_cell_mask
+            & valid_step_mask[:, :, None, None, None]
+        )
+        return torch.where(
+            output_valid,
+            correction,
+            torch.zeros_like(correction),
+        )
+
+
 class PackedMambaTemporalAdapter(nn.Module):
     """Apply :class:`MambaTemporalModule` to a canonical packed field sequence.
 
@@ -398,46 +675,245 @@ class PackedMambaTemporalAdapter(nn.Module):
         n_layers: int = 2,
         d_conv: int = 3,
         expand: int = 2,
+        dropout: float = 0.0,
+        mode: str = "per_variable",
+        gated_fusion: bool = False,
+        gate_init: float = 0.0,
+        lead_time_conditioning: bool = False,
+        mask_conditioning: bool = False,
+        coordinate_conditioning: bool = False,
+        causal: bool = True,
     ) -> None:
         super().__init__()
         self.packing = packing
-        surf_vars = list(
-            dict.fromkeys(spec.aurora_name for spec in packing.channels if spec.kind == "surf")
-        )
-        atmos_vars = list(
-            dict.fromkeys(spec.aurora_name for spec in packing.channels if spec.kind == "atmos")
-        )
-        self.core = MambaTemporalModule(
-            surf_vars=surf_vars,
-            atmos_vars=atmos_vars,
-            channels=channels,
-            d_state=d_state,
-            n_layers=n_layers,
-            d_conv=d_conv,
-            expand=expand,
-            lon_periodic=packing.lon_periodic,
-        )
+        self.mode = str(mode).strip().lower()
+        self.lead_time_conditioning = bool(lead_time_conditioning)
+        self.mask_conditioning = bool(mask_conditioning)
+        self.coordinate_conditioning = bool(coordinate_conditioning)
+        self.causal = bool(causal)
+        if self.mode not in {"per_variable", "packed_joint"}:
+            raise ValueError(
+                "PackedMambaTemporalAdapter mode must be 'per_variable' or "
+                f"'packed_joint', got {mode!r}."
+            )
+        if not self.causal:
+            raise ValueError(
+                "Non-causal temporal refinement is unsupported for rollout inference."
+            )
+        if self.mode == "per_variable":
+            surf_vars = list(
+                dict.fromkeys(
+                    spec.aurora_name
+                    for spec in packing.channels
+                    if spec.kind == "surf"
+                )
+            )
+            atmos_vars = list(
+                dict.fromkeys(
+                    spec.aurora_name
+                    for spec in packing.channels
+                    if spec.kind == "atmos"
+                )
+            )
+            self.core: MambaTemporalModule | PackedJointMambaTemporalHead = (
+                MambaTemporalModule(
+                    surf_vars=surf_vars,
+                    atmos_vars=atmos_vars,
+                    channels=channels,
+                    d_state=d_state,
+                    n_layers=n_layers,
+                    d_conv=d_conv,
+                    expand=expand,
+                    lon_periodic=packing.lon_periodic,
+                )
+            )
+        else:
+            self.core = PackedJointMambaTemporalHead(
+                packing.num_channels,
+                channels=channels,
+                d_state=d_state,
+                n_layers=n_layers,
+                d_conv=d_conv,
+                expand=expand,
+                dropout=dropout,
+                lon_periodic=packing.lon_periodic,
+                gated_fusion=gated_fusion,
+                gate_init=gate_init,
+                lead_time_conditioning=self.lead_time_conditioning,
+                mask_conditioning=self.mask_conditioning,
+                coordinate_conditioning=self.coordinate_conditioning,
+                latitude=packing.lat,
+                longitude=packing.lon,
+                lead_time_scale_hours=packing.lead_time_scale_hours,
+            )
 
-    def _validate_sequence(self, sequence: torch.Tensor) -> tuple[int, int, int, int, int]:
+    def _validate_sequence(
+        self,
+        sequence: torch.Tensor,
+    ) -> tuple[int, int, int, int, int]:
         if sequence.ndim != 5:
             raise ValueError(
                 "Packed temporal sequence must have shape [batch, lead, channel, "
                 f"latitude, longitude], got {tuple(sequence.shape)}."
             )
+        if not sequence.is_floating_point():
+            raise ValueError(
+                "Packed temporal sequence must use a floating dtype, "
+                f"got {sequence.dtype}."
+            )
         batch, steps, channels, height, width = sequence.shape
-        if steps < 1:
-            raise ValueError("Packed temporal sequence lead dimension must be >= 1, got 0.")
+        if batch < 1 or steps < 1 or height < 1 or width < 1:
+            raise ValueError(
+                "Packed temporal sequence batch, lead, latitude and longitude "
+                f"dimensions must be positive, got {tuple(sequence.shape)}."
+            )
         if channels != self.packing.num_channels:
             raise ValueError(
                 "Packed temporal sequence channel dimension mismatch: expected "
-                f"FieldPacking.num_channels={self.packing.num_channels}, got {channels}."
+                f"FieldPacking.num_channels={self.packing.num_channels}, got "
+                f"{channels}."
             )
         return batch, steps, channels, height, width
 
-    def temporal_residual(self, sequence: torch.Tensor) -> torch.Tensor:
-        """Return a correction for ``[B, S, C, H, W]`` normalized fields."""
+    def _resolve_masks(
+        self,
+        sequence: torch.Tensor,
+        *,
+        valid_cell_mask: torch.Tensor | None,
+        valid_step_mask: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         batch, steps, channels, height, width = self._validate_sequence(sequence)
-        flat = sequence.reshape(batch * steps, channels, height, width)
+        finite = torch.isfinite(sequence)
+        if valid_cell_mask is None:
+            cell_mask = finite
+        else:
+            if valid_cell_mask.device != sequence.device:
+                raise ValueError(
+                    "valid_cell_mask must be on the same device as sequence."
+                )
+            if valid_cell_mask.dtype != torch.bool:
+                raise ValueError("valid_cell_mask must have boolean dtype.")
+            allowed = {
+                (batch, steps, channels, height, width),
+                (batch, steps, 1, height, width),
+            }
+            if tuple(valid_cell_mask.shape) not in allowed:
+                raise ValueError(
+                    "valid_cell_mask must have shape [B,S,C,H,W] or "
+                    f"[B,S,1,H,W]; expected one of {sorted(allowed)}, got "
+                    f"{tuple(valid_cell_mask.shape)}."
+                )
+            cell_mask = valid_cell_mask.expand_as(sequence) & finite
+
+        inferred_steps = cell_mask.flatten(2).any(dim=2)
+        if valid_step_mask is None:
+            step_mask = inferred_steps
+        else:
+            if valid_step_mask.shape != (batch, steps):
+                raise ValueError(
+                    "valid_step_mask must have shape [batch, lead]; expected "
+                    f"{(batch, steps)}, got {tuple(valid_step_mask.shape)}."
+                )
+            if valid_step_mask.device != sequence.device:
+                raise ValueError(
+                    "valid_step_mask must be on the same device as sequence."
+                )
+            if valid_step_mask.dtype != torch.bool:
+                raise ValueError("valid_step_mask must have boolean dtype.")
+            step_mask = valid_step_mask & inferred_steps
+        if not bool(step_mask.any(dim=1).all()):
+            raise ValueError(
+                "Every packed temporal sequence must contain at least one valid lead."
+            )
+        if steps > 1 and bool((~step_mask[:, :-1] & step_mask[:, 1:]).any()):
+            raise ValueError(
+                "valid_step_mask must be a contiguous valid prefix; a padded or "
+                "missing step cannot be followed by a valid future step."
+            )
+        return cell_mask, step_mask
+
+    def _resolve_lead_hours(
+        self,
+        lead_hours: torch.Tensor | None,
+        *,
+        batch: int,
+        steps: int,
+        device: torch.device,
+        valid_step_mask: torch.Tensor,
+        validate_order: bool,
+    ) -> torch.Tensor | None:
+        if lead_hours is None:
+            if self.mode == "packed_joint" and self.lead_time_conditioning:
+                raise ValueError(
+                    "packed_joint temporal lead conditioning requires lead_hours "
+                    "with shape [batch, lead]."
+                )
+            return None
+        lead = torch.as_tensor(
+            lead_hours,
+            device=device,
+            dtype=torch.float32,
+        )
+        if lead.ndim == 1 and lead.numel() == steps:
+            lead = lead.view(1, steps).expand(batch, steps)
+        elif lead.ndim == 1 and steps == 1 and lead.numel() == batch:
+            lead = lead.view(batch, 1)
+        elif lead.shape != (batch, steps):
+            raise ValueError(
+                "lead_hours must have shape [lead] or [batch, lead]; expected "
+                f"{(steps,)} or {(batch, steps)}, got {tuple(lead.shape)}."
+            )
+        selected = lead[valid_step_mask]
+        if not bool(torch.isfinite(selected).all()) or bool((selected <= 0).any()):
+            raise ValueError(
+                "Every valid temporal lead hour must be finite and positive."
+            )
+        if validate_order and steps > 1:
+            adjacent = valid_step_mask[:, 1:] & valid_step_mask[:, :-1]
+            differences = lead[:, 1:] - lead[:, :-1]
+            if bool((differences[adjacent] <= 0).any()):
+                raise ValueError(
+                    "lead_hours must be strictly increasing over valid temporal "
+                    "steps for causal rollout refinement."
+                )
+        return torch.where(valid_step_mask, lead, torch.zeros_like(lead))
+
+    def temporal_residual(
+        self,
+        sequence: torch.Tensor,
+        *,
+        lead_hours: torch.Tensor | None = None,
+        valid_cell_mask: torch.Tensor | None = None,
+        valid_step_mask: torch.Tensor | None = None,
+        validate_lead_order: bool = True,
+    ) -> torch.Tensor:
+        """Return a correction for canonical [B,S,C,H,W] normalized fields."""
+        batch, steps, channels, height, width = self._validate_sequence(sequence)
+        cell_mask, step_mask = self._resolve_masks(
+            sequence,
+            valid_cell_mask=valid_cell_mask,
+            valid_step_mask=valid_step_mask,
+        )
+        leads = self._resolve_lead_hours(
+            lead_hours,
+            batch=batch,
+            steps=steps,
+            device=sequence.device,
+            valid_step_mask=step_mask,
+            validate_order=validate_lead_order,
+        )
+        clean = torch.where(cell_mask, sequence, torch.zeros_like(sequence))
+        if self.mode == "packed_joint":
+            assert isinstance(self.core, PackedJointMambaTemporalHead)
+            return self.core(
+                clean,
+                lead_hours=leads,
+                valid_cell_mask=cell_mask,
+                valid_step_mask=step_mask,
+            )
+
+        assert isinstance(self.core, MambaTemporalModule)
+        flat = clean.reshape(batch * steps, channels, height, width)
         fields = self.packing.unpack(flat)
         corrections: dict[str, torch.Tensor] = {}
         for name in self.packing.variables:
@@ -445,37 +921,63 @@ class PackedMambaTemporalAdapter(nn.Module):
             kind = channel_specs[0].kind
             values = fields[name]
             if kind == "surf":
-                variable_sequence = values.reshape(batch, steps, height, width)
+                variable_sequence = values.reshape(
+                    batch, steps, height, width
+                )
             else:
                 levels = len(channel_specs)
-                variable_sequence = values.reshape(batch, steps, levels, height, width)
-            correction = self.core.temporal_residual(variable_sequence, name, kind)
-            corrections[name] = correction.reshape(batch * steps, *correction.shape[2:])
-        packed = self.packing.pack(corrections)
-        return packed.reshape(batch, steps, channels, height, width)
+                variable_sequence = values.reshape(
+                    batch, steps, levels, height, width
+                )
+            correction = self.core.temporal_residual(
+                variable_sequence,
+                name,
+                kind,
+            )
+            corrections[name] = correction.reshape(
+                batch * steps, *correction.shape[2:]
+            )
+        packed = self.packing.pack(corrections).reshape(
+            batch, steps, channels, height, width
+        )
+        output_valid = cell_mask & step_mask[:, :, None, None, None]
+        return torch.where(output_valid, packed, torch.zeros_like(packed))
 
-    def corrected_sequence(self, sequence: torch.Tensor) -> torch.Tensor:
+    def corrected_sequence(
+        self,
+        sequence: torch.Tensor,
+        **kwargs,
+    ) -> torch.Tensor:
         """Return the causally corrected normalized sequence."""
-        clean = torch.nan_to_num(sequence, nan=0.0, posinf=0.0, neginf=0.0)
-        corrected = clean + self.temporal_residual(clean)
-        # Missing cells stay missing for downstream masks/serialization rather
-        # than being silently replaced by the normalization mean.
+        correction = self.temporal_residual(sequence, **kwargs)
+        clean = torch.nan_to_num(
+            sequence,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+        corrected = clean + correction
         return torch.where(torch.isfinite(sequence), corrected, sequence)
 
-    def correct_causal(self, history: torch.Tensor) -> torch.Tensor:
+    def correct_causal(
+        self,
+        history: torch.Tensor,
+        **kwargs,
+    ) -> torch.Tensor:
         """Correct and return only the latest frame from a causal history."""
-        return self.corrected_sequence(history)[:, -1]
+        return self.corrected_sequence(history, **kwargs)[:, -1]
 
-    def causal_residual(self, history: torch.Tensor) -> torch.Tensor:
-        """Return only the temporal correction for the latest history frame.
-
-        Keeping the correction separate lets residual refiners add it directly
-        to their sampled residual. In particular, a zero-initialized Mamba then
-        preserves the spatial refiner output without an avoidable
-        ``(rollout + residual) - rollout`` round trip.
-        """
+    def causal_residual(
+        self,
+        history: torch.Tensor,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Return only the temporal correction for the latest causal frame."""
         self._validate_sequence(history)
-        clean = torch.nan_to_num(history, nan=0.0, posinf=0.0, neginf=0.0)
-        correction = self.temporal_residual(clean)[:, -1]
+        correction = self.temporal_residual(history, **kwargs)[:, -1]
         latest_is_finite = torch.isfinite(history[:, -1])
-        return torch.where(latest_is_finite, correction, torch.zeros_like(correction))
+        return torch.where(
+            latest_is_finite,
+            correction,
+            torch.zeros_like(correction),
+        )

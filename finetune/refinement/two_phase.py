@@ -42,6 +42,7 @@ Aurora's per-rollout-step packed fields and forecast lead times.
 
 from __future__ import annotations
 
+import math
 import warnings
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
@@ -72,42 +73,302 @@ __all__ = [
 
 _TEMPORAL_DEFAULTS: dict[str, Any] = {
     "enabled": False,
+    "mode": "per_variable",
     "channels": 16,
     "state": 8,
     "layers": 2,
     "conv": 3,
     "expand": 2,
+    "dropout": 0.0,
+    "gated_fusion": False,
+    "gate_init": 0.0,
+    "lead_time_conditioning": False,
+    "mask_conditioning": False,
+    "coordinate_conditioning": False,
+    "causal": True,
+    "learning_rate_multiplier": 1.0,
 }
+_TEMPORAL_OBJECTIVE_DEFAULTS: dict[str, Any] = {
+    "base": "mse",
+    "huber_delta": 1.0,
+    "charbonnier_epsilon": 1.0e-3,
+    "tendency_weight": 0.0,
+    "structure_weight": 0.0,
+    "extreme_weight": 0.0,
+    "extreme_quantile": 0.95,
+}
+_TEMPORAL_LEGACY_KEYS = {
+    "enabled": "mamba_temporal_enabled",
+    "channels": "mamba_temporal_channels",
+    "state": "mamba_temporal_state",
+    "layers": "mamba_temporal_layers",
+    "conv": "mamba_temporal_conv",
+    "expand": "mamba_temporal_expand",
+}
+_TEMPORAL_READABLE_ALIASES = {
+    "state_dim": "state",
+    "num_layers": "layers",
+    "conv_kernel": "conv",
+    "expansion_factor": "expand",
+}
+_TEMPORAL_NESTED_KEYS = frozenset(
+    {
+        *_TEMPORAL_DEFAULTS,
+        *_TEMPORAL_READABLE_ALIASES,
+        "objective",
+    }
+)
+_TEMPORAL_OBJECTIVE_KEYS = frozenset(_TEMPORAL_OBJECTIVE_DEFAULTS)
+
+
+def _finite_temporal_number(
+    value: Any,
+    field_name: str,
+    *,
+    minimum: float | None = None,
+    maximum: float | None = None,
+) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} must be a finite number.") from exc
+    if not math.isfinite(number):
+        raise ValueError(f"{field_name} must be finite, got {value!r}.")
+    if minimum is not None and number < minimum:
+        raise ValueError(f"{field_name} must be >= {minimum}, got {number}.")
+    if maximum is not None and number > maximum:
+        raise ValueError(f"{field_name} must be <= {maximum}, got {number}.")
+    return number
+
+
+def _positive_temporal_int(value: Any, field_name: str) -> int:
+    """Resolve an integer architecture width without silently truncating."""
+    if isinstance(value, bool):
+        raise ValueError(f"{field_name} must be a positive integer, got {value!r}.")
+    try:
+        integer = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} must be a positive integer.") from exc
+    if integer < 1 or isinstance(value, float) and not value.is_integer():
+        raise ValueError(
+            f"{field_name} must be a positive integer, got {value!r}."
+        )
+    return integer
 
 
 def resolve_temporal_config(
     config: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
-    """Resolve the legacy-compatible top-level temporal Mamba settings."""
+    """Resolve the nested temporal schema and translate legacy flat keys."""
     model = (config or {}).get("model", {})
-    enabled = model.get("mamba_temporal_enabled", _TEMPORAL_DEFAULTS["enabled"])
+    if not isinstance(model, Mapping):
+        raise ValueError("model must be a mapping for temporal configuration.")
+    nested = model.get("mamba_temporal", {})
+    if nested is None:
+        nested = {}
+    if not isinstance(nested, Mapping):
+        raise ValueError(
+            "model.mamba_temporal must be a mapping, "
+            f"got {type(nested).__name__}."
+        )
+    unknown = sorted(set(nested) - _TEMPORAL_NESTED_KEYS)
+    if unknown:
+        raise ValueError(
+            "Unknown model.mamba_temporal key(s) "
+            f"{unknown}; supported keys are {sorted(_TEMPORAL_NESTED_KEYS)}."
+        )
+
+    readable_by_short = {
+        short: readable for readable, short in _TEMPORAL_READABLE_ALIASES.items()
+    }
+    for short, legacy_key in _TEMPORAL_LEGACY_KEYS.items():
+        nested_keys = (short, readable_by_short.get(short))
+        for nested_key in nested_keys:
+            if nested_key is None:
+                continue
+            if (
+                legacy_key in model
+                and nested_key in nested
+                and model[legacy_key] != nested[nested_key]
+            ):
+                raise ValueError(
+                    f"model.{legacy_key} conflicts with "
+                    f"model.mamba_temporal.{nested_key}."
+                )
+
+    resolved = dict(_TEMPORAL_DEFAULTS)
+    for name, legacy_key in _TEMPORAL_LEGACY_KEYS.items():
+        if legacy_key in model:
+            resolved[name] = model[legacy_key]
+    for key in _TEMPORAL_DEFAULTS:
+        if key in nested:
+            resolved[key] = nested[key]
+    for readable, short in _TEMPORAL_READABLE_ALIASES.items():
+        if readable in nested and short in nested and nested[readable] != nested[short]:
+            raise ValueError(
+                f"model.mamba_temporal.{readable} conflicts with legacy alias "
+                f"model.mamba_temporal.{short}."
+            )
+        if readable in nested:
+            resolved[short] = nested[readable]
+
+    enabled = resolved["enabled"]
     if not isinstance(enabled, bool):
         raise ValueError(
-            "model.mamba_temporal_enabled must be true or false, "
+            "model.mamba_temporal.enabled must be true or false, "
             f"got {enabled!r}."
         )
+    mode = str(resolved["mode"]).strip().lower()
+    if mode not in {"per_variable", "packed_joint"}:
+        raise ValueError(
+            "model.mamba_temporal.mode must be 'per_variable' or "
+            f"'packed_joint', got {resolved['mode']!r}."
+        )
+    for key in (
+        "lead_time_conditioning",
+        "mask_conditioning",
+        "coordinate_conditioning",
+        "causal",
+        "gated_fusion",
+    ):
+        if key not in nested and mode == "packed_joint" and key in {
+            "lead_time_conditioning",
+            "mask_conditioning",
+            "gated_fusion",
+        }:
+            resolved[key] = True
+        if not isinstance(resolved[key], bool):
+            raise ValueError(
+                f"model.mamba_temporal.{key} must be true or false, "
+                f"got {resolved[key]!r}."
+            )
+    if not resolved["causal"]:
+        raise ValueError(
+            "model.mamba_temporal.causal=false is unsupported; temporal "
+            "refinement must not use future forecast leads."
+        )
+
+    gate_init = _finite_temporal_number(
+        resolved["gate_init"],
+        "model.mamba_temporal.gate_init",
+        minimum=0.0,
+    )
+    if gate_init >= 1.0:
+        raise ValueError(
+            "model.mamba_temporal.gate_init must be less than 1."
+        )
+    dropout = _finite_temporal_number(
+        resolved["dropout"],
+        "model.mamba_temporal.dropout",
+        minimum=0.0,
+    )
+    if dropout >= 1.0:
+        raise ValueError("model.mamba_temporal.dropout must be less than 1.")
+    learning_rate_multiplier = _finite_temporal_number(
+        resolved["learning_rate_multiplier"],
+        "model.mamba_temporal.learning_rate_multiplier",
+        minimum=0.0,
+    )
+    if learning_rate_multiplier <= 0.0:
+        raise ValueError(
+            "model.mamba_temporal.learning_rate_multiplier must be greater than 0."
+        )
+
+    objective_raw = nested.get("objective", {})
+    if objective_raw is None:
+        objective_raw = {}
+    if not isinstance(objective_raw, Mapping):
+        raise ValueError("model.mamba_temporal.objective must be a mapping.")
+    objective_unknown = sorted(set(objective_raw) - _TEMPORAL_OBJECTIVE_KEYS)
+    if objective_unknown:
+        raise ValueError(
+            "Unknown model.mamba_temporal.objective key(s) "
+            f"{objective_unknown}; supported keys are "
+            f"{sorted(_TEMPORAL_OBJECTIVE_KEYS)}."
+        )
+    objective = dict(_TEMPORAL_OBJECTIVE_DEFAULTS)
+    objective.update(objective_raw)
+    objective["base"] = str(objective["base"]).strip().lower()
+    if objective["base"] not in {"mse", "huber", "charbonnier"}:
+        raise ValueError(
+            "model.mamba_temporal.objective.base must be mse, huber, or "
+            f"charbonnier, got {objective['base']!r}."
+        )
+    for key in (
+        "huber_delta",
+        "charbonnier_epsilon",
+        "tendency_weight",
+        "structure_weight",
+        "extreme_weight",
+    ):
+        minimum = 1.0e-12 if key in {"huber_delta", "charbonnier_epsilon"} else 0.0
+        objective[key] = _finite_temporal_number(
+            objective[key],
+            f"model.mamba_temporal.objective.{key}",
+            minimum=minimum,
+        )
+    objective["extreme_quantile"] = _finite_temporal_number(
+        objective["extreme_quantile"],
+        "model.mamba_temporal.objective.extreme_quantile",
+        minimum=0.0,
+        maximum=1.0,
+    )
+    if not 0.0 < objective["extreme_quantile"] < 1.0:
+        raise ValueError(
+            "model.mamba_temporal.objective.extreme_quantile must be in (0, 1)."
+        )
+
+    if objective["extreme_weight"] > 0.0:
+        raise ValueError(
+            "model.mamba_temporal.objective.extreme_weight requires persisted "
+            "training-split tail thresholds, which are not yet available; keep "
+            "it at 0.0 to avoid deriving thresholds from evaluation targets."
+        )
+
+    def _architecture_label(short: str, readable: str) -> str:
+        legacy = _TEMPORAL_LEGACY_KEYS[short]
+        if legacy in model and short not in nested and readable not in nested:
+            return f"model.{legacy}"
+        return f"model.mamba_temporal.{readable}"
+
+    channels = _positive_temporal_int(
+        resolved["channels"], _architecture_label("channels", "channels")
+    )
+    state = _positive_temporal_int(
+        resolved["state"], _architecture_label("state", "state_dim")
+    )
+    layers = _positive_temporal_int(
+        resolved["layers"], _architecture_label("layers", "num_layers")
+    )
+    conv = _positive_temporal_int(
+        resolved["conv"], _architecture_label("conv", "conv_kernel")
+    )
+    expand = _positive_temporal_int(
+        resolved["expand"], _architecture_label("expand", "expansion_factor")
+    )
     return {
         "enabled": enabled,
-        "channels": int(
-            model.get("mamba_temporal_channels", _TEMPORAL_DEFAULTS["channels"])
-        ),
-        "state": int(
-            model.get("mamba_temporal_state", _TEMPORAL_DEFAULTS["state"])
-        ),
-        "layers": int(
-            model.get("mamba_temporal_layers", _TEMPORAL_DEFAULTS["layers"])
-        ),
-        "conv": int(
-            model.get("mamba_temporal_conv", _TEMPORAL_DEFAULTS["conv"])
-        ),
-        "expand": int(
-            model.get("mamba_temporal_expand", _TEMPORAL_DEFAULTS["expand"])
-        ),
+        "mode": mode,
+        "channels": channels,
+        "state": state,
+        "state_dim": state,
+        "layers": layers,
+        "num_layers": layers,
+        "conv": conv,
+        "conv_kernel": conv,
+        "expand": expand,
+        "expansion_factor": expand,
+        "dropout": dropout,
+        "gated_fusion": bool(resolved["gated_fusion"]),
+        "gate_init": gate_init,
+        "lead_time_conditioning": bool(resolved["lead_time_conditioning"]),
+        "mask_conditioning": bool(resolved["mask_conditioning"]),
+        "coordinate_conditioning": bool(resolved["coordinate_conditioning"]),
+        "causal": True,
+        "learning_rate_multiplier": learning_rate_multiplier,
+        "objective": objective,
+        "semantic_version": 1 if mode == "per_variable" else 2,
+        "scan_backend": "selective_scan_ref_v1",
     }
 
 
@@ -208,6 +469,18 @@ class AuroraTwoPhaseRefiner(nn.Module):
         temporal_layers: int = 2,
         temporal_conv: int = 3,
         temporal_expand: int = 2,
+        temporal_mode: str = "per_variable",
+        temporal_dropout: float = 0.0,
+        temporal_gated_fusion: bool = False,
+        temporal_gate_init: float = 0.0,
+        temporal_lead_time_conditioning: bool = False,
+        temporal_mask_conditioning: bool = False,
+        temporal_coordinate_conditioning: bool = False,
+        temporal_causal: bool = True,
+        temporal_learning_rate_multiplier: float = 1.0,
+        temporal_objective: Mapping[str, Any] | None = None,
+        temporal_semantic_version: int = 1,
+        temporal_scan_backend: str = "selective_scan_ref_v1",
     ) -> None:
         super().__init__()
         self.aurora = aurora if aurora is not None else nn.Identity()
@@ -221,13 +494,36 @@ class AuroraTwoPhaseRefiner(nn.Module):
             dict.fromkeys(str(name) for name in conditioning_static_names)
         )
         self.refiner: ResidualRefiner | None = None
+        objective = dict(_TEMPORAL_OBJECTIVE_DEFAULTS)
+        if temporal_objective is not None:
+            objective.update(temporal_objective)
         self.temporal_config = {
             "enabled": bool(temporal_enabled),
+            "mode": str(temporal_mode).strip().lower(),
             "channels": int(temporal_channels),
             "state": int(temporal_state),
+            "state_dim": int(temporal_state),
             "layers": int(temporal_layers),
+            "num_layers": int(temporal_layers),
             "conv": int(temporal_conv),
+            "conv_kernel": int(temporal_conv),
             "expand": int(temporal_expand),
+            "expansion_factor": int(temporal_expand),
+            "dropout": float(temporal_dropout),
+            "gated_fusion": bool(temporal_gated_fusion),
+            "gate_init": float(temporal_gate_init),
+            "lead_time_conditioning": bool(temporal_lead_time_conditioning),
+            "mask_conditioning": bool(temporal_mask_conditioning),
+            "coordinate_conditioning": bool(
+                temporal_coordinate_conditioning
+            ),
+            "causal": bool(temporal_causal),
+            "learning_rate_multiplier": float(
+                temporal_learning_rate_multiplier
+            ),
+            "objective": objective,
+            "semantic_version": int(temporal_semantic_version),
+            "scan_backend": str(temporal_scan_backend),
         }
         if self.temporal_config["enabled"] and not self.refinement_config.is_active:
             raise ValueError(
@@ -241,6 +537,25 @@ class AuroraTwoPhaseRefiner(nn.Module):
                     f"model.mamba_temporal_{temporal_field} must be a positive integer, "
                     f"got {value!r}."
                 )
+        if self.temporal_config["mode"] not in {"per_variable", "packed_joint"}:
+            raise ValueError(
+                "model.mamba_temporal.mode must be per_variable or packed_joint."
+            )
+        if not self.temporal_config["causal"]:
+            raise ValueError(
+                "model.mamba_temporal.causal=false is unsupported for rollout inference."
+            )
+        dropout = self.temporal_config["dropout"]
+        if not math.isfinite(dropout) or not 0.0 <= dropout < 1.0:
+            raise ValueError("model.mamba_temporal.dropout must be in [0, 1).")
+        gate_init = self.temporal_config["gate_init"]
+        if not math.isfinite(gate_init) or not 0.0 <= gate_init < 1.0:
+            raise ValueError("model.mamba_temporal.gate_init must be in [0, 1).")
+        lr_multiplier = self.temporal_config["learning_rate_multiplier"]
+        if not math.isfinite(lr_multiplier) or lr_multiplier <= 0.0:
+            raise ValueError(
+                "model.mamba_temporal.learning_rate_multiplier must be positive."
+            )
         self.temporal: PackedMambaTemporalAdapter | None = None
         if self.temporal_config["enabled"]:
             self.temporal = PackedMambaTemporalAdapter(
@@ -250,6 +565,16 @@ class AuroraTwoPhaseRefiner(nn.Module):
                 n_layers=self.temporal_config["layers"],
                 d_conv=self.temporal_config["conv"],
                 expand=self.temporal_config["expand"],
+                dropout=self.temporal_config["dropout"],
+                mode=self.temporal_config["mode"],
+                gated_fusion=self.temporal_config["gated_fusion"],
+                gate_init=self.temporal_config["gate_init"],
+                lead_time_conditioning=self.temporal_config["lead_time_conditioning"],
+                mask_conditioning=self.temporal_config["mask_conditioning"],
+                coordinate_conditioning=self.temporal_config[
+                    "coordinate_conditioning"
+                ],
+                causal=self.temporal_config["causal"],
             )
         self._area_weight_cache: dict[tuple[int, torch.device, torch.dtype], torch.Tensor] = {}
         self._apply_aurora_freeze()
@@ -790,7 +1115,20 @@ class AuroraTwoPhaseRefiner(nn.Module):
             valid_mask.to(dtype=torch.bool), lead_index, field_name="valid_mask"
         )
         finite_base = torch.isfinite(sequence)
-        corrected = self.temporal.corrected_sequence(sequence)
+        input_step_mask = finite_base.flatten(2).any(dim=2)
+        lead_sequence = (
+            self.lead_major_to_sequence(
+                forecast_lead_time, lead_index, field_name="forecast_lead_time"
+            )
+            if forecast_lead_time is not None
+            else None
+        )
+        corrected = self.temporal.corrected_sequence(
+            sequence,
+            lead_hours=lead_sequence,
+            valid_cell_mask=finite_base,
+            valid_step_mask=input_step_mask,
+        )
         valid = (
             mask_sequence
             & finite_base
@@ -810,7 +1148,26 @@ class AuroraTwoPhaseRefiner(nn.Module):
             target_sequence.float(),
             torch.zeros_like(target_sequence, dtype=torch.float32),
         )
-        squared = (safe_corrected - safe_target).pow(2)
+        objective = self.temporal_config["objective"]
+
+        def _point_error(
+            prediction: torch.Tensor, truth: torch.Tensor
+        ) -> torch.Tensor:
+            difference = prediction - truth
+            base_name = objective["base"]
+            if base_name == "mse":
+                return difference.square()
+            if base_name == "huber":
+                return F.huber_loss(
+                    prediction,
+                    truth,
+                    reduction="none",
+                    delta=objective["huber_delta"],
+                )
+            epsilon = objective["charbonnier_epsilon"]
+            return torch.sqrt(difference.square() + epsilon**2) - epsilon
+
+        point_error = _point_error(safe_corrected, safe_target)
 
         diagnostics: dict[str, torch.Tensor] = {}
         variable_losses: list[torch.Tensor] = []
@@ -821,7 +1178,7 @@ class AuroraTwoPhaseRefiner(nn.Module):
                 if spec.aurora_name == name
             ]
             var_valid = valid[:, :, indices]
-            var_squared = squared[:, :, indices]
+            var_squared = point_error[:, :, indices]
             var_count = var_valid.sum()
             if int(var_count.detach()) == 0:
                 continue
@@ -838,8 +1195,125 @@ class AuroraTwoPhaseRefiner(nn.Module):
             )
         # Match the legacy flow-Mamba contract: each target variable contributes
         # equally, regardless of how many atmospheric levels it packs.
-        loss = torch.stack(variable_losses).mean()
-        return loss, diagnostics
+        base_loss = torch.stack(variable_losses).mean()
+        diagnostics["temporal_base_loss"] = base_loss
+
+        def _variable_equal_mean(
+            error: torch.Tensor, error_mask: torch.Tensor
+        ) -> torch.Tensor:
+            terms: list[torch.Tensor] = []
+            for variable_name in self.packing.variables:
+                channel_indices = [
+                    spec.index
+                    for spec in self.packing.channels
+                    if spec.aurora_name == variable_name
+                ]
+                selected_mask = error_mask[:, :, channel_indices]
+                count = selected_mask.sum()
+                if int(count.detach()) == 0:
+                    continue
+                selected_error = error[:, :, channel_indices]
+                terms.append(
+                    (
+                        selected_error
+                        * selected_mask.to(dtype=selected_error.dtype)
+                    ).sum()
+                    / count.to(dtype=selected_error.dtype)
+                )
+            if not terms:
+                return error.sum() * 0.0
+            return torch.stack(terms).mean()
+
+        total_loss = base_loss
+        tendency_weight = float(objective["tendency_weight"])
+        if tendency_weight > 0.0:
+            tendency_mask = valid[:, 1:] & valid[:, :-1]
+            predicted_tendency = safe_corrected[:, 1:] - safe_corrected[:, :-1]
+            target_tendency = safe_target[:, 1:] - safe_target[:, :-1]
+            tendency_loss = _variable_equal_mean(
+                _point_error(predicted_tendency, target_tendency),
+                tendency_mask,
+            )
+            diagnostics["temporal_tendency_loss"] = tendency_loss
+            total_loss = total_loss + tendency_weight * tendency_loss
+
+        structure_weight = float(objective["structure_weight"])
+        if structure_weight > 0.0:
+            structure_terms: list[torch.Tensor] = []
+            if safe_corrected.shape[-2] > 1:
+                latitude_mask = valid[..., 1:, :] & valid[..., :-1, :]
+                structure_terms.append(
+                    _variable_equal_mean(
+                        _point_error(
+                            safe_corrected[..., 1:, :] - safe_corrected[..., :-1, :],
+                            safe_target[..., 1:, :] - safe_target[..., :-1, :],
+                        ),
+                        latitude_mask,
+                    )
+                )
+            if safe_corrected.shape[-1] > 1:
+                longitude_mask = valid[..., 1:] & valid[..., :-1]
+                structure_terms.append(
+                    _variable_equal_mean(
+                        _point_error(
+                            safe_corrected[..., 1:] - safe_corrected[..., :-1],
+                            safe_target[..., 1:] - safe_target[..., :-1],
+                        ),
+                        longitude_mask,
+                    )
+                )
+                if self.packing.lon_periodic:
+                    longitude_seam_mask = valid[..., :1] & valid[..., -1:]
+                    structure_terms.append(
+                        _variable_equal_mean(
+                            _point_error(
+                                safe_corrected[..., :1] - safe_corrected[..., -1:],
+                                safe_target[..., :1] - safe_target[..., -1:],
+                            ),
+                            longitude_seam_mask,
+                        )
+                    )
+            structure_loss = (
+                torch.stack(structure_terms).mean()
+                if structure_terms
+                else base_loss * 0.0
+            )
+            diagnostics["temporal_structure_loss"] = structure_loss
+            total_loss = total_loss + structure_weight * structure_loss
+
+        extreme_weight = float(objective["extreme_weight"])
+        if extreme_weight > 0.0:
+            extreme_terms: list[torch.Tensor] = []
+            quantile = float(objective["extreme_quantile"])
+            for variable_name in self.packing.variables:
+                channel_indices = [
+                    spec.index
+                    for spec in self.packing.channels
+                    if spec.aurora_name == variable_name
+                ]
+                variable_valid = valid[:, :, channel_indices]
+                if not bool(variable_valid.any()):
+                    continue
+                variable_target = safe_target[:, :, channel_indices]
+                threshold = torch.quantile(
+                    variable_target[variable_valid], quantile
+                )
+                tail_mask = variable_valid & (variable_target >= threshold)
+                variable_error = point_error[:, :, channel_indices]
+                extreme_terms.append(
+                    (variable_error * tail_mask.to(variable_error.dtype)).sum()
+                    / tail_mask.sum().to(variable_error.dtype)
+                )
+            extreme_loss = (
+                torch.stack(extreme_terms).mean()
+                if extreme_terms
+                else base_loss * 0.0
+            )
+            diagnostics["temporal_extreme_loss"] = extreme_loss
+            total_loss = total_loss + extreme_weight * extreme_loss
+
+        diagnostics["temporal_total_loss"] = total_loss
+        return total_loss, diagnostics
 
     # ------------------------------------------------------------------
     # Inference
@@ -861,12 +1335,20 @@ class AuroraTwoPhaseRefiner(nn.Module):
         chunk_size: int | None = None,
         num_steps: int | None = None,
         temporal_history: list[torch.Tensor] | None = None,
+        temporal_lead_history: list[torch.Tensor] | None = None,
+        temporal_control: str = "on",
     ) -> TwoPhaseStepOutput:
         """Deterministic plus (optionally) refined ensemble inference.
 
         The deterministic rollout is always returned unchanged; refinement only
         adds fields.
         """
+        temporal_control = str(temporal_control).strip().lower()
+        if temporal_control not in {"on", "off", "shuffled"}:
+            raise ValueError(
+                "temporal_control must be on, off, or shuffled; "
+                f"got {temporal_control!r}."
+            )
         rollout = rollout_normalized.float()
         out = TwoPhaseStepOutput(
             deterministic_normalized=rollout,
@@ -1038,6 +1520,11 @@ class AuroraTwoPhaseRefiner(nn.Module):
         member_normalized = rollout.unsqueeze(1) + member_corrections
         if self.temporal is not None:
             history = temporal_history if temporal_history is not None else []
+            lead_history = (
+                temporal_lead_history
+                if temporal_lead_history is not None
+                else []
+            )
             expected_shape = tuple(member_normalized.shape)
             for history_index, frame in enumerate(history):
                 if tuple(frame.shape) != expected_shape:
@@ -1058,16 +1545,99 @@ class AuroraTwoPhaseRefiner(nn.Module):
                         f"{history_index}: expected {member_normalized.dtype}, "
                         f"got {frame.dtype}."
                     )
+            if temporal_lead_history is not None and len(lead_history) != len(history):
+                raise ValueError(
+                    "temporal_lead_history length must match temporal_history; "
+                    f"got {len(lead_history)} and {len(history)}."
+                )
+            if (
+                history
+                and self.temporal.lead_time_conditioning
+                and temporal_lead_history is None
+            ):
+                raise ValueError(
+                    "Packed temporal lead conditioning requires one physical lead "
+                    "entry for every temporal history frame."
+                )
             current_raw = member_normalized.detach()
             temporal_sequence = torch.stack([*history, current_raw], dim=2)
             batch_size, members, steps, channels, height, width = (
                 temporal_sequence.shape
             )
-            temporal_correction = self.temporal.causal_residual(
-                temporal_sequence.reshape(
-                    batch_size * members, steps, channels, height, width
+            temporal_leads: torch.Tensor | None = None
+            if forecast_lead_time is not None and (
+                temporal_lead_history is not None
+                or self.temporal.lead_time_conditioning
+            ):
+                resolved_leads = [
+                    self._forecast_lead_vector(
+                        entry,
+                        batch_size=batch_size,
+                        device=member_normalized.device,
+                    )
+                    for entry in lead_history
+                ]
+                if any(entry is None for entry in resolved_leads):
+                    raise ValueError("Temporal lead history contains a missing lead.")
+                lead_frames = [
+                    entry for entry in resolved_leads if entry is not None
+                ]
+                lead_frames.append(forecast_lead_time)
+                lead_sequence = torch.stack(lead_frames, dim=1)
+                temporal_leads = (
+                    lead_sequence[:, None, :]
+                    .expand(batch_size, members, steps)
+                    .reshape(batch_size * members, steps)
                 )
-            ).reshape(batch_size, members, channels, height, width).float()
+            elif lead_history or self.temporal.lead_time_conditioning:
+                raise ValueError(
+                    "Physical forecast leads are required by temporal lead "
+                    "conditioning and its history contract."
+                )
+
+            validate_lead_order = True
+            if temporal_control == "shuffled":
+                # Deterministic negative control: permute only the available past;
+                # the current lead remains last, so no future state is introduced.
+                order = torch.cat(
+                    (
+                        torch.arange(
+                            steps - 2,
+                            -1,
+                            -1,
+                            device=temporal_sequence.device,
+                        ),
+                        torch.tensor(
+                            [steps - 1], device=temporal_sequence.device
+                        ),
+                    )
+                )
+                temporal_sequence = temporal_sequence.index_select(2, order)
+                if temporal_leads is not None:
+                    temporal_leads = (
+                        temporal_leads.reshape(batch_size, members, steps)
+                        .index_select(2, order)
+                        .reshape(batch_size * members, steps)
+                    )
+                validate_lead_order = False
+
+            flat_sequence = temporal_sequence.reshape(
+                batch_size * members, steps, channels, height, width
+            )
+            temporal_input_mask = torch.isfinite(flat_sequence)
+            temporal_step_mask = temporal_input_mask.flatten(2).any(dim=2)
+            if temporal_control == "off":
+                temporal_correction = torch.zeros_like(member_normalized)
+            else:
+                temporal_correction = self.temporal.causal_residual(
+                    flat_sequence,
+                    lead_hours=temporal_leads,
+                    valid_cell_mask=temporal_input_mask,
+                    valid_step_mask=temporal_step_mask,
+                    validate_lead_order=validate_lead_order,
+                ).reshape(
+                    batch_size, members, channels, height, width
+                ).float()
             member_normalized = member_normalized.float() + temporal_correction
             member_corrections = member_normalized - rollout.unsqueeze(1)
             # Temporal post-processing is itself a residual correction. Guard
@@ -1086,6 +1656,12 @@ class AuroraTwoPhaseRefiner(nn.Module):
                 - conditional_mean_correction.unsqueeze(1)
             )
             history.append(current_raw)
+            if temporal_lead_history is not None:
+                if forecast_lead_time is None:
+                    raise ValueError(
+                        "temporal_lead_history requires forecast_lead_time."
+                    )
+                lead_history.append(forecast_lead_time.detach())
             if self.refinement_config.deterministic_inference:
                 conditional_mean_correction = member_corrections[:, 0]
                 member_innovations = (
@@ -1352,6 +1928,12 @@ class AuroraTwoPhaseRefiner(nn.Module):
         postprocessing; the caller decides whether the deterministic or the
         refined state continues the rollout.
         """
+        if not self.training and self.temporal is not None:
+            raise RuntimeError(
+                "AuroraTwoPhaseRefiner.forward cannot apply enabled temporal Mamba "
+                "to a single forecast step. Use the sequence-aware rollout path "
+                "with chronological temporal_history instead."
+            )
         pred = self.aurora(batch)
         if self.training or not self.refinement_config.is_active:
             return pred
@@ -1428,4 +2010,18 @@ def build_two_phase_refiner(
         temporal_layers=temporal["layers"],
         temporal_conv=temporal["conv"],
         temporal_expand=temporal["expand"],
+        temporal_mode=temporal["mode"],
+        temporal_dropout=temporal["dropout"],
+        temporal_gated_fusion=temporal["gated_fusion"],
+        temporal_gate_init=temporal["gate_init"],
+        temporal_lead_time_conditioning=temporal["lead_time_conditioning"],
+        temporal_mask_conditioning=temporal["mask_conditioning"],
+        temporal_coordinate_conditioning=temporal[
+            "coordinate_conditioning"
+        ],
+        temporal_causal=temporal["causal"],
+        temporal_learning_rate_multiplier=temporal["learning_rate_multiplier"],
+        temporal_objective=temporal["objective"],
+        temporal_semantic_version=temporal["semantic_version"],
+        temporal_scan_backend=temporal["scan_backend"],
     )

@@ -247,30 +247,49 @@ def validate_unified_checkpoint_contract(
                 f"got {current_value!r}."
             )
 
-    saved_temporal = checkpoint.get("resolved_temporal_config")
-    if not isinstance(saved_temporal, dict):
-        saved_temporal = resolve_temporal_config(saved_config)
+    saved_temporal = resolve_temporal_config(saved_config)
+    serialized_temporal = checkpoint.get("resolved_temporal_config")
+    if isinstance(serialized_temporal, dict):
+        # Hydrate newly added fields from legacy-safe raw-config defaults while
+        # retaining every field explicitly serialized by newer checkpoints.
+        saved_temporal.update(serialized_temporal)
     current_temporal = resolve_temporal_config(config)
     temporal_fields = {
         "enabled": "model.mamba_temporal_enabled",
+        "mode": "model.mamba_temporal.mode",
         "channels": "model.mamba_temporal_channels",
         "state": "model.mamba_temporal_state",
         "layers": "model.mamba_temporal_layers",
         "conv": "model.mamba_temporal_conv",
         "expand": "model.mamba_temporal_expand",
+        "dropout": "model.mamba_temporal.dropout",
+        "gated_fusion": "model.mamba_temporal.gated_fusion",
+        "gate_init": "model.mamba_temporal.gate_init",
+        "lead_time_conditioning": "model.mamba_temporal.lead_time_conditioning",
+        "mask_conditioning": "model.mamba_temporal.mask_conditioning",
+        "coordinate_conditioning": "model.mamba_temporal.coordinate_conditioning",
+        "causal": "model.mamba_temporal.causal",
+        "learning_rate_multiplier": (
+            "model.mamba_temporal.learning_rate_multiplier"
+        ),
+        "objective": "model.mamba_temporal.objective",
+        "semantic_version": "model.mamba_temporal.semantic_version",
+        "scan_backend": "model.mamba_temporal.scan_backend",
     }
+    temporal_both_enabled = bool(saved_temporal["enabled"]) and bool(
+        current_temporal["enabled"]
+    )
+    compared_temporal_fields = (
+        tuple(temporal_fields)
+        if temporal_both_enabled
+        else ("enabled",)
+    )
     temporal_mismatches = [
         key
-        for key in temporal_fields
+        for key in compared_temporal_fields
         if saved_temporal.get(key) != current_temporal.get(key)
     ]
-    enabling_or_disabling = (
-        bool(saved_temporal.get("enabled", False))
-        != bool(current_temporal.get("enabled", False))
-    )
-    if temporal_mismatches and not (
-        allow_temporal_migration and enabling_or_disabling
-    ):
+    if temporal_mismatches and not allow_temporal_migration:
         details = "; ".join(
             f"{temporal_fields[key]}: saved={saved_temporal.get(key)!r}, "
             f"current={current_temporal.get(key)!r}"
@@ -533,6 +552,8 @@ def load_model_from_checkpoint(
     mmap: bool = False,
     autocast: bool | None = None,
     require_validated: bool | None = None,
+    flow_sampling_steps_override: int | None = None,
+    allow_unsafe_temporal_sampling_override: bool = False,
 ) -> tuple[torch.nn.Module, dict[str, Any]]:
     """Rebuild and strictly load a combined checkpoint.
 
@@ -584,6 +605,78 @@ def load_model_from_checkpoint(
         resolved_specs,
         require_validated=require_validated,
     )
+    from finetune.flow_refine import AuroraFlowRefine
+
+    if not isinstance(allow_unsafe_temporal_sampling_override, bool):
+        raise ValueError(
+            "allow_unsafe_temporal_sampling_override must be true or false."
+        )
+    if isinstance(model, AuroraFlowRefine):
+        def _positive_sampling_steps(value: Any, source: str) -> int:
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(
+                    f"{source} must be a positive integer, got {value!r}."
+                )
+            return int(value)
+
+        saved_steps_raw = checkpoint.get("flow_sampling_steps")
+        if saved_steps_raw is None:
+            if bool(getattr(model, "has_temporal", False)):
+                raise ValueError(
+                    "Legacy AuroraFlowRefine checkpoint has active temporal Mamba "
+                    "but is missing top-level flow_sampling_steps; the exact "
+                    "training-time flow integration trajectory cannot be proven. "
+                    "Refusing to fall back to runtime configuration because that "
+                    "would change the spatial-frame distribution seen by temporal "
+                    "Mamba. Use a checkpoint that persisted flow_sampling_steps."
+                )
+            resolved_sampling_steps = _positive_sampling_steps(
+                model.sampling_steps, "configured flow sampling steps"
+            )
+            sampling_steps_source = "config"
+        else:
+            resolved_sampling_steps = _positive_sampling_steps(
+                saved_steps_raw, "checkpoint flow_sampling_steps"
+            )
+            sampling_steps_source = "checkpoint"
+
+        if flow_sampling_steps_override is not None:
+            override_steps = _positive_sampling_steps(
+                flow_sampling_steps_override, "flow_sampling_steps_override"
+            )
+            if (
+                bool(getattr(model, "has_temporal", False))
+                and override_steps != resolved_sampling_steps
+                and not allow_unsafe_temporal_sampling_override
+            ):
+                raise ValueError(
+                    "A legacy temporal-Mamba checkpoint must use its persisted "
+                    f"flow sampling steps ({resolved_sampling_steps}); requested "
+                    f"override={override_steps} changes the spatial-frame "
+                    "distribution seen by temporal Mamba. Set "
+                    "allow_unsafe_temporal_sampling_override=true only for an "
+                    "explicit diagnostic ablation."
+                )
+            if override_steps != resolved_sampling_steps and bool(
+                getattr(model, "has_temporal", False)
+            ):
+                warnings.warn(
+                    "UNSAFE diagnostic: overriding temporal-Mamba checkpoint flow "
+                    f"sampling steps {resolved_sampling_steps} -> {override_steps}.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+            resolved_sampling_steps = override_steps
+            sampling_steps_source = "explicit_override"
+        model.sampling_steps = resolved_sampling_steps
+        model.flow_sampling_steps_source = sampling_steps_source
+        checkpoint["resolved_flow_sampling_steps"] = resolved_sampling_steps
+        checkpoint["flow_sampling_steps_source"] = sampling_steps_source
+    elif flow_sampling_steps_override is not None:
+        raise ValueError(
+            "flow_sampling_steps_override applies only to legacy AuroraFlowRefine "
+            "checkpoints."
+        )
     state = checkpoint.get("model_state_dict")
     if not isinstance(state, dict):
         raise ValueError(f"Checkpoint {path} is missing model_state_dict.")

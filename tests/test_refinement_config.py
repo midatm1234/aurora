@@ -5,18 +5,169 @@ Configuration contract for the unified stochastic residual refinement.
 
 from __future__ import annotations
 
+import threading
 import warnings
+from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 
+import finetune.refinement.config as refinement_config
 import pytest
 import yaml
+from finetune import aurora_finetune_utils as ft
 from finetune.refinement.config import (
     REFINEMENT_TYPES,
     ConfigValidationError,
     resolve_performance_config,
     resolve_refinement_config,
 )
+from finetune.refinement.two_phase import resolve_temporal_config
 
 EXAMPLE_DIR = "finetune/examples/stochastic_refinement"
+
+
+# --------------------------------------------------------------------------
+# Warning deduplication
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _reset_config_warning_registry(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Keep warning-deduplication state and torchrun rank isolated per test."""
+    monkeypatch.delenv("RANK", raising=False)
+    with refinement_config._CONFIG_WARNING_LOCK:
+        refinement_config._CONFIG_WARNINGS_EMITTED.clear()
+    yield
+    with refinement_config._CONFIG_WARNING_LOCK:
+        refinement_config._CONFIG_WARNINGS_EMITTED.clear()
+
+
+def test_warn_config_once_deduplicates_across_call_sites() -> None:
+    message = "cross-call-site configuration advisory"
+
+    def first_call_site() -> None:
+        refinement_config._warn_config_once(message)
+
+    def second_call_site() -> None:
+        refinement_config._warn_config_once(message)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        first_call_site()
+        second_call_site()
+
+    assert [str(item.message) for item in caught] == [message]
+
+
+def test_resolver_deduplicates_ignored_diffusion_warning_across_call_sites() -> None:
+    raw = {
+        "model": {
+            "refinement": {
+                "enabled": True,
+                "type": "flow_matching_conv_unet",
+                "diffusion": {"inference_steps": 25},
+            }
+        }
+    }
+    expected = "refinement.diffusion settings are ignored for " "type='flow_matching_conv_unet'."
+
+    def first_resolver_call_site() -> None:
+        resolve_refinement_config(raw)
+
+    def second_resolver_call_site() -> None:
+        resolve_refinement_config(raw)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        first_resolver_call_site()
+        second_resolver_call_site()
+
+    assert [str(item.message) for item in caught] == [expected]
+    assert caught[0].category is RuntimeWarning
+
+
+def test_warn_config_once_is_thread_safe() -> None:
+    worker_count = 16
+    barrier = threading.Barrier(worker_count)
+    message = "concurrent configuration advisory"
+
+    def emit_from_worker(_index: int) -> None:
+        barrier.wait(timeout=10.0)
+        refinement_config._warn_config_once(message)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            list(executor.map(emit_from_worker, range(worker_count)))
+
+    assert [str(item.message) for item in caught] == [message]
+
+
+@pytest.mark.parametrize(
+    ("rank", "should_emit"),
+    [
+        pytest.param(None, True, id="unset"),
+        pytest.param("", True, id="blank"),
+        pytest.param("invalid", True, id="invalid"),
+        pytest.param("0", True, id="zero"),
+        pytest.param("1", False, id="positive-nonzero"),
+        pytest.param("-1", False, id="negative-nonzero"),
+    ],
+)
+def test_warn_config_once_honours_rank_zero_only(
+    monkeypatch: pytest.MonkeyPatch,
+    rank: str | None,
+    should_emit: bool,
+) -> None:
+    if rank is None:
+        monkeypatch.delenv("RANK", raising=False)
+    else:
+        monkeypatch.setenv("RANK", rank)
+    message = "rank-aware configuration advisory"
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        refinement_config._warn_config_once(message)
+
+    assert [str(item.message) for item in caught] == ([message] if should_emit else [])
+    with refinement_config._CONFIG_WARNING_LOCK:
+        assert ((RuntimeWarning, message) in refinement_config._CONFIG_WARNINGS_EMITTED) is (
+            should_emit
+        )
+
+
+def test_warn_config_once_preserves_distinct_messages() -> None:
+    messages = ["first configuration advisory", "second configuration advisory"]
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        refinement_config._warn_config_once(messages[0])
+        refinement_config._warn_config_once(messages[1])
+        refinement_config._warn_config_once(messages[0])
+
+    assert [str(item.message) for item in caught] == messages
+
+
+def test_warning_as_error_does_not_consume_config_warning_registry() -> None:
+    message = "retryable configuration advisory"
+    key = (RuntimeWarning, message)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        with pytest.raises(RuntimeWarning, match="retryable configuration advisory"):
+            refinement_config._warn_config_once(message)
+
+    with refinement_config._CONFIG_WARNING_LOCK:
+        assert key not in refinement_config._CONFIG_WARNINGS_EMITTED
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        refinement_config._warn_config_once(message)
+    assert [str(item.message) for item in caught] == [message]
+
+    with warnings.catch_warnings(record=True) as caught_again:
+        warnings.simplefilter("always")
+        refinement_config._warn_config_once(message)
+    assert caught_again == []
 
 
 # --------------------------------------------------------------------------
@@ -417,6 +568,7 @@ def test_unknown_coordinate_conditioning_key_is_rejected() -> None:
         "aurora_NO2_finetune_US-WEST_3day_lead_config.yaml",
         "aurora_NO2_finetune_US-WEST_3day_lead_diffusion_config.yaml",
         "aurora_NO2_finetune_US-WEST_3day_lead_diffusion_transformer_config.yaml",
+        "aurora_NO2_finetune_US-WEST_3day_lead_flow_matching_config.yaml",
         "aurora_NO2_finetune_US-WEST_3day_lead_flow_matching_transformer_config.yaml",
     ],
 )
@@ -592,7 +744,7 @@ def test_precision_change_warns() -> None:
     "name,expected",
     [
         ("aurora_O3_global_rollout_no_refinement.yaml", "none"),
-        ("aurora_O3_global_flow_matching_unet.yaml", "flow_matching_unet"),
+        ("aurora_O3_global_flow_matching_unet.yaml", "flow_matching_conv_unet"),
         ("aurora_O3_global_flow_matching_conv_unet.yaml", "flow_matching_conv_unet"),
         ("aurora_O3_global_flow_matching_transformer.yaml", "flow_matching_transformer"),
         ("aurora_O3_global_diffusion_unet.yaml", "diffusion_unet"),
@@ -612,6 +764,7 @@ def test_example_configurations(name: str, expected: str) -> None:
 
 
 _SAFE_UNIFIED_EXAMPLES = (
+    "aurora_O3_global_flow_matching_unet.yaml",
     "aurora_O3_global_flow_matching_conv_unet.yaml",
     "aurora_O3_global_flow_matching_transformer.yaml",
     "aurora_O3_global_diffusion_unet.yaml",
@@ -624,8 +777,10 @@ def test_unified_examples_ship_a_safe_correction_product(name: str) -> None:
     path = f"{EXAMPLE_DIR}/{name}"
     with open(path) as handle:
         text = handle.read()
-    raw = yaml.safe_load(text)
-    cfg = resolve_refinement_config(raw)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        raw = ft.load_config(path)
+        cfg = resolve_refinement_config(raw)
 
     # The equations are intentionally present beside the machine-readable flag:
     # this prevents an ambiguous `residual` label from reversing the correction.
@@ -649,8 +804,24 @@ def test_unified_examples_ship_a_safe_correction_product(name: str) -> None:
 
     model = raw["model"]
     training = raw["training"]
-    assert model["mamba_temporal_enabled"] is False
-    assert training["mamba_temporal_weight"] == 0.0
+    assert not any(key.startswith("mamba_temporal_") for key in model)
+    temporal_raw = model["mamba_temporal"]
+    assert temporal_raw["enabled"] is False
+    assert temporal_raw["mode"] == "packed_joint"
+    assert temporal_raw["gated_fusion"] is True
+    assert temporal_raw["lead_time_conditioning"] is True
+    assert temporal_raw["mask_conditioning"] is True
+    assert temporal_raw["coordinate_conditioning"] is True
+    assert temporal_raw["causal"] is True
+    temporal = resolve_temporal_config(raw)
+    assert temporal["enabled"] is False
+    assert temporal["mode"] == "packed_joint"
+    assert temporal["gated_fusion"] is True
+    assert temporal["lead_time_conditioning"] is True
+    assert temporal["mask_conditioning"] is True
+    assert temporal["coordinate_conditioning"] is True
+    assert temporal["causal"] is True
+    assert training["mamba_temporal_weight"] == 1.0
     assert training["validation_refinement_ensemble_size"] == 1
     assert training["validation_source"] == "train_tail"
     assert training["checkpoint_metric"] == "mean_physical_rmse_ratio"
@@ -667,6 +838,12 @@ def test_unified_examples_ship_a_safe_correction_product(name: str) -> None:
         assert zero_initialized is True
         assert cfg.diffusion.prediction_type == "sample"
         assert not (zero_initialized and cfg.diffusion.prediction_type == "epsilon")
+
+    raw["model"]["mamba_temporal"]["enabled"] = True
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        ft.validate_config(raw, path)
+    assert resolve_temporal_config(raw)["enabled"] is True
 
 
 def test_unified_head_warns_when_legacy_auxiliary_block_is_enabled() -> None:

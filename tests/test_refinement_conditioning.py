@@ -96,6 +96,46 @@ def _model(*, temporal: bool = False):
     return model
 
 
+def test_eval_forward_rejects_enabled_temporal_single_step() -> None:
+    model = _model(temporal=True).eval()
+
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            "cannot apply enabled temporal Mamba to a single forecast step.*"
+            "sequence-aware rollout path.*chronological temporal_history"
+        ),
+    ):
+        model(_batch(batch_size=1), forecast_lead_time_hours=24.0)
+
+
+def test_eval_forward_without_temporal_preserves_refinement_path(monkeypatch) -> None:
+    model = _model(temporal=False).eval()
+    batch = _batch(batch_size=1)
+    sentinel = object()
+    seen = {}
+
+    def _refine(wrapper, pred, **kwargs):
+        seen.update(wrapper=wrapper, pred=pred, kwargs=kwargs)
+        return sentinel
+
+    monkeypatch.setattr(
+        "finetune.refinement.integration.refine_batch_prediction", _refine
+    )
+
+    result = model(batch, forecast_lead_time_hours=24.0)
+
+    assert result is sentinel
+    assert seen["wrapper"] is model
+    assert seen["pred"] is batch
+    assert seen["kwargs"] == {
+        "aurora_input_batch": batch,
+        "forecast_lead_time_hours": 24.0,
+        "ensemble_size": 1,
+        "seed": model.refinement_config.seed,
+    }
+
+
 def _coordinate_model(packing=None):
     config = refinement_config(
         "diffusion_transformer",
@@ -263,7 +303,12 @@ def test_diffusion_transformer_temporal_loss_reuses_exact_full_conditioning(
     )
     assert seen and torch.equal(seen[0], out.conditioning)
     assert torch.isfinite(temporal_loss)
-    assert set(metrics) == {"temporal_loss/gtco3", "temporal_loss/go3"}
+    assert set(metrics) == {
+        "temporal_loss/gtco3",
+        "temporal_loss/go3",
+        "temporal_base_loss",
+        "temporal_total_loss",
+    }
     temporal_loss.backward()
     assert model.temporal is not None
     assert any(

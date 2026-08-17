@@ -11,8 +11,19 @@ INPUT_NB="aurora_finetune_rollout.ipynb"
 OUTPUT_NB="outputs/O3_US-WEST_3day_lead_v3/aurora_finetune_rollout_executed_$(date +%Y%m%d_%H%M%S).ipynb"
 LOG_FILE="outputs/O3_US-WEST_3day_lead_v3/training_$(date +%Y%m%d_%H%M%S).log"
 
+CASE_OUTPUT_DIR="outputs/O3_US-WEST_3day_lead_v3"
+CASE_CHECKPOINT_DIR="outputs/checkpoints/O3_US-WEST_3day_lead_v3"
+if [[ "${AURORA_ALLOW_CASE_OVERWRITE:-0}" != "1" ]] && \
+   { [[ -e "$CASE_OUTPUT_DIR" ]] || [[ -e "$CASE_CHECKPOINT_DIR" ]]; }; then
+    echo "Refusing to reuse existing O3 v3 artifacts:"
+    echo "  $CASE_OUTPUT_DIR"
+    echo "  $CASE_CHECKPOINT_DIR"
+    echo "Set AURORA_ALLOW_CASE_OVERWRITE=1 only for an intentional rerun."
+    exit 2
+fi
+
 # Create output directory
-mkdir -p outputs/O3_US-WEST_3day_lead_v3
+mkdir -p "$CASE_OUTPUT_DIR"
 
 echo "=========================================="
 echo "Aurora O3 v3 Fine-Tuning (papermill)"

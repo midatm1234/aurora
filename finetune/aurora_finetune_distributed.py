@@ -1164,7 +1164,22 @@ def _worker(rank: int, world_size: int, local_gpu: int, cfg: dict):
                 "tensors (only the conv-refine heads will train)"
             )
 
-    named_trainable = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
+    named_trainable = [
+        (name, param)
+        for name, param in model.named_parameters()
+        if param.requires_grad
+    ]
+    from finetune.refinement.two_phase import resolve_temporal_config
+
+    temporal_lr_multiplier = resolve_temporal_config(cfg)[
+        "learning_rate_multiplier"
+    ]
+    temporal_module = getattr(inner, "temporal", None)
+    temporal_param_ids = (
+        {id(param) for param in temporal_module.parameters()}
+        if temporal_module is not None
+        else set()
+    )
 
     if scale_aware_enabled:
         with torch.no_grad():
@@ -1201,6 +1216,16 @@ def _worker(rank: int, world_size: int, local_gpu: int, cfg: dict):
             )
             for rms, is_pre in zip(rms_values, is_pretrained_flags)
         ]
+        if temporal_lr_multiplier != 1.0:
+            raw_scales = [
+                scale
+                * (
+                    temporal_lr_multiplier
+                    if id(param) in temporal_param_ids
+                    else 1.0
+                )
+                for scale, (_, param) in zip(raw_scales, named_trainable)
+            ]
         # Bucket by (log10(scale) at 0.5-dex, is_pretrained) so we can label
         # each group clearly in the printout.
         bucket_keys = [
@@ -1240,7 +1265,29 @@ def _worker(rank: int, world_size: int, local_gpu: int, cfg: dict):
                       f"e.g. {example}")
         opt_target = param_groups
     else:
-        opt_target = [p for _, p in named_trainable]
+        if temporal_lr_multiplier == 1.0 or not temporal_param_ids:
+            opt_target = [param for _, param in named_trainable]
+        else:
+            spatial_params = [
+                param
+                for _, param in named_trainable
+                if id(param) not in temporal_param_ids
+            ]
+            temporal_params = [
+                param
+                for _, param in named_trainable
+                if id(param) in temporal_param_ids
+            ]
+            opt_target = []
+            if spatial_params:
+                opt_target.append({"params": spatial_params, "lr": lr})
+            if temporal_params:
+                opt_target.append(
+                    {
+                        "params": temporal_params,
+                        "lr": lr * temporal_lr_multiplier,
+                    }
+                )
 
     if optimizer_name == "adamw":
         optimizer = torch.optim.AdamW(opt_target, lr=lr, weight_decay=weight_decay)
@@ -1331,15 +1378,22 @@ def _worker(rank: int, world_size: int, local_gpu: int, cfg: dict):
         if saved_run_id:
             cfg["runtime"]["training_run_id"] = str(saved_run_id)
         ft.validate_checkpoint_longitude(model, ckpt)
-        saved_temporal_enabled = bool(
-            ckpt.get("config", {}).get("model", {}).get(
-                "mamba_temporal_enabled", False,
+        saved_config = ckpt.get("config", {})
+        saved_temporal = resolve_temporal_config(saved_config)
+        serialized_temporal = ckpt.get("resolved_temporal_config")
+        if isinstance(serialized_temporal, dict):
+            saved_temporal.update(serialized_temporal)
+        current_temporal = resolve_temporal_config(cfg)
+        saved_temporal_enabled = bool(saved_temporal["enabled"])
+        current_temporal_enabled = bool(current_temporal["enabled"])
+        temporal_migration = (
+            saved_temporal_enabled != current_temporal_enabled
+            or (
+                saved_temporal_enabled
+                and current_temporal_enabled
+                and saved_temporal != current_temporal
             )
         )
-        current_temporal_enabled = bool(
-            cfg.get("model", {}).get("mamba_temporal_enabled", False)
-        )
-        temporal_migration = saved_temporal_enabled != current_temporal_enabled
         ft.validate_checkpoint_refinement_contract(
             model,
             ckpt,
@@ -1348,8 +1402,9 @@ def _worker(rank: int, world_size: int, local_gpu: int, cfg: dict):
             allow_temporal_migration=True,
             require_validated=False,
         )
-        # Only the explicitly validated legacy Mamba migration may be tolerant.
-        # An unchanged architecture (including every unified refiner) loads
+        # Only an explicitly detected temporal-only migration may be tolerant,
+        # for either the legacy or unified wrapper. An unchanged architecture
+        # (including disabled temporal options that merely differ in YAML) loads
         # strictly so truncated or incompatible restarts fail early.
         load_result = model.load_state_dict(
             ckpt["model_state_dict"], strict=not temporal_migration,

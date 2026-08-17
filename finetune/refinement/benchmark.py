@@ -221,8 +221,7 @@ def _channel_specs(
             f"actual rollout levels={available.tolist()}"
         )
     for name in case.atmos_variables:
-        for level in case.pressure_levels:
-            index = int(np.flatnonzero(np.isclose(available, level, rtol=0.0, atol=1e-6))[0])
+        for packed_level_index, level in enumerate(case.pressure_levels):
             key = f"{name}_{level_to_str(float(level))}"
             specs.append(
                 ChannelSpec(
@@ -231,7 +230,9 @@ def _channel_specs(
                     dataset_name=name,
                     kind="atmos",
                     level=float(level),
-                    level_index=index,
+                    # FieldPacking indexes the configured packed level axis,
+                    # not the source dataset's (possibly sparse) full axis.
+                    level_index=packed_level_index,
                     mean=float(locations[key]),
                     std=float(scales[key]),
                 )
@@ -329,6 +330,7 @@ def load_case(
     stride: int = 1,
     lat_stride: int = 1,
     lon_stride: int = 1,
+    initialization_selection: str = "prefix",
     device: torch.device | str = "cpu",
     verbose: bool = True,
 ) -> BenchmarkDataset:
@@ -351,6 +353,11 @@ def load_case(
         raise ValueError(
             "stride, lat_stride, and lon_stride must each be >= 1; actual "
             f"{stride}, {lat_stride}, {lon_stride}."
+        )
+    if initialization_selection not in {"prefix", "uniform"}:
+        raise ValueError(
+            "initialization_selection must be 'prefix' or 'uniform', got "
+            f"{initialization_selection!r}."
         )
 
     truth = xr.open_dataset(case.truth_path)
@@ -384,7 +391,21 @@ def load_case(
         last = init + np.timedelta64(int(round(float(expected.max()) * 3600)), "s")
         if first >= truth_start and last <= truth_end:
             candidate_files.append(path)
-    files = candidate_files[:: max(1, int(stride))][: int(max_initializations)]
+    eligible_files = candidate_files[:: max(1, int(stride))]
+    if initialization_selection == "uniform" and len(eligible_files) > max_initializations:
+        # Spread a capped scientific ablation over the complete eligible
+        # period instead of silently selecting a short prefix of adjacent
+        # dates. Rounding a monotone linspace is unique when count <= size.
+        selected_positions = np.rint(
+            np.linspace(
+                0,
+                len(eligible_files) - 1,
+                num=int(max_initializations),
+            )
+        ).astype(np.int64)
+        files = [eligible_files[int(index)] for index in selected_positions]
+    else:
+        files = eligible_files[: int(max_initializations)]
     if not files:
         truth.close()
         raise ValueError(
@@ -1299,6 +1320,8 @@ class HeadResult:
     per_lead: dict[str, dict[float, MetricRow]] = field(default_factory=dict)
     refined: torch.Tensor | None = None
     diagnostics: dict[str, Any] = field(default_factory=dict)
+    trained_refiner: Any | None = field(default=None, repr=False, compare=False)
+    refinement_config: RefinementConfig | None = field(default=None, repr=False, compare=False)
     resolved_config: dict[str, Any] = field(default_factory=dict)
 
 
@@ -1578,6 +1601,8 @@ def train_and_evaluate(
         refined=refined,
         diagnostics=inference_diagnostics,
         resolved_config=config.to_dict(),
+        trained_refiner=refiner,
+        refinement_config=config,
     )
 
 

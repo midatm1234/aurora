@@ -526,3 +526,266 @@ def test_atomic_save_leaves_no_temporary_files(tmp_path) -> None:
     assert [p.name for p in target.parent.iterdir()] == ["refinement.ckpt"]
     restored = torch.load(target, weights_only=False)
     assert torch.equal(restored["a"], torch.ones(2))
+
+
+def _temporal_checkpoint_config(
+    *, enabled: bool, mode: str = "per_variable", channels: int = 4
+) -> dict:
+    config = refinement_config("diffusion_unet")
+    config["model"]["mamba_temporal"] = {
+        "enabled": enabled,
+        "mode": mode,
+        "channels": channels,
+        "state_dim": 2,
+        "num_layers": 1,
+        "conv_kernel": 2,
+        "expansion_factor": 1,
+        "dropout": 0.0,
+        "gated_fusion": mode == "packed_joint",
+        "gate_init": 0.0,
+        "lead_time_conditioning": mode == "packed_joint",
+        "mask_conditioning": mode == "packed_joint",
+        "coordinate_conditioning": False,
+        "causal": True,
+    }
+    config["rollout"] = {"rollout_step_hours": 12}
+    config["data"] = {"target_lead_times": [1, 2, 3]}
+    return config
+
+
+def _unified_contract_payload(model, config, packing) -> dict:
+    return {
+        "config": config,
+        "resolved_refinement_config": model.refinement_config.to_dict(),
+        "resolved_temporal_config": model.temporal_config,
+        "field_packing": packing.to_dict(),
+    }
+
+
+def test_checkpoint_ignores_inactive_temporal_architecture_options() -> None:
+    packing = build_packing(8, 8, lead_times_hours=(12.0, 24.0, 36.0))
+    saved_config = _temporal_checkpoint_config(
+        enabled=False, mode="per_variable"
+    )
+    current_config = _temporal_checkpoint_config(
+        enabled=False, mode="packed_joint"
+    )
+    saved_model = build_two_phase_refiner(DummyAurora(), packing, saved_config)
+    current_model = build_two_phase_refiner(DummyAurora(), packing, current_config)
+    validate_unified_checkpoint_contract(
+        current_model,
+        _unified_contract_payload(saved_model, saved_config, packing),
+        current_config,
+    )
+
+
+def test_checkpoint_rejects_active_temporal_semantic_and_cadence_drift() -> None:
+    packing = build_packing(8, 8, lead_times_hours=(12.0, 24.0, 36.0))
+    saved_config = _temporal_checkpoint_config(
+        enabled=True, mode="packed_joint", channels=4
+    )
+    saved_model = build_two_phase_refiner(DummyAurora(), packing, saved_config)
+    changed_width = _temporal_checkpoint_config(
+        enabled=True, mode="packed_joint", channels=8
+    )
+    changed_model = build_two_phase_refiner(DummyAurora(), packing, changed_width)
+    checkpoint = _unified_contract_payload(saved_model, saved_config, packing)
+    with pytest.raises(ValueError, match="Mamba temporal configuration mismatch"):
+        validate_unified_checkpoint_contract(
+            changed_model, checkpoint, changed_width
+        )
+
+    changed_cadence = copy.deepcopy(saved_config)
+    changed_cadence["rollout"]["rollout_step_hours"] = 6
+    cadence_model = build_two_phase_refiner(
+        DummyAurora(), packing, changed_cadence
+    )
+    with pytest.raises(ValueError, match="rollout_step_hours mismatch"):
+        validate_unified_checkpoint_contract(
+            cadence_model, checkpoint, changed_cadence
+        )
+
+
+def test_official_checkpoint_contract_rejects_lazy_mamba_state() -> None:
+    with pytest.raises(ValueError, match="obsolete lazy CUDA Mamba state"):
+        ft.validate_checkpoint_refinement_contract(
+            nn.Identity(),
+            {"model_state_dict": {"temporal.block._mamba_impl.weight": torch.ones(1)}},
+            {},
+            None,
+        )
+    ft.validate_checkpoint_refinement_contract(
+        nn.Identity(), {"model_state_dict": {}}, {}, None
+    )
+
+
+def test_official_loader_restores_saved_legacy_flow_sampling_steps(
+    tmp_path, monkeypatch
+) -> None:
+    from finetune import model_factory
+    from finetune.flow_refine import AuroraFlowRefine
+
+    def wrapper() -> AuroraFlowRefine:
+        return AuroraFlowRefine(
+            base=nn.Identity(),
+            target_surf_vars=("tcno2",),
+            hidden=4,
+            time_dim=8,
+            sampling_steps=1,
+            lon_periodic=False,
+            temporal_enabled=True,
+            temporal_channels=4,
+            temporal_state=2,
+            temporal_layers=1,
+            temporal_conv=2,
+            temporal_expand=1,
+        )
+
+    source = wrapper()
+    checkpoint_path = tmp_path / "legacy.ckpt"
+    torch.save(
+        {
+            "model_state_dict": source.state_dict(),
+            "flow_sampling_steps": 8,
+        },
+        checkpoint_path,
+    )
+    monkeypatch.setattr(
+        model_factory, "build_finetune_model", lambda *args, **kwargs: wrapper()
+    )
+    monkeypatch.setattr(ft, "validate_checkpoint_longitude", lambda *args: None)
+    monkeypatch.setattr(
+        ft, "validate_checkpoint_refinement_contract", lambda *args, **kwargs: None
+    )
+
+    loaded, checkpoint = model_factory.load_model_from_checkpoint(
+        {}, None, checkpoint_path, require_validated=False
+    )
+    assert loaded.sampling_steps == 8
+    assert loaded.flow_sampling_steps_source == "checkpoint"
+    assert checkpoint["resolved_flow_sampling_steps"] == 8
+    assert checkpoint["flow_sampling_steps_source"] == "checkpoint"
+
+    with pytest.raises(ValueError, match="must use its persisted"):
+        model_factory.load_model_from_checkpoint(
+            {},
+            None,
+            checkpoint_path,
+            require_validated=False,
+            flow_sampling_steps_override=1,
+        )
+    with pytest.warns(RuntimeWarning, match="UNSAFE diagnostic"):
+        overridden, metadata = model_factory.load_model_from_checkpoint(
+            {},
+            None,
+            checkpoint_path,
+            require_validated=False,
+            flow_sampling_steps_override=1,
+            allow_unsafe_temporal_sampling_override=True,
+        )
+    assert overridden.sampling_steps == 1
+    assert metadata["flow_sampling_steps_source"] == "explicit_override"
+
+    invalid_path = tmp_path / "invalid_sampling_steps.ckpt"
+    torch.save(
+        {
+            "model_state_dict": source.state_dict(),
+            "flow_sampling_steps": True,
+        },
+        invalid_path,
+    )
+    with pytest.raises(
+        ValueError, match="checkpoint flow_sampling_steps must be a positive integer"
+    ):
+        model_factory.load_model_from_checkpoint(
+            {}, None, invalid_path, require_validated=False
+        )
+
+
+def _legacy_flow_refine_for_loader(
+    *, temporal_enabled: bool, sampling_steps: int = 3
+):
+    from finetune.flow_refine import AuroraFlowRefine
+
+    return AuroraFlowRefine(
+        base=nn.Identity(),
+        target_surf_vars=("tcno2",),
+        hidden=4,
+        time_dim=8,
+        sampling_steps=sampling_steps,
+        lon_periodic=False,
+        temporal_enabled=temporal_enabled,
+        temporal_channels=4,
+        temporal_state=2,
+        temporal_layers=1,
+        temporal_conv=2,
+        temporal_expand=1,
+    )
+
+
+def _stub_legacy_loader(monkeypatch, model_factory, factory) -> None:
+    monkeypatch.setattr(
+        model_factory, "build_finetune_model", lambda *args, **kwargs: factory()
+    )
+    monkeypatch.setattr(ft, "validate_checkpoint_longitude", lambda *args: None)
+    monkeypatch.setattr(
+        ft, "validate_checkpoint_refinement_contract", lambda *args, **kwargs: None
+    )
+
+
+def test_official_loader_rejects_unproven_temporal_sampling_steps(
+    tmp_path, monkeypatch
+) -> None:
+    from finetune import model_factory
+
+    source = _legacy_flow_refine_for_loader(temporal_enabled=True)
+    checkpoint_path = tmp_path / "legacy_temporal_missing_sampling_steps.ckpt"
+    torch.save({"model_state_dict": source.state_dict()}, checkpoint_path)
+    _stub_legacy_loader(
+        monkeypatch,
+        model_factory,
+        lambda: _legacy_flow_refine_for_loader(temporal_enabled=True),
+    )
+
+    match = "active temporal Mamba.*missing top-level flow_sampling_steps"
+    with pytest.raises(ValueError, match=match):
+        model_factory.load_model_from_checkpoint(
+            {}, None, checkpoint_path, require_validated=False
+        )
+    # An asserted override does not prove which trajectory was used in training.
+    with pytest.raises(ValueError, match=match):
+        model_factory.load_model_from_checkpoint(
+            {},
+            None,
+            checkpoint_path,
+            require_validated=False,
+            flow_sampling_steps_override=8,
+            allow_unsafe_temporal_sampling_override=True,
+        )
+
+
+def test_official_loader_keeps_non_temporal_sampling_config_fallback(
+    tmp_path, monkeypatch
+) -> None:
+    from finetune import model_factory
+
+    source = _legacy_flow_refine_for_loader(
+        temporal_enabled=False, sampling_steps=3
+    )
+    checkpoint_path = tmp_path / "legacy_spatial_missing_sampling_steps.ckpt"
+    torch.save({"model_state_dict": source.state_dict()}, checkpoint_path)
+    _stub_legacy_loader(
+        monkeypatch,
+        model_factory,
+        lambda: _legacy_flow_refine_for_loader(
+            temporal_enabled=False, sampling_steps=3
+        ),
+    )
+
+    loaded, checkpoint = model_factory.load_model_from_checkpoint(
+        {}, None, checkpoint_path, require_validated=False
+    )
+    assert loaded.sampling_steps == 3
+    assert loaded.flow_sampling_steps_source == "config"
+    assert checkpoint["resolved_flow_sampling_steps"] == 3
+    assert checkpoint["flow_sampling_steps_source"] == "config"

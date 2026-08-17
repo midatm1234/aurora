@@ -17,7 +17,7 @@ import warnings
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 import torch
@@ -432,6 +432,14 @@ def validate_config(
     except ConfigValidationError as exc:
         raise ValueError(str(exc)) from exc
     legacy_flow_selected = flow_enabled or refinement_cfg.backend == "legacy"
+    flow_contract_version = (
+        positive_integer(
+            model_cfg.get("flow_refine_contract_version", 1),
+            "model.flow_refine_contract_version",
+        )
+        if legacy_flow_selected
+        else 1
+    )
     if refinement_cfg.backend == "unified" and conv_enabled:
         raise ValueError(
             "model.conv_refine_enabled is mutually exclusive with a stochastic "
@@ -506,6 +514,14 @@ def validate_config(
             "training.flow_refine_autoregressive_feedback must be a boolean."
         )
 
+    if flow_autoregressive_feedback and (
+        not legacy_flow_selected or flow_contract_version < 2
+    ):
+        raise ValueError(
+            "training.flow_refine_autoregressive_feedback=true is supported "
+            "only by legacy flow_refine_contract_version >= 2."
+        )
+
     if bool(model_cfg.get("flow_refine_lead_time_cond", False)):
         if not legacy_flow_selected:
             raise ValueError(
@@ -528,13 +544,13 @@ def validate_config(
                 f"supervised lead ({expected_scale:g} hours)."
             )
 
-    temporal_enabled_value = model_cfg.get("mamba_temporal_enabled", False)
-    if not isinstance(temporal_enabled_value, bool):
-        raise ValueError(
-            "model.mamba_temporal_enabled must be true or false, got "
-            f"{temporal_enabled_value!r}."
-        )
-    temporal_enabled = temporal_enabled_value
+    from finetune.refinement.two_phase import resolve_temporal_config
+
+    temporal_config = resolve_temporal_config(config)
+    temporal_enabled = bool(temporal_config["enabled"])
+    temporal_only = training_cfg.get("mamba_temporal_only", False)
+    if not isinstance(temporal_only, bool):
+        raise ValueError("training.mamba_temporal_only must be true or false.")
     if "mamba_temporal_weight" in training_cfg:
         configured_temporal_weight = finite_number(
             training_cfg["mamba_temporal_weight"],
@@ -555,47 +571,89 @@ def validate_config(
                 "(legacy flow_matching_unet or a unified flow/diffusion refiner); "
                 f"actual model.refinement.type={refinement_cfg.type!r}."
             )
+        if legacy_flow_selected and temporal_config["mode"] != "per_variable":
+            raise ValueError(
+                "model.mamba_temporal.mode=packed_joint is supported only by the "
+                "unified refinement wrapper; legacy flow_matching_unet must use "
+                "per_variable."
+            )
+        if legacy_flow_selected:
+            unsupported_legacy_temporal = [
+                key
+                for key, default in (
+                    ("dropout", 0.0),
+                    ("gated_fusion", False),
+                    ("gate_init", 0.0),
+                    ("lead_time_conditioning", False),
+                    ("mask_conditioning", False),
+                    ("coordinate_conditioning", False),
+                )
+                if temporal_config[key] != default
+            ]
+            legacy_objective_defaults = {
+                "base": "mse",
+                "huber_delta": 1.0,
+                "charbonnier_epsilon": 1.0e-3,
+                "tendency_weight": 0.0,
+                "structure_weight": 0.0,
+                "extreme_weight": 0.0,
+                "extreme_quantile": 0.95,
+            }
+            if temporal_config["objective"] != legacy_objective_defaults:
+                unsupported_legacy_temporal.append("objective")
+            if unsupported_legacy_temporal:
+                raise ValueError(
+                    "Legacy flow_matching_unet temporal Mamba does not implement "
+                    "these model.mamba_temporal option(s): "
+                    f"{unsupported_legacy_temporal}. Use their legacy-safe defaults "
+                    "or a unified packed_joint head."
+                )
+            warnings.warn(
+                "Legacy flow Mamba corrections are not included in validation "
+                "checkpoint selection and its historical temporal training input "
+                "does not match multi-step stochastic deployment. Use the unified "
+                "packed_joint deterministic two-stage path for new studies.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         if len(target_leads) < 2:
             raise ValueError(
-                "model.mamba_temporal_enabled requires at least two "
+                "model.mamba_temporal.enabled requires at least two "
                 f"data.target_lead_times; actual value is {target_leads!r}."
             )
         expected_temporal_leads = list(range(1, max(target_leads) + 1))
         if target_leads != expected_temporal_leads:
             raise ValueError(
                 "data.target_lead_times must be consecutive rollout indices "
-                "[1, ..., max] when model.mamba_temporal_enabled=true, because "
-                "Mamba is applied at every inference step; expected "
+                "[1, ..., max] when temporal Mamba is enabled, because it is "
+                "applied at every inference step; expected "
                 f"{expected_temporal_leads!r}, got {target_leads!r}."
             )
         if rollout_steps > max(target_leads):
             raise ValueError(
                 "rollout.rollout_num_steps exceeds the trained temporal-Mamba "
-                "horizon from data.target_lead_times when "
-                "model.mamba_temporal_enabled=true; expected 0 or a value <= "
+                "horizon from data.target_lead_times; expected 0 or a value <= "
                 f"{max(target_leads)}, got {rollout_steps}."
             )
         if step_hours is None:
             raise ValueError(
-                "model.mamba_temporal_enabled requires a positive "
-                f"rollout.rollout_step_hours; actual value is {step_value!r}."
+                "Temporal Mamba requires a positive rollout.rollout_step_hours; "
+                f"actual value is {step_value!r}."
             )
-        for key, default in (
-            ("mamba_temporal_channels", 16),
-            ("mamba_temporal_state", 8),
-            ("mamba_temporal_layers", 2),
-            ("mamba_temporal_conv", 3),
-            ("mamba_temporal_expand", 2),
-        ):
-            positive_integer(model_cfg.get(key, default), f"model.{key}")
-        temporal_weight = configured_temporal_weight if (
-            "mamba_temporal_weight" in training_cfg
-        ) else 1.0
+        temporal_weight = (
+            configured_temporal_weight
+            if "mamba_temporal_weight" in training_cfg
+            else 1.0
+        )
         if temporal_weight <= 0:
             raise ValueError(
                 "A training.mamba_temporal_weight > 0 is required when the "
                 "temporal module is enabled."
             )
+    elif temporal_only:
+        raise ValueError(
+            "training.mamba_temporal_only=true requires temporal Mamba to be enabled."
+        )
 
     if (
         refinement_cfg.is_active
@@ -2711,7 +2769,8 @@ def compute_supervised_loss(
     flow_feedback_enabled = (
         is_flow_refine
         and base_for_fm.training
-        and bool(training_cfg.get("flow_refine_autoregressive_feedback", False))
+        and int(base_for_fm.flow_refine_contract_version) >= 2
+        and training_cfg.get("flow_refine_autoregressive_feedback", False) is True
     )
     # Per-variable normalised sequences (ordered by lead) for the Mamba
     # temporal loss. Populated inside the lead loop only when a flow-refine
@@ -2721,6 +2780,9 @@ def compute_supervised_loss(
         []
         if unified_eval_active and getattr(unified_refiner, "has_temporal", False)
         else None
+    )
+    unified_eval_temporal_lead_history: list[torch.Tensor] | None = (
+        [] if unified_eval_temporal_history is not None else None
     )
     unified_eval_generator = None
     if unified_eval_active:
@@ -2758,6 +2820,7 @@ def compute_supervised_loss(
                     ensemble_size=validation_refinement_ensemble_size,
                     generator=unified_eval_generator,
                     temporal_history=unified_eval_temporal_history,
+                    temporal_lead_history=unified_eval_temporal_lead_history,
                 )
                 feedback_pred = (
                     pred
@@ -3418,13 +3481,16 @@ def maybe_wrap_flow_refine(
         model_cfg["longitude_grid_signature"] = longitude_grid_signature(lon)
     lon_encoding = bool(model_cfg.get("flow_refine_lon_encoding", False))
 
-    # Mamba temporal module (optional; default off → backward compatible).
-    temporal_enabled = bool(model_cfg.get("mamba_temporal_enabled", False))
-    temporal_channels = int(model_cfg.get("mamba_temporal_channels", 16))
-    temporal_state = int(model_cfg.get("mamba_temporal_state", 8))
-    temporal_layers = int(model_cfg.get("mamba_temporal_layers", 2))
-    temporal_conv = int(model_cfg.get("mamba_temporal_conv", 3))
-    temporal_expand = int(model_cfg.get("mamba_temporal_expand", 2))
+    # Mamba temporal module (optional; nested and flat schemas are equivalent).
+    from finetune.refinement.two_phase import resolve_temporal_config
+
+    temporal_config = resolve_temporal_config(config)
+    temporal_enabled = temporal_config["enabled"]
+    temporal_channels = temporal_config["channels"]
+    temporal_state = temporal_config["state"]
+    temporal_layers = temporal_config["layers"]
+    temporal_conv = temporal_config["conv"]
+    temporal_expand = temporal_config["expand"]
 
     # Build per-variable loss_levels → level-index mapping so the wrapper
     # only applies bias correction to the configured levels at inference.
@@ -3588,6 +3654,29 @@ def configure_trainable_parameters(
         else model
     )
 
+    if bool(config.get("training", {}).get("mamba_temporal_only", False)):
+        temporal_module = getattr(model, "temporal", None)
+        if temporal_module is None:
+            raise ValueError(
+                "mamba_temporal_only requires a constructed temporal module."
+            )
+        for param in model.parameters():
+            param.requires_grad = False
+        for param in temporal_module.parameters():
+            param.requires_grad = True
+        if is_stochastic_refine:
+            model.aurora_frozen = True
+            model.aurora.eval()
+        total = sum(param.numel() for param in model.parameters())
+        trainable = sum(
+            param.numel() for param in model.parameters() if param.requires_grad
+        )
+        return {
+            "total_parameters": int(total),
+            "trainable_parameters": int(trainable),
+            "frozen_parameters": int(total - trainable),
+        }
+
     for param in base.parameters():
         param.requires_grad = True
 
@@ -3682,15 +3771,58 @@ def create_optimizer(model: torch.nn.Module, config: dict[str, Any]) -> torch.op
 
     params = [p for p in model.parameters() if p.requires_grad]
     if not params:
-        raise ValueError("No trainable parameters were found after freeze/unfreeze configuration.")
+        raise ValueError(
+            "No trainable parameters were found after freeze/unfreeze configuration."
+        )
+
+    from finetune.refinement.two_phase import resolve_temporal_config
+
+    temporal_multiplier = resolve_temporal_config(config)[
+        "learning_rate_multiplier"
+    ]
+    optimizer_params: Any = params
+    if temporal_multiplier != 1.0:
+        inner = model.module if hasattr(model, "module") else model
+        temporal_module = getattr(inner, "temporal", None)
+        if temporal_module is not None:
+            temporal_ids = {
+                id(param)
+                for param in temporal_module.parameters()
+                if param.requires_grad
+            }
+            temporal_params = [
+                param for param in params if id(param) in temporal_ids
+            ]
+            spatial_params = [
+                param for param in params if id(param) not in temporal_ids
+            ]
+            optimizer_params = []
+            if spatial_params:
+                optimizer_params.append({"params": spatial_params, "lr": lr})
+            if temporal_params:
+                optimizer_params.append(
+                    {
+                        "params": temporal_params,
+                        "lr": lr * temporal_multiplier,
+                    }
+                )
 
     if optimizer_name == "adamw":
-        return torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
+        return torch.optim.AdamW(
+            optimizer_params, lr=lr, weight_decay=weight_decay
+        )
     if optimizer_name == "adam":
-        return torch.optim.Adam(params, lr=lr, weight_decay=weight_decay)
+        return torch.optim.Adam(
+            optimizer_params, lr=lr, weight_decay=weight_decay
+        )
     if optimizer_name == "sgd":
         momentum = float(training_cfg.get("sgd_momentum", 0.9))
-        return torch.optim.SGD(params, lr=lr, momentum=momentum, weight_decay=weight_decay)
+        return torch.optim.SGD(
+            optimizer_params,
+            lr=lr,
+            momentum=momentum,
+            weight_decay=weight_decay,
+        )
 
     raise ValueError(f"Unsupported optimizer: {optimizer_name}")
 
@@ -3830,8 +3962,15 @@ def run_rollout(
     *,
     refinement_seed: int | None = None,
     refinement_ensemble_size: int | None = None,
+    temporal_control: str = "on",
 ) -> list[Batch]:
     """Run rollout from a starting sample using a fine-tuned model."""
+    temporal_control = str(temporal_control).strip().lower()
+    if temporal_control not in {"on", "off", "shuffled"}:
+        raise ValueError(
+            "temporal_control must be on, off, or shuffled; "
+            f"got {temporal_control!r}."
+        )
     rollout_cfg = config.get("rollout", {})
     steps = int(rollout_cfg.get("rollout_num_steps", 0))
     if steps <= 0:
@@ -4003,6 +4142,9 @@ def run_rollout(
     unified_temporal_history: list[torch.Tensor] | None = (
         [] if unified_temporal_active else None
     )
+    unified_temporal_lead_history: list[torch.Tensor] | None = (
+        [] if unified_temporal_history is not None else None
+    )
     unified_refinement_generator = (
         _make_refinement_generator(
             device,
@@ -4047,6 +4189,8 @@ def run_rollout(
                     ensemble_size=resolved_refinement_ensemble_size,
                     generator=unified_refinement_generator,
                     temporal_history=unified_temporal_history,
+                    temporal_lead_history=unified_temporal_lead_history,
+                    temporal_control=temporal_control,
                 )
                 feedback_pred = pred if refinement_feedback else deterministic_pred
             else:
@@ -4081,14 +4225,32 @@ def run_rollout(
             # Mamba temporal correction (causal): refine the flow-corrected
             # target fields using their evolution across the rollout so far.
             if temporal_active:
-                pred = base_for_fm.apply_temporal_rollout(
-                    pred, legacy_temporal_history
-                )
+                if temporal_control == "on":
+                    pred = base_for_fm.apply_temporal_rollout(
+                        pred, legacy_temporal_history
+                    )
+                elif temporal_control == "shuffled":
+                    # Update the canonical raw-frame history once, then evaluate
+                    # a deterministic negative control with previous leads reversed
+                    # while the current lead remains last.
+                    base_for_fm.apply_temporal_rollout(
+                        pred, legacy_temporal_history
+                    )
+                    shuffled_history = {
+                        key: list(reversed(frames[:-1]))
+                        for key, frames in legacy_temporal_history.items()
+                    }
+                    pred = base_for_fm.apply_temporal_rollout(
+                        pred, shuffled_history
+                    )
+                # temporal_control="off" intentionally keeps the spatial frame.
                 # V1 historically fed the temporal output back unconditionally.
                 # For v2+, temporal correction is part of the emitted
                 # postprocessing and must not replace raw-Aurora provenance
                 # unless refinement feedback was explicitly enabled.
-                if not versioned_flow_postprocessing or flow_refine_feedback:
+                if temporal_control != "off" and (
+                    not versioned_flow_postprocessing or flow_refine_feedback
+                ):
                     feedback_pred = pred
             predictions.append(pred.to("cpu"))
 
@@ -4430,6 +4592,21 @@ def validate_checkpoint_refinement_contract(
         require_validated=bool(require_validated),
     )
 
+    state_dict = checkpoint.get("model_state_dict")
+    if isinstance(state_dict, Mapping):
+        obsolete_lazy_keys = [
+            key for key in state_dict if "._mamba_impl." in str(key)
+        ]
+        if obsolete_lazy_keys:
+            raise ValueError(
+                "Checkpoint contains obsolete lazy CUDA Mamba state under "
+                "'._mamba_impl.'. That backend was instantiated after optimizer "
+                "construction and used weights independent from the trained "
+                "SelectiveSSM path, so the checkpoint cannot be represented as "
+                "numerically compatible. Retrain the temporal phase with the "
+                "eager selective_scan_ref backend."
+            )
+
     inner = model.module if hasattr(model, "module") else model
     from finetune.flow_refine import AuroraFlowRefine
     from finetune.refinement.two_phase import AuroraTwoPhaseRefiner
@@ -4597,22 +4774,47 @@ def validate_checkpoint_refinement_contract(
             "Checkpoint refinement configuration mismatch: " + detail
         )
 
-    temporal_defaults: dict[str, Any] = {
-        "mamba_temporal_enabled": False,
-        "mamba_temporal_channels": 16,
-        "mamba_temporal_state": 8,
-        "mamba_temporal_layers": 2,
-        "mamba_temporal_conv": 3,
-        "mamba_temporal_expand": 2,
+    from finetune.refinement.two_phase import resolve_temporal_config
+
+    saved_temporal = resolve_temporal_config(checkpoint_cfg)
+    serialized_temporal = checkpoint.get("resolved_temporal_config")
+    if isinstance(serialized_temporal, dict):
+        saved_temporal.update(serialized_temporal)
+    current_temporal = resolve_temporal_config(config)
+    temporal_fields = {
+        "enabled": "mamba_temporal_enabled",
+        "mode": "mamba_temporal.mode",
+        "channels": "mamba_temporal_channels",
+        "state": "mamba_temporal_state",
+        "layers": "mamba_temporal_layers",
+        "conv": "mamba_temporal_conv",
+        "expand": "mamba_temporal_expand",
+        "dropout": "mamba_temporal.dropout",
+        "gated_fusion": "mamba_temporal.gated_fusion",
+        "gate_init": "mamba_temporal.gate_init",
+        "lead_time_conditioning": "mamba_temporal.lead_time_conditioning",
+        "mask_conditioning": "mamba_temporal.mask_conditioning",
+        "coordinate_conditioning": "mamba_temporal.coordinate_conditioning",
+        "causal": "mamba_temporal.causal",
+        "semantic_version": "mamba_temporal.semantic_version",
+        "scan_backend": "mamba_temporal.scan_backend",
     }
+    temporal_both_enabled = bool(saved_temporal["enabled"]) and bool(
+        current_temporal["enabled"]
+    )
+    compared_temporal_fields = (
+        tuple(temporal_fields)
+        if temporal_both_enabled
+        else ("enabled",)
+    )
     temporal_mismatches = [
         (
-            key,
-            saved_model.get(key, default),
-            current_model.get(key, default),
+            temporal_fields[key],
+            saved_temporal.get(key),
+            current_temporal.get(key),
         )
-        for key, default in temporal_defaults.items()
-        if saved_model.get(key, default) != current_model.get(key, default)
+        for key in compared_temporal_fields
+        if saved_temporal.get(key) != current_temporal.get(key)
     ]
     if temporal_mismatches and not allow_temporal_migration:
         detail = ", ".join(
@@ -4626,7 +4828,10 @@ def validate_checkpoint_refinement_contract(
             "run a training warm-start migration before inference."
         )
 
-    if bool(current_model.get("flow_refine_lead_time_cond", False)):
+    if (
+        bool(current_model.get("flow_refine_lead_time_cond", False))
+        or temporal_both_enabled
+    ):
         saved_step = checkpoint_cfg.get("rollout", {}).get("rollout_step_hours")
         current_step = config.get("rollout", {}).get("rollout_step_hours")
         if saved_step is None or current_step is None or not np.isclose(

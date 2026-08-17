@@ -291,15 +291,13 @@ model:
   # eval sampler deterministic (1 step) for the column field.
   flow_refine_sampling_steps_late: 1
   # ------------------------------------------------------------------
-  # Mamba temporal module (long-lead rollout corrector).
-  # Adds a selective state-space (Mamba) corrector on top of the
-  # flow-matching output. It learns how the bias-corrected field and
-  # Aurora's residual evolve across a rollout sequence, targeting the
-  # accumulated drift that degrades 2-3 day forecasts relative to 6 h.
-  # The temporal decoder is zero-init (identity-at-init), so the module
-  # is a no-op until trained. Trained on the ordered multi-lead sequence
-  # (see training.mamba_temporal_weight) and applied causally at rollout.
-  # Requires flow_refine_enabled: true and >= 2 target_lead_times.
+  # Optional causal packed-joint temporal corrector.
+  # A shared selective state-space model sees every configured O3 field,
+  # physical forecast lead/spacing, validity masks, and geophysical coordinates.
+  # The ReZero fusion gate is identity-at-init, so this remains an exact no-op
+  # while disabled and until an enabled temporal phase learns a correction.
+  # Training uses ordered multi-lead sequences; rollout inference is causal.
+  # Requires an active model.refinement head and >= 2 target_lead_times.
 
   # ------------------------------------------------------------------
   # Unified stochastic residual refinement (Phase 2).
@@ -410,12 +408,32 @@ model:
       zero_init_output: true
       local_refinement: true  # explicit opt-in; legacy-safe schema default is false
 
-  mamba_temporal_enabled: false
-  mamba_temporal_channels: 16   # per-pixel feature width of the encoder/SSM
-  mamba_temporal_state: 8       # SSM hidden state dimension (N)
-  mamba_temporal_layers: 2      # stacked Mamba blocks
-  mamba_temporal_conv: 3        # causal temporal conv kernel
-  mamba_temporal_expand: 2      # SSM inner expansion factor
+  # Optional causal sequence model. Keep it disabled unless a run explicitly
+  # trains and validates the temporal objective independently.
+  mamba_temporal:
+    enabled: false
+    mode: packed_joint
+    channels: 16
+    state_dim: 8
+    num_layers: 2
+    expansion_factor: 2
+    conv_kernel: 3
+    dropout: 0.0
+    gated_fusion: true
+    gate_init: 0.0
+    lead_time_conditioning: true
+    mask_conditioning: true
+    coordinate_conditioning: true
+    causal: true
+    learning_rate_multiplier: 1.0
+    objective:
+      base: mse
+      huber_delta: 1.0
+      charbonnier_epsilon: 1.0e-3
+      tendency_weight: 0.0
+      structure_weight: 0.0
+      extreme_weight: 0.0
+      extreme_quantile: 0.95
   model_kwargs: {}
 
 training:
@@ -497,9 +515,9 @@ training:
   loss_function: mse
   multi_target_loss_weights: {}
   # Weight of the Mamba temporal loss (trained on the ordered multi-lead
-  # rollout sequence). Only active when model.mamba_temporal_enabled=true
+  # rollout sequence). Only active when model.mamba_temporal.enabled=true
   # and there are >= 2 target lead times. 0 disables the temporal loss term.
-  mamba_temporal_weight: 0.0
+  mamba_temporal_weight: 1.0  # ignored while disabled; enables a one-key Mamba toggle
   # Train each later lead on the same corrected autoregressive state that
   # inference feeds back, while retaining the unrefined prediction as the
   # residual-loss reference.
@@ -517,7 +535,7 @@ training:
   # the original pure residual-MSE behaviour.
   flow_aux_loss:
     # Master on/off switch for all structural terms below (single-line toggle).
-    enabled: true
+    enabled: false  # Legacy-only; unified weights live in model.refinement.loss.
     # Extreme-event performance: up-weight squared error on tail cells
     # (|z| above the per-sample quantile) + match spatial peak magnitude.
     extreme_weight: 0.5

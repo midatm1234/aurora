@@ -82,6 +82,7 @@ def _smoke_config() -> dict:
     config = copy.deepcopy(_raw_config())
     config["model"]["model_variant"] = "tiny_aurora"
     config["model"]["mixed_precision"] = "none"
+    config["model"].pop("mamba_temporal", None)
     config["model"].update(
         {
             "mamba_temporal_enabled": True,
@@ -232,8 +233,8 @@ def test_target_config_and_notebooks_share_the_factory() -> None:
         transformer["zero_init_output"]
         and diffusion["prediction_type"] == "epsilon"
     )
-    assert config["model"]["mamba_temporal_enabled"] is False
-    assert training["mamba_temporal_weight"] == 0.0
+    assert config["model"]["mamba_temporal"]["enabled"] is False
+    assert training["mamba_temporal_weight"] == 1.0
     assert training["validation_refinement_ensemble_size"] == 1
     assert training["validation_source"] == "train_tail"
     assert training["checkpoint_metric"] == "mean_physical_rmse_ratio"
@@ -373,6 +374,8 @@ def test_no2_diffusion_transformer_train_checkpoint_inference_netcdf(
     assert set(metrics["temporal"]) == {
         "temporal_loss/tcno2",
         "temporal_loss/no2",
+        "temporal_base_loss",
+        "temporal_total_loss",
     }
     assert training_sequence_shapes == [(1, 6, 6, 6)]
     hook.remove()
@@ -985,6 +988,7 @@ def test_temporal_mamba_is_causal_and_accepts_arbitrary_positive_width() -> None
 
 
 def _enable_temporal_for_validation(config: dict) -> dict:
+    config["model"].pop("mamba_temporal", None)
     config["model"]["mamba_temporal_enabled"] = True
     config["training"]["mamba_temporal_weight"] = 1.0
     return config
@@ -1050,6 +1054,7 @@ def test_temporal_config_rejects_nonpositive_architecture_fields(field) -> None:
 
 def test_temporal_config_rejects_nonboolean_enable_and_zero_weight() -> None:
     invalid_boolean = _raw_config()
+    invalid_boolean["model"].pop("mamba_temporal", None)
     invalid_boolean["model"]["mamba_temporal_enabled"] = "true"
     with pytest.raises(ValueError, match="must be true or false"):
         ft.validate_config(invalid_boolean, NO2_DT_CONFIG)

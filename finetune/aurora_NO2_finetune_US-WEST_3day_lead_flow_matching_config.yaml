@@ -13,7 +13,7 @@ paths:
 #   <output_dir>/<case_name>/  and  <checkpoint_dir>/<case_name>/
 # resume_from="best"/"last" resolves relative to the case folder, so
 # stages chain naturally when you keep case_name fixed across runs.
-case_name: NO2_US-WEST_3day_lead_flow_matching_transformer
+case_name: NO2_US-WEST_3day_lead_flow_matching
 
 data:
   predictor_variables:
@@ -165,7 +165,7 @@ model:
   mixed_precision: bf16  # none | bf16 | fp16
   refinement:
     enabled: true
-    type: flow_matching_transformer
+    type: flow_matching_conv_unet
     correction_convention: cams_minus_aurora_add
     checkpoint: null
     freeze_aurora: true
@@ -215,7 +215,7 @@ model:
     loss:
       generative: mse
       # Directly train and score the deterministic correction that is deployed;
-      # diffusion noise loss alone is not a checkpoint-quality metric.
+      # the flow objective alone is not a checkpoint-quality metric.
       deterministic_weight: 1.0
       aux_on_deterministic: true
       reconstruction_weight: 0.0
@@ -252,7 +252,8 @@ model:
       residual_zscore: false  # shared per-channel correction scaler is authoritative
       res_std_momentum: 0.99
 
-    # Alternate UNet settings are inactive for the declared transformer head.
+    # Spatial backbone for the flow-matching correction process. The output projection
+    # is independently zero initialized for every packed variable/level.
     unet:
       hidden_channels: 64
       num_levels: 3

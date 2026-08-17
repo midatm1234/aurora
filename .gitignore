@@ -45,3 +45,4 @@ finetune/outputs/
 examples/outputs/
 examples/cams_download_2025_range.log
 finetune/*.pdf
+*.orig

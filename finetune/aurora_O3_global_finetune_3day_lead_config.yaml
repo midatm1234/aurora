@@ -1,6 +1,7 @@
 paths:
   project_root: .
   data_dir: ../data
+  data_case_name: O3_global_3day_lead
   train_data_path: ../data/train.nc
   val_data_path: ../data/test.nc
   test_data_path: ../data/test.nc
@@ -16,7 +17,7 @@ paths:
 #   <output_dir>/<case_name>/  and  <checkpoint_dir>/<case_name>/
 # resume_from="best"/"last" resolves relative to the case folder, so
 # stages chain naturally when you keep case_name fixed across runs.
-case_name: O3_global_3day_lead
+case_name: O3_global_3day_lead_unified_flow_matching_conv_unet
 
 # Evaluation settings consumed by evaluate_finetuned_cams_rollouts.ipynb.
 # Ground truth, fine-tuned output, result paths, targets, levels, and lead
@@ -245,7 +246,7 @@ model:
   # Trains a small UNet on the conditional residual r = y_true − ŷ in
   # normalised space. Deterministic inference predicts r̂ at the source
   # endpoint and adds it back. Mutually exclusive with conv-refine.
-  flow_refine_enabled: true
+  flow_refine_enabled: false
   # Version 3 adds explicit cumulative forecast-lead conditioning to the
   # corrected t=0 endpoint and per-level residual scaling. Older checkpoints
   # have no lead embedding and are deliberately incompatible with this recipe.
@@ -256,7 +257,7 @@ model:
   # physical lead hours (12, 24, ..., 72) so each head can learn that CAMS
   # rollout residual amplitude and structure evolve with lead. The scale is
   # also the maximum supported lead for inference; longer rollouts fail loudly.
-  flow_refine_lead_time_cond: true
+  flow_refine_lead_time_cond: false
   flow_refine_lead_time_scale_hours: 72
   # Optional absolute-position conditioning. When enabled, the Flow head gets
   # sin(lon)/cos(lon), never raw longitude. Enabling changes checkpoint input
@@ -279,6 +280,96 @@ model:
   # eval sampler deterministic (1 step) for the column field.
   flow_refine_sampling_steps_late: 1
   # ------------------------------------------------------------------
+  # Unified stochastic residual refinement (Phase 2).
+  # The legacy flow keys above are retained only for old-checkpoint metadata;
+  # flow_refine_enabled=false guarantees that this shared head is authoritative.
+  refinement:
+    enabled: true
+    type: flow_matching_conv_unet
+    correction_convention: cams_minus_aurora_add
+    checkpoint: null
+    freeze_aurora: true
+    joint_finetuning: false
+    # Repository-wide correction contract:
+    #   correction_target = CAMS - Aurora
+    #   refined_forecast = Aurora + predicted_correction
+    train_on_residual: true
+    feedback_to_rollout: false
+    seed: 1234
+    ensemble_size: 1
+    deterministic_inference: true
+    # The deployed point forecast queries the trained flow process directly.
+    deterministic_head: shared_process
+
+    target_space:
+      use_existing_normalization: true
+      residual_space: normalized
+      residual_scaling: per_channel
+      residual_scaling_center: true
+      residual_scaling_momentum: 0.05
+      residual_scaling_warmup_batches: 32
+      residual_scaling_target_std: 1.0
+      residual_clip_standard_deviations: 4.0
+
+    conditioning:
+      aurora_rollout: true
+      aurora_input_state: false
+      aurora_features: false
+      static_fields: false
+      masks: true
+      forecast_lead_time: true
+      latitude: true
+      longitude: true
+
+    loss:
+      generative: mse
+      deterministic_weight: 1.0
+      aux_on_deterministic: true
+      reconstruction_weight: 0.0
+      mae_weight: 1.0
+      bias_weight: 1.0
+      gradient_weight: 0.25
+      pattern_correlation_weight: 0.5
+      variance_weight: 2.0
+      extreme_weight: 1.0
+      extreme_quantile: 0.95
+      extreme_intensity: 4.0
+      extreme_tail: upper
+      quantile_weight: 1.0
+      peak_weight: 0.0
+      spectral_weight: 0.0
+      degradation_weight: 1.0
+      magnitude_weight: 0.0
+      area_weighted: true
+      separate_by_variable: true
+      separate_by_level: true
+      separate_by_lead_time: true
+
+    flow_matching:
+      source_distribution: gaussian
+      interpolation_path: existing_aurora
+      integration_steps: 50
+      solver: euler
+      stochastic_initialization: true
+      time_sampling: logit_normal
+      sigma_min: 1.0e-3
+      logit_normal_mean: -0.5
+      logit_normal_std: 1.2
+      # The shared per-channel target-space scaler is authoritative.
+      residual_zscore: false
+      res_std_momentum: 0.99
+
+    # Preserve the memory-tested global O3 capacity from the working recipe.
+    unet:
+      hidden_channels: 16
+      num_levels: 3
+      num_residual_blocks: 2
+      time_embedding_dim: 128
+      dropout: 0.0
+      bottleneck_attention: true
+      attention_heads: 4
+      zero_init_output: true
+  # ------------------------------------------------------------------
   # Mamba temporal module (long-lead rollout corrector).
   # Adds a selective state-space (Mamba) corrector on top of the
   # flow-matching output. It learns how the bias-corrected field and
@@ -287,13 +378,31 @@ model:
   # The temporal decoder is zero-init (identity-at-init), so the module
   # is a no-op until trained. Trained on the ordered multi-lead sequence
   # (see training.mamba_temporal_weight) and applied causally at rollout.
-  # Requires flow_refine_enabled: true and >= 2 target_lead_times.
-  mamba_temporal_enabled: false
-  mamba_temporal_channels: 16   # per-pixel feature width of the encoder/SSM
-  mamba_temporal_state: 8       # SSM hidden state dimension (N)
-  mamba_temporal_layers: 2      # stacked Mamba blocks
-  mamba_temporal_conv: 3        # causal temporal conv kernel
-  mamba_temporal_expand: 2      # SSM inner expansion factor
+  # Requires the active unified refinement head and >= 2 target_lead_times.
+  mamba_temporal:
+    enabled: false
+    mode: packed_joint
+    channels: 16
+    state_dim: 8
+    num_layers: 2
+    expansion_factor: 2
+    conv_kernel: 3
+    dropout: 0.0
+    gated_fusion: true
+    gate_init: 0.0
+    lead_time_conditioning: true
+    mask_conditioning: true
+    coordinate_conditioning: true
+    causal: true
+    learning_rate_multiplier: 1.0
+    objective:
+      base: mse
+      huber_delta: 1.0
+      charbonnier_epsilon: 1.0e-3
+      tendency_weight: 0.0
+      structure_weight: 0.0
+      extreme_weight: 0.0
+      extreme_quantile: 0.95
   model_kwargs: {}
 
 training:
@@ -369,13 +478,14 @@ training:
   loss_function: mse
   multi_target_loss_weights: {}
   # Weight of the Mamba temporal loss (trained on the ordered multi-lead
-  # rollout sequence). Only active when model.mamba_temporal_enabled=true
+  # rollout sequence). Only active when model.mamba_temporal.enabled=true
   # and there are >= 2 target lead times. 0 disables the temporal loss term.
-  mamba_temporal_weight: 0.0
+  mamba_temporal_weight: 1.0  # ignored while disabled; enables a one-key Mamba toggle
+  mamba_temporal_only: false  # true trains only temporal.* from a phase-1 checkpoint
   # Train each later lead on the same corrected autoregressive state that
   # inference feeds back, while retaining the unrefined prediction as the
   # residual-loss reference.
-  flow_refine_autoregressive_feedback: true
+  flow_refine_autoregressive_feedback: false
 
   # ---------------------------------------------------------------------
   # Structural auxiliary losses for the flow-matching refine head.
@@ -389,7 +499,7 @@ training:
   # the original pure residual-MSE behaviour.
   flow_aux_loss:
     # Master on/off switch for all structural terms below (single-line toggle).
-    enabled: true
+    enabled: false  # Legacy-only; unified weights live in model.refinement.loss.
     # Extreme-event performance: up-weight squared error on tail cells
     # (|z| above the per-sample quantile) + match spatial peak magnitude.
     extreme_weight: 0.5

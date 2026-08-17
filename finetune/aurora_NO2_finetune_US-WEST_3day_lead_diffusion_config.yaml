@@ -165,7 +165,7 @@ model:
   mixed_precision: bf16  # none | bf16 | fp16
   refinement:
     enabled: true
-    type: diffusion
+    type: diffusion_unet
     correction_convention: cams_minus_aurora_add
     checkpoint: null
     freeze_aurora: true
@@ -238,23 +238,7 @@ model:
       separate_by_level: true
       separate_by_lead_time: true
 
-    # Retained in this consolidated NO2 recipe so changing `type` to
-    # flow_matching_transformer is explicit and does not inherit an accidental
-    # scheduler/path default. The shared target, scaler, deterministic mean,
-    # conditioning, losses, checkpoint metric, and constraints stay unchanged.
-    flow_matching:
-      source_distribution: gaussian
-      interpolation_path: existing_aurora
-      integration_steps: 50
-      solver: euler  # existing_aurora uses data-parameterization updates, not an ODE solver.
-      stochastic_initialization: true
-      time_sampling: logit_normal
-      sigma_min: 1.0e-3
-      logit_normal_mean: -0.5
-      logit_normal_std: 1.2
-      residual_zscore: false  # shared per-channel correction scaler is authoritative
-      res_std_momentum: 0.99
-
+    # Diffusion process settings for the declared refinement head.
     diffusion:
       training_timesteps: 1000
       inference_steps: 50
@@ -274,7 +258,7 @@ model:
       deterministic_estimator: auto
       deterministic_training_steps: 4
 
-    # Retained for a one-line switch to diffusion_unet. The output projection
+    # Spatial backbone for the diffusion correction process. The output projection
     # is independently zero initialized for every packed variable/level.
     unet:
       hidden_channels: 64
@@ -306,12 +290,30 @@ model:
 
   # Optional causal sequence model. Keep it disabled unless a run explicitly
   # trains and validates the temporal objective independently.
-  mamba_temporal_enabled: false
-  mamba_temporal_channels: 16
-  mamba_temporal_state: 8
-  mamba_temporal_layers: 2
-  mamba_temporal_conv: 3
-  mamba_temporal_expand: 2
+  mamba_temporal:
+    enabled: false
+    mode: packed_joint
+    channels: 16
+    state_dim: 8
+    num_layers: 2
+    expansion_factor: 2
+    conv_kernel: 3
+    dropout: 0.0
+    gated_fusion: true
+    gate_init: 0.0
+    lead_time_conditioning: true
+    mask_conditioning: true
+    coordinate_conditioning: true
+    causal: true
+    learning_rate_multiplier: 1.0
+    objective:
+      base: mse
+      huber_delta: 1.0
+      charbonnier_epsilon: 1.0e-3
+      tendency_weight: 0.0
+      structure_weight: 0.0
+      extreme_weight: 0.0
+      extreme_quantile: 0.95
   model_kwargs: {}
 
 training:
@@ -320,7 +322,8 @@ training:
   num_epochs: 100
   # Phase 1 Aurora is frozen; train the diffusion correction head only.
   refinement_loss_weight: 1.0
-  mamba_temporal_weight: 0.0
+  mamba_temporal_weight: 1.0  # ignored while disabled; enables a one-key Mamba toggle
+  mamba_temporal_only: false  # true trains only temporal.* from a phase-1 checkpoint
   learning_rate: 3.0e-4
   optimizer: adamw
   weight_decay: 0.0

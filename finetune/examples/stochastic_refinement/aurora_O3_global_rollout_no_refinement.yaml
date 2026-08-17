@@ -493,7 +493,7 @@ training:
   # the original pure residual-MSE behaviour.
   flow_aux_loss:
     # Master on/off switch for all structural terms below (single-line toggle).
-    enabled: true
+    enabled: false  # No refinement objective is active in this baseline.
     # Extreme-event performance: up-weight squared error on tail cells
     # (|z| above the per-sample quantile) + match spatial peak magnitude.
     extreme_weight: 0.5

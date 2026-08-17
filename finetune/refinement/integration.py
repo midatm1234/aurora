@@ -556,6 +556,8 @@ def refine_batch_prediction(
     aurora_input_batch: Any | None = None,
     return_details: bool = False,
     temporal_history: list[torch.Tensor] | None = None,
+    temporal_lead_history: list[torch.Tensor] | None = None,
+    temporal_control: str = "on",
 ) -> Any:
     """Refine one deterministic Aurora prediction ``Batch`` as postprocessing.
 
@@ -620,6 +622,8 @@ def refine_batch_prediction(
         generator=generator,
         return_members=return_details,
         temporal_history=temporal_history,
+        temporal_lead_history=temporal_lead_history,
+        temporal_control=temporal_control,
     )
     refined_physical = result.refined_physical
     if refined_physical is None:

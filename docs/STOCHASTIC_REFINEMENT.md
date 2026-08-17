@@ -809,7 +809,7 @@ Training (all use the existing distributed driver):
 python finetune/aurora_finetune_distributed.py \
   --config finetune/examples/stochastic_refinement/aurora_O3_global_rollout_no_refinement.yaml
 
-# existing flow-matching UNet (unchanged behaviour)
+# compatibility filename using the unified flow-matching convolutional UNet
 python finetune/aurora_finetune_distributed.py \
   --config finetune/examples/stochastic_refinement/aurora_O3_global_flow_matching_unet.yaml
 

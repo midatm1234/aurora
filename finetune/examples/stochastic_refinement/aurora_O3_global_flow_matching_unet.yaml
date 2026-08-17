@@ -1,13 +1,21 @@
-# Example configuration: existing flow-matching UNet (refinement.type: flow_matching_unet)
+# Copyright (c) Microsoft Corporation. Licensed under the MIT license.
 #
-# Derived, unmodified except where noted, from
-# ``finetune/aurora_O3_global_finetune_3day_lead_config.yaml`` (a currently
-# working Aurora flow-matching configuration). Existing YAML files are never
-# overwritten; this is an additional, explicitly versioned example.
+# Conditional flow matching on the CONVOLUTIONAL UNet backbone (Phase 2).
 #
-# This is the EXISTING Aurora rectified-flow head. `flow_matching` remains a backward-compatible alias and existing checkpoints load unchanged.
+# This pairs the flow-matching objective used by the Transformer variant with a
+# fully convolutional spatial backbone. It provides a controlled UNet-versus-
+# Transformer comparison without changing the probability path or target.
+# Neither architecture is assumed superior; select it from independent,
+# per-variable and per-level validation metrics. Run the comparison with:
 #
-# See docs/STOCHASTIC_REFINEMENT.md for the full schema.
+#   python -m finetune.refinement.benchmark --case no2_uswest --compare
+#
+# Benchmark reports record source provenance and must use unrefined Aurora input.
+# Do not compare against an already-refined rollout mislabeled as raw Aurora.
+#
+# This is DISTINCT from type: flow_matching_unet, which keeps routing to the
+# original Aurora flow wrapper so existing checkpoints stay valid.
+
 paths:
   # Preserve the finetune-directory project root used by the source config.
   project_root: ../..
@@ -28,7 +36,7 @@ paths:
 #   <output_dir>/<case_name>/  and  <checkpoint_dir>/<case_name>/
 # resume_from="best"/"last" resolves relative to the case folder, so
 # stages chain naturally when you keep case_name fixed across runs.
-case_name: O3_global_3day_lead_flow_matching_unet
+case_name: O3_global_3day_lead_flow_matching_conv_unet_compat
 
 # Evaluation settings consumed by evaluate_finetuned_cams_rollouts.ipynb.
 # Ground truth, fine-tuned output, result paths, targets, levels, and lead
@@ -268,7 +276,7 @@ model:
   # physical lead hours (12, 24, ..., 72) so each head can learn that CAMS
   # rollout residual amplitude and structure evolve with lead. The scale is
   # also the maximum supported lead for inference; longer rollouts fail loudly.
-  flow_refine_lead_time_cond: true
+  flow_refine_lead_time_cond: false
   flow_refine_lead_time_scale_hours: 72
   # Optional absolute-position conditioning. When enabled, the Flow head gets
   # sin(lon)/cos(lon), never raw longitude. Enabling changes checkpoint input
@@ -291,15 +299,13 @@ model:
   # eval sampler deterministic (1 step) for the column field.
   flow_refine_sampling_steps_late: 1
   # ------------------------------------------------------------------
-  # Mamba temporal module (long-lead rollout corrector).
-  # Adds a selective state-space (Mamba) corrector on top of the
-  # flow-matching output. It learns how the bias-corrected field and
-  # Aurora's residual evolve across a rollout sequence, targeting the
-  # accumulated drift that degrades 2-3 day forecasts relative to 6 h.
-  # The temporal decoder is zero-init (identity-at-init), so the module
-  # is a no-op until trained. Trained on the ordered multi-lead sequence
-  # (see training.mamba_temporal_weight) and applied causally at rollout.
-  # Requires flow_refine_enabled: true and >= 2 target_lead_times.
+  # Optional causal packed-joint temporal corrector.
+  # A shared selective state-space model sees every configured O3 field,
+  # physical forecast lead/spacing, validity masks, and geophysical coordinates.
+  # The ReZero fusion gate is identity-at-init, so this remains an exact no-op
+  # while disabled and until an enabled temporal phase learns a correction.
+  # Training uses ordered multi-lead sequences; rollout inference is causal.
+  # Requires an active model.refinement head and >= 2 target_lead_times.
 
   # ------------------------------------------------------------------
   # Unified stochastic residual refinement (Phase 2).
@@ -310,19 +316,38 @@ model:
   # ------------------------------------------------------------------
   refinement:
     enabled: true
-    type: flow_matching_unet
+    type: flow_matching_conv_unet
+    correction_convention: cams_minus_aurora_add
     checkpoint: null
     freeze_aurora: true
     joint_finetuning: false
+    # Repository-wide correction contract (including serialization/evaluation):
+    #   correction_target = CAMS - Aurora
+    #   refined_forecast = Aurora + predicted_correction
     train_on_residual: true
     feedback_to_rollout: false   # experimental when true; evaluate separately
     seed: 1234
+    # Pointwise skill (MAE/RMSE/bias) uses the deterministic conditional mean.
+    # For uncertainty experiments set deterministic_inference=false and use
+    # ensemble_size >= 2; never report one stochastic member as the forecast.
     ensemble_size: 1
+    deterministic_inference: true
+    deterministic_head: shared_process
 
     target_space:
       use_existing_normalization: true
       residual_space: normalized
-
+      # The residual lives in Aurora's FIELD-normalized space, where its
+      # standard deviation is 0.02-0.06, not 1.0. Diffusion and flow matching
+      # both mix it with unit-variance Gaussian noise, so without this the
+      # signal sits ~30x below the noise floor. Set to 'none' only to reproduce
+      # pre-audit numerics.
+      residual_scaling: per_channel
+      residual_scaling_center: true
+      residual_scaling_momentum: 0.05
+      residual_scaling_warmup_batches: 32
+      residual_scaling_target_std: 1.0
+      residual_clip_standard_deviations: 4.0
     conditioning:
       aurora_rollout: true
       aurora_input_state: false
@@ -330,31 +355,55 @@ model:
       static_fields: false
       masks: true
       forecast_lead_time: true   # physical hours; separate from process time
+      latitude: true
+      longitude: true
 
     loss:
       generative: mse
+      # --- Forecast-skill terms -------------------------------------------
+      # The generative objective trains a denoiser/velocity field; it does not
+      # train the deterministic estimate the forecast actually emits.
+      # deterministic_weight directly supervises that deployed estimate.
+      # Re-tune every auxiliary weight on an independent validation split.
+      deterministic_weight: 1.0
+      aux_on_deterministic: true   # score the field inference emits, not a noisy draw
+      bias_weight: 1.0             # systematic bias, grouped by variable/level/lead
+      # --- Structure, spread and extremes ----------------------------------
+      # The conditional mean is smooth, so a pure skill objective oversmooths.
+      # These recover spatial structure and tail behaviour.
+      pattern_correlation_weight: 0.5
+      variance_weight: 2.0         # spatial standard-deviation match
+      extreme_weight: 1.0          # quantile-weighted tail error
+      extreme_quantile: 0.95
+      extreme_intensity: 4.0
+      quantile_weight: 1.0         # sorted-value (1-D Wasserstein) PDF match
+      gradient_weight: 0.25
+      # --- Off by default --------------------------------------------------
+      extreme_tail: upper
       reconstruction_weight: 0.0
-      bias_weight: 0.0
-      gradient_weight: 0.0
-      pattern_correlation_weight: 0.0
+      mae_weight: 1.0
+      peak_weight: 0.0
+      spectral_weight: 0.0         # opt in only after case-specific validation
+      degradation_weight: 1.0      # penalize corrections that worsen Aurora
+      magnitude_weight: 0.0
       area_weighted: true
       separate_by_variable: true
       separate_by_level: true
       separate_by_lead_time: true
-
     flow_matching:
       source_distribution: gaussian
       interpolation_path: existing_aurora  # the Aurora x1 (data) formulation
-      integration_steps: 1
+      integration_steps: 50
       solver: euler
       stochastic_initialization: true
       time_sampling: logit_normal
       sigma_min: 1.0e-3
       logit_normal_mean: -0.5
       logit_normal_std: 1.2
-      residual_zscore: true
+      residual_zscore: false  # shared per-channel correction scaler is authoritative
       res_std_momentum: 0.99
 
+    # Explicit global-domain capacity; do not inherit the 64-channel default.
     unet:
       hidden_channels: 16
       num_levels: 3
@@ -365,12 +414,49 @@ model:
       attention_heads: 4
       zero_init_output: true
 
-  mamba_temporal_enabled: false
-  mamba_temporal_channels: 16   # per-pixel feature width of the encoder/SSM
-  mamba_temporal_state: 8       # SSM hidden state dimension (N)
-  mamba_temporal_layers: 2      # stacked Mamba blocks
-  mamba_temporal_conv: 3        # causal temporal conv kernel
-  mamba_temporal_expand: 2      # SSM inner expansion factor
+    transformer:
+      patch_size: [8, 8]
+      embedding_dim: 256
+      num_heads: 8
+      num_blocks: 6
+      mlp_ratio: 4.0
+      dropout: 0.0
+      positional_encoding: latlon_2d
+      max_tokens_lat: 256
+      max_tokens_lon: 512
+      attention_mode: windowed_2d   # global_2d is exact but costly on global grids
+      window_size: [8, 8]
+      shifted_windows: true
+      gradient_checkpointing: true
+      optimized_attention: auto
+      zero_init_output: true
+
+  # Optional causal sequence model. Keep it disabled unless a run explicitly
+  # trains and validates the temporal objective independently.
+  mamba_temporal:
+    enabled: false
+    mode: packed_joint
+    channels: 16
+    state_dim: 8
+    num_layers: 2
+    expansion_factor: 2
+    conv_kernel: 3
+    dropout: 0.0
+    gated_fusion: true
+    gate_init: 0.0
+    lead_time_conditioning: true
+    mask_conditioning: true
+    coordinate_conditioning: true
+    causal: true
+    learning_rate_multiplier: 1.0
+    objective:
+      base: mse
+      huber_delta: 1.0
+      charbonnier_epsilon: 1.0e-3
+      tendency_weight: 0.0
+      structure_weight: 0.0
+      extreme_weight: 0.0
+      extreme_quantile: 0.95
   model_kwargs: {}
 
 training:
@@ -425,11 +511,17 @@ training:
     patience: 3
     min_delta: 1.0e-5
   validation_frequency: 5
+  # Score the same deterministic conditional-mean product used at inference.
+  validation_refinement_ensemble_size: 1
   skip_validation: false
   # Keep model selection disjoint from the held-out test period. A temporal
   # gap equal to the maximum rollout lead is inserted automatically.
   validation_source: train_tail
   validation_fraction: 0.1
+  # Select in physical space: mean(refined RMSE / Aurora RMSE), grouped by
+  # variable, pressure level, and lead. Every target channel must improve.
+  checkpoint_metric: mean_physical_rmse_ratio
+  require_all_physical_channels_improve: true
   require_refinement_improvement: true
   save_best_only: true
   save_last: true
@@ -446,13 +538,13 @@ training:
   loss_function: mse
   multi_target_loss_weights: {}
   # Weight of the Mamba temporal loss (trained on the ordered multi-lead
-  # rollout sequence). Only active when model.mamba_temporal_enabled=true
+  # rollout sequence). Only active when model.mamba_temporal.enabled=true
   # and there are >= 2 target lead times. 0 disables the temporal loss term.
-  mamba_temporal_weight: 0.0
+  mamba_temporal_weight: 1.0  # ignored while disabled; enables a one-key Mamba toggle
   # Train each later lead on the same corrected autoregressive state that
   # inference feeds back, while retaining the unrefined prediction as the
   # residual-loss reference.
-  flow_refine_autoregressive_feedback: true
+  flow_refine_autoregressive_feedback: false
 
   # ---------------------------------------------------------------------
   # Structural auxiliary losses for the flow-matching refine head.
@@ -466,7 +558,7 @@ training:
   # the original pure residual-MSE behaviour.
   flow_aux_loss:
     # Master on/off switch for all structural terms below (single-line toggle).
-    enabled: true
+    enabled: false  # Legacy-only; unified weights live in model.refinement.loss.
     # Extreme-event performance: up-weight squared error on tail cells
     # (|z| above the per-sample quantile) + match spatial peak magnitude.
     extreme_weight: 0.5

@@ -37,6 +37,7 @@ import copy
 import hashlib
 import json
 import math
+import os
 import threading
 import warnings
 from dataclasses import dataclass, field
@@ -63,6 +64,36 @@ __all__ = [
 
 class ConfigValidationError(ValueError):
     """Raised for any invalid or mutually incompatible refinement setting."""
+
+
+_CONFIG_WARNING_LOCK = threading.Lock()
+_CONFIG_WARNINGS_EMITTED: set[tuple[type[Warning], str]] = set()
+
+
+def _warn_config_once(
+    message: str,
+    category: type[Warning] = RuntimeWarning,
+    *,
+    stacklevel: int = 2,
+) -> None:
+    """Emit each configuration advisory once, and only from torchrun rank zero."""
+    rank = os.environ.get("RANK")
+    if rank not in (None, ""):
+        try:
+            if int(rank) != 0:
+                return
+        except ValueError:
+            # An invalid external rank value should not hide useful diagnostics.
+            pass
+
+    key = (category, message)
+    with _CONFIG_WARNING_LOCK:
+        if key in _CONFIG_WARNINGS_EMITTED:
+            return
+        # Keep the lock through emission so concurrent config resolution cannot
+        # race. Record only after success so warning-as-error remains retryable.
+        warnings.warn(message, category, stacklevel=stacklevel + 1)
+        _CONFIG_WARNINGS_EMITTED.add(key)
 
 
 _EPSILON_RESIDUAL_WARNING_LOCK = threading.Lock()
@@ -1188,7 +1219,7 @@ class TransformerConfig:
         if attention_mode == "global_2d" and (
             raw.get("window_size") is not None or raw.get("shifted_windows") is not None
         ):
-            warnings.warn(
+            _warn_config_once(
                 "refinement.transformer.window_size / shifted_windows are ignored for "
                 "attention_mode='global_2d'.",
                 RuntimeWarning,
@@ -1704,9 +1735,7 @@ def _legacy_refinement_config(config: Any) -> RefinementConfig:
     if not bool(model_cfg.get("flow_refine_enabled", False)):
         return RefinementConfig()
 
-    feedback_to_rollout = training_cfg.get(
-        "flow_refine_autoregressive_feedback", False
-    )
+    feedback_to_rollout = training_cfg.get("flow_refine_autoregressive_feedback", False)
     if not isinstance(feedback_to_rollout, bool):
         raise ConfigValidationError(
             "training.flow_refine_autoregressive_feedback must be a boolean, "
@@ -1790,7 +1819,7 @@ def resolve_refinement_config(config: Any) -> RefinementConfig:
         else _as_bool("refinement", "enabled", enabled_raw, True)
     )
     if enabled and resolved_type == "none":
-        warnings.warn(
+        _warn_config_once(
             "refinement.enabled is true but refinement.type is 'none'; running the "
             "deterministic Aurora rollout without stochastic refinement.",
             RuntimeWarning,
@@ -1833,7 +1862,7 @@ def resolve_refinement_config(config: Any) -> RefinementConfig:
 
     feedback = _as_bool("refinement", "feedback_to_rollout", raw.get("feedback_to_rollout"), False)
     if feedback:
-        warnings.warn(
+        _warn_config_once(
             "refinement.feedback_to_rollout=true is EXPERIMENTAL: the refined field is "
             "fed back into later Aurora rollout steps, which changes the deterministic "
             "rollout trajectory and can accumulate error. Evaluate it independently.",
@@ -1893,13 +1922,13 @@ def resolve_refinement_config(config: Any) -> RefinementConfig:
         _warn_epsilon_residual_prediction_once()
 
     if cfg.is_active and cfg.is_diffusion and raw.get("flow_matching"):
-        warnings.warn(
+        _warn_config_once(
             f"refinement.flow_matching settings are ignored for type={cfg.type!r}.",
             RuntimeWarning,
             stacklevel=2,
         )
     if cfg.is_active and cfg.is_flow_matching and raw.get("diffusion"):
-        warnings.warn(
+        _warn_config_once(
             f"refinement.diffusion settings are ignored for type={cfg.type!r}.",
             RuntimeWarning,
             stacklevel=2,
@@ -1910,7 +1939,7 @@ def resolve_refinement_config(config: Any) -> RefinementConfig:
         and cfg.flow_matching.interpolation_path == "existing_aurora"
         and cfg.flow_matching.solver != "euler"
     ):
-        warnings.warn(
+        _warn_config_once(
             "refinement.flow_matching.solver is ignored for the existing_aurora "
             "data parameterization; use solver='euler' for an explicit no-op "
             "placeholder, or select interpolation_path='rectified_flow' for ODE "
@@ -1921,7 +1950,7 @@ def resolve_refinement_config(config: Any) -> RefinementConfig:
     training_section = _as_mapping(_locate_section(config, "training") or {})
     legacy_aux = _as_mapping(training_section.get("flow_aux_loss"))
     if cfg.backend == "unified" and bool(legacy_aux.get("enabled", False)):
-        warnings.warn(
+        _warn_config_once(
             "training.flow_aux_loss is implemented only by the legacy "
             "flow_matching_unet and is ignored by unified refinement heads. Move "
             "the desired weights to model.refinement.loss.",
@@ -2015,14 +2044,14 @@ def resolve_performance_config(config: Any) -> PerformanceConfig:
                 f"performance.{cache.section}.enabled requires refinement.freeze_aurora=true."
             )
     if cfg.compile.enabled and not (cfg.compile.aurora or cfg.compile.refinement):
-        warnings.warn(
+        _warn_config_once(
             "performance.compile.enabled is true but neither compile.aurora nor "
             "compile.refinement is enabled; nothing will be compiled.",
             RuntimeWarning,
             stacklevel=2,
         )
     if cfg.precision.mode != "fp32" or cfg.precision.allow_tf32:
-        warnings.warn(
+        _warn_config_once(
             "performance.precision requests a reduced-precision path; validate "
             "numerical parity against the fp32 reference before trusting results.",
             RuntimeWarning,
