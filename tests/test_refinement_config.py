@@ -779,7 +779,11 @@ def test_unified_examples_ship_a_safe_correction_product(name: str) -> None:
         text = handle.read()
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", RuntimeWarning)
-        raw = ft.load_config(path)
+        # This tests authored configuration, not filesystem preparation. The
+        # convenience loader requires private train/test files and creates
+        # output directories; validate the same YAML without those side effects.
+        raw = yaml.safe_load(text)
+        ft.validate_config(raw)
         cfg = resolve_refinement_config(raw)
 
     # The equations are intentionally present beside the machine-readable flag:
