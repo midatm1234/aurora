@@ -2,6 +2,8 @@
 
 The branch `agent_skills_to_finetune_aurora` adds a working local MCP/CLI backend around the existing fork. Source: `88f652f04aa75b65e410b8d00cf4ea07f2edd945` on `aurora_finetune_stochastic_refinement`. [Source and asset pins](../provenance/source-lock.json), [reference access records](../provenance/references.json), and the [post-commit implementation receipt](../provenance/implementation.json) identify the exact lineage. The feature implementation commit is `032a6326a2d05a200ca1963b9fc00a35892d5719`. The original working tree, uncommitted experiments, notebooks and trained artifacts were preserved in place; development used a separate worktree.
 
+Publication succeeded using the authenticated `midatm1234` account. Share [the published branch](https://github.com/midatm1234/aurora/tree/agent_skills_to_finetune_aurora). Published implementation and packaging commit `68c32207a964decc739c44c533ccfc17f42b942d` passed both [GitHub CI jobs](https://github.com/midatm1234/aurora/actions/runs/35778286127) and the complete workflow suite from a fresh HTTPS clone. The [publication receipt](../provenance/publication-validation.json) records that exact tested commit; subsequent documentation commits preserve the result as historical evidence. Resolve the current documentation/branch head with `git rev-parse HEAD`. Only the requested new branch was pushed, without force.
+
 ## Implementation
 
 `aurora_workflow/` separates planning/settings, filesystem/provenance safeguards, SQLite jobs and detached workers, assets, CAMS preparation, scientific adapters, physical evaluation, knowledge, and the MCP/CLI entry points. It reuses the fork's Aurora model, state advance, packing, residual heads, losses, optimizer/scheduler functions and compatibility validators. There is no weather starter project or hosted-service dependency.
@@ -84,6 +86,8 @@ The clean-machine CPU setup was actually installed from `scripts/bootstrap_workf
 | New complete workflow suite | **PASSED 103**, **SKIPPED 1** (104 collected) |
 | Selected existing refinement/checkpoint/normalization/model/flow/distributed/config/IO regression tests | **PASSED 250** |
 | Separate clean lightweight environment (no NumPy/PyTorch) | **PASSED 47**, **SKIPPED 6** optional numerical checks; real MCP and knowledge available |
+| Published-branch fresh clone, complete workflow suite | **PASSED 103**, **SKIPPED 1**; pinned source ancestry and all knowledge files present |
+| GitHub hosted CI at `68c3220` | **PASSED** both jobs: metadata **47 passed / 6 skipped**; CPU science **103 passed / 1 skipped** |
 | Actual SDK stdio initialize/discovery/schemas/structured results/dispatch | **PASSED**, SDK 1.30.0, negotiated protocol 2025-11-25, 24 tools |
 | Four unified heads plus none through MCP → durable worker → actual fixture train/refine/evaluate/report → registered run knowledge | **PASSED**, synthetic backbone/CAMS fixtures; actual refinement implementations |
 | Direct science versus MCP numerical parity, strict checkpoint reload, exact interrupted-resume comparison, no feedback/future-target input | **PASSED** within documented scope/tolerance |
@@ -99,6 +103,8 @@ The clean-machine CPU setup was actually installed from `scripts/bootstrap_workf
 | Final failing tests in the executed suites | **0** |
 
 The broadened regression run initially found five existing config-only tests requiring private train/test paths. All five were reproduced on a clean detached checkout of the source commit. The test now validates the identical YAML through `validate_config` without calling the convenience loader that checks data files and creates output directories. Scientific code and the historical YAMLs were unchanged. The resulting 250-test regression run passes. A nonfatal installed NumPy/NetCDF extension compatibility warning was observed; fixture values and round trips passed. Real forecast validation remains necessary.
+
+The first hosted runs exposed two packaging failures: the inherited `data/` ignore rule omitted four knowledge documents, and shallow CI checkout prevented pinned-source ancestry verification. Both were corrected; the published clean clone and hosted rerun passed. The suite also skips clearly when its optional dependencies are absent in the inherited legacy Python test matrix. A separate clean-archive audit passed all 35 knowledge tests and verified client/skill links. These checks do not require private datasets.
 
 Commands used:
 

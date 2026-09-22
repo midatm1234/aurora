@@ -1,0 +1,69 @@
+{
+  "authenticated_push_account": "midatm1234",
+  "branch": "agent_skills_to_finetune_aurora",
+  "branch_url": "https://github.com/midatm1234/aurora/tree/agent_skills_to_finetune_aurora",
+  "clean_archive_knowledge_audit": {
+    "concepts": 19,
+    "local_links_missing": 0,
+    "passed": 35,
+    "required_files_missing": 0
+  },
+  "force_push": false,
+  "fork_source_commit": "88f652f04aa75b65e410b8d00cf4ea07f2edd945",
+  "fresh_https_clone_workflow_tests": {
+    "errors": 0,
+    "failed": 0,
+    "junit_sha256": "c89eae22945209f8e5130553c2011650b4ad8f9553e2757cb808fe1f9012da03",
+    "passed": 103,
+    "seconds": 36.183,
+    "skipped": 1,
+    "total": 104
+  },
+  "hosted_ci": {
+    "completed_at": "2026-09-22T20:10:07Z",
+    "jobs": [
+      {
+        "failed": 0,
+        "id": 106916964715,
+        "name": "metadata",
+        "passed": 47,
+        "skipped": 6,
+        "state": "success"
+      },
+      {
+        "failed": 0,
+        "id": 106916965102,
+        "name": "cpu-science",
+        "passed": 103,
+        "skipped": 1,
+        "state": "success"
+      }
+    ],
+    "run_id": 35778286127,
+    "state": "success",
+    "url": "https://github.com/midatm1234/aurora/actions/runs/35778286127"
+  },
+  "note": "This records checks executed against the named published commit. Later documentation/receipt commits do not retroactively change that validation identity.",
+  "original_worktree": {
+    "branch": "aurora_finetune_stochastic_refinement",
+    "commit": "88f652f04aa75b65e410b8d00cf4ea07f2edd945",
+    "preserved": true,
+    "status_entries": 61
+  },
+  "publication_fixes": [
+    "Include authored knowledge/data Markdown despite inherited data/ ignore rule.",
+    "Fetch full source history in both hosted workflow jobs for pinned ancestry verification.",
+    "Skip optional workflow suite with a clear reason in unsupported legacy environments."
+  ],
+  "publication_state": "succeeded",
+  "pushed_refs": [
+    "refs/heads/agent_skills_to_finetune_aurora"
+  ],
+  "real_cams_gpu_execution": {
+    "reason": "Opt-in resource approval was not received; CPU fixture success is not scientific reproduction.",
+    "state": "SKIPPED"
+  },
+  "recorded_at": "2026-09-22T20:11:16.605913+00:00",
+  "schema_version": 1,
+  "validated_commit": "68c32207a964decc739c44c533ccfc17f42b942d"
+}
