@@ -1,0 +1,5 @@
+# Metadata, knowledge, CLI and supported MCP v1 maintenance line; no model dependencies.
+mcp==1.30.0
+pydantic==2.13.4
+PyYAML==6.0.3
+pytest==9.1.1

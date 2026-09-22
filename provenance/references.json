@@ -1,0 +1,141 @@
+{
+  "schema_version": 1,
+  "accessed_at": "2026-09-22T19:27:00.282592+00:00",
+  "note": "Page hashes identify retrieved response bytes, not immutable upstream version pins. Full external documents are not redistributed. arXiv references were reviewed as abstract/metadata pages; Nature atmospheric-chemistry methods/results were read.",
+  "repositories": {
+    "GoogleCloudPlatform/knowledge-catalog": "22efaa5402775a7c4d4c37f89e41258daaf3cb65",
+    "microsoft/vibe-kit": "6590f598c1a7294d7b3c8874721af4cca1908679",
+    "microsoft/aurora": "4765abc724c607a18f93df0302dbd0afcaca17fa",
+    "modelcontextprotocol/python-sdk": "6affe5c0d3588fd1705713b3703dc68015cfe3eb",
+    "modelcontextprotocol/modelcontextprotocol": "c7400a0796045cbf102cb80b9b41422c7ce8e7af",
+    "agentskills/agentskills": "69ef37e9424c0a7ea9dd2293b559e43ec8176379"
+  },
+  "documents": {
+    "nature": {
+      "url": "https://www.nature.com/articles/s41586-025-09005-y",
+      "sha256": "d3f27bb290a130f4a9642602023ce1aa5b275e43d77aeb37aae93ea8f02ab463",
+      "status": "accessed",
+      "arxiv_version": null
+    },
+    "flow": {
+      "url": "https://arxiv.org/abs/2210.02747",
+      "sha256": "228275106e1c6eb485b9729a4226982bd7bb7f5fc8d16fd3d6567aa49074d25d",
+      "status": "accessed",
+      "arxiv_version": "arXiv:2210.02747v2"
+    },
+    "ddpm": {
+      "url": "https://arxiv.org/abs/2006.11239",
+      "sha256": "16370e3d3273a8d7fc27bb779fb42c853b57231d25ecf2c76cca07eb6a80260d",
+      "status": "accessed",
+      "arxiv_version": "arXiv:2006.11239v2"
+    },
+    "dit": {
+      "url": "https://arxiv.org/abs/2212.09748",
+      "sha256": "9bc37273c06b4d9195d6c9ccce1402bd34f343530b381fc207df8b67d3cfd8ea",
+      "status": "accessed",
+      "arxiv_version": "arXiv:2212.09748v2"
+    },
+    "mamba": {
+      "url": "https://arxiv.org/abs/2312.00752",
+      "sha256": "c46e80f9a7fb8d7f280bd5bf790e63d124321224d3902bafbaa185a484d2d4e3",
+      "status": "accessed",
+      "arxiv_version": "arXiv:2312.00752v2"
+    },
+    "corrdiff": {
+      "url": "https://arxiv.org/abs/2309.15214",
+      "sha256": "3a79ae8cb99cd5030451e3f2ded717b3ad453a056e35db7fb446f9ac687dc93f",
+      "status": "accessed",
+      "arxiv_version": "arXiv:2309.15214v4"
+    },
+    "codex-mcp": {
+      "url": "https://learn.chatgpt.com/docs/extend/mcp.md?surface=cli",
+      "sha256": "978cad2319d28ce8e888e890cb6bd5c5a0631d3dc0b463fc66928ba419982f1a",
+      "status": "accessed",
+      "arxiv_version": null
+    },
+    "codex-skills": {
+      "url": "https://learn.chatgpt.com/docs/build-skills.md",
+      "sha256": "d15791562748e64a53dfec534b8558aa522e732cec0fdedcf7257fa4ef486a20",
+      "status": "accessed",
+      "arxiv_version": null
+    },
+    "claude-mcp": {
+      "url": "https://code.claude.com/docs/en/mcp.md",
+      "sha256": "d872a8aded51160476e935bad371f10a06e31d244f23f3f4f28f057c0f0ca36e",
+      "status": "accessed",
+      "arxiv_version": null
+    },
+    "claude-skills": {
+      "url": "https://code.claude.com/docs/en/skills.md",
+      "sha256": "f7ebd153d18e51023d6b4d829921eee81ef57af837b9bd9acd24752d85b94352",
+      "status": "accessed",
+      "arxiv_version": null
+    },
+    "vscode-mcp": {
+      "url": "https://code.visualstudio.com/docs/agent-customization/mcp-servers",
+      "sha256": "c5a5e59de0a8aee80e5b3d955d67991dc81f9985c6aa4e26c700b4e82b5e0322",
+      "status": "accessed",
+      "arxiv_version": null
+    },
+    "github-skills": {
+      "url": "https://docs.github.com/en/copilot/how-tos/copilot-on-github/customize-copilot/customize-cloud-agent/add-skills",
+      "sha256": "546f53e4d81793bcab9892ec6454ca1b3372e1a4d43abe393d5b71e828745c92",
+      "status": "accessed",
+      "arxiv_version": null
+    },
+    "agentskills": {
+      "url": "https://agentskills.io/specification",
+      "sha256": "b856c12fce12ffbf251dff9219201c7688ff599f54bbd4f1a2339f60ce65a302",
+      "status": "accessed",
+      "arxiv_version": null
+    },
+    "mcp": {
+      "url": "https://modelcontextprotocol.io/specification/2025-11-25",
+      "sha256": "3cdc3b019a5d06f19ff32b861740f07d0f1a114efbd6e121b0f4a757c37753e1",
+      "status": "accessed",
+      "arxiv_version": null
+    },
+    "aurora-models": {
+      "url": "https://microsoft.github.io/aurora/models.html",
+      "sha256": "8395f93a840d700a2c7e8cb152075d71c5d8f0fcefed55f108739d968f1b2570",
+      "status": "accessed",
+      "arxiv_version": null
+    },
+    "aurora-cams": {
+      "url": "https://microsoft.github.io/aurora/example_cams.html",
+      "sha256": "8fb87c8b874f9b2bf75c02db40cfd98f8bbaa8a44ea6686e50936ecb80c6fcba",
+      "status": "accessed",
+      "arxiv_version": null
+    },
+    "cams": {
+      "url": "https://ads.atmosphere.copernicus.eu/datasets/cams-global-atmospheric-composition-forecasts?tab=overview",
+      "sha256": "cc847ad889263d0643b0d33eec4588e4adb2b3c994b9391a7fa7a8c50ed8f731",
+      "status": "accessed",
+      "arxiv_version": null
+    },
+    "okf": {
+      "url": "https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/22efaa5402775a7c4d4c37f89e41258daaf3cb65/okf/SPEC.md",
+      "revision": "22efaa5402775a7c4d4c37f89e41258daaf3cb65",
+      "sha256": "26aa5da029278939f914e578107242d9607d4f2dc5fe153272b82f9ed1030101",
+      "status": "accessed"
+    },
+    "vibe-kit-skill": {
+      "url": "https://github.com/microsoft/vibe-kit/blob/6590f598c1a7294d7b3c8874721af4cca1908679/skills/msresearch-aurora/SKILL.md",
+      "revision": "6590f598c1a7294d7b3c8874721af4cca1908679",
+      "sha256": "37209382c6d350a8a9288cc407661b3a343e2ba3a83fd2832cdeb53716954842",
+      "status": "accessed"
+    }
+  },
+  "presentation": {
+    "filename": "Fine-tuning Microsoft Aurora for an Air Quality Digital Twin (1).pptx",
+    "status": "unavailable",
+    "searched": [
+      "user attachment directory",
+      "repository file inventory"
+    ],
+    "sha256": null,
+    "slides_inspected": false,
+    "notes_extracted": false,
+    "note": "Only pasted request supplied; docs/GEOS-CF.pdf is a different document."
+  }
+}

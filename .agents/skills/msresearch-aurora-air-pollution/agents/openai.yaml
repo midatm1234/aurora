@@ -1,0 +1,6 @@
+interface:
+  display_name: "Aurora Air Pollution"
+  short_description: "Reproduce CAMS forecasts and residual refinement"
+  default_prompt: "Use $msresearch-aurora-air-pollution to inspect existing assets and plan a bounded reproduction."
+policy:
+  allow_implicit_invocation: true

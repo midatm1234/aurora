@@ -1,0 +1,79 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Aurora project extensions to OKF v0.2",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "model_track": {
+      "enum": [
+        "aurora_air_pollution",
+        "weather_separate",
+        "format_only"
+      ]
+    },
+    "configuration_hash": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "slide_references": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "slide",
+          "file_sha256"
+        ],
+        "properties": {
+          "slide": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "file_sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          }
+        }
+      }
+    },
+    "evidence_kind": {
+      "enum": [
+        "code_verified",
+        "executed_run",
+        "hypothesis",
+        "published_background",
+        "repository_reported",
+        "slide_reported",
+        "unavailable"
+      ]
+    },
+    "implementation_status": {
+      "enum": [
+        "documented",
+        "historical",
+        "implemented",
+        "planned",
+        "unavailable"
+      ]
+    },
+    "execution_status": {
+      "enum": [
+        "blocked",
+        "failed",
+        "not_run",
+        "requires_artifact",
+        "skipped",
+        "succeeded"
+      ]
+    },
+    "reporting_status": {
+      "enum": [
+        "background",
+        "executed_fixture",
+        "executed_real",
+        "historical_unreproduced",
+        "hypothesis",
+        "unavailable"
+      ]
+    }
+  }
+}

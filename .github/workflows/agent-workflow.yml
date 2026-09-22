@@ -1,0 +1,24 @@
+name: Portable air-pollution workflow
+on: [push, pull_request]
+jobs:
+  metadata:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r requirements/workflow-light.txt
+      - run: python -m pytest --confcutdir=tests/workflow tests/workflow/test_core.py tests/workflow/test_mcp.py tests/workflow/test_knowledge.py
+  cpu-science:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python scripts/bootstrap_workflow.py --venv /tmp/aurora-cpu --science
+      - run: /tmp/aurora-cpu/bin/python -m pytest --confcutdir=tests/workflow tests/workflow
+        env:
+          CUDA_VISIBLE_DEVICES: ''
+          OMP_NUM_THREADS: '1'

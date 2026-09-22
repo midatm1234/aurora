@@ -1,0 +1,11 @@
+-r workflow-light.txt
+# Install torch/torchvision CPU wheels first, using bootstrap_workflow.py --science.
+numpy==2.4.6
+scipy==1.17.1
+einops==0.8.2
+timm==1.0.27
+xarray==2026.4.0
+netCDF4==1.7.4
+huggingface-hub==1.17.0
+cdsapi==0.7.7
+dask[array]==2026.8.0

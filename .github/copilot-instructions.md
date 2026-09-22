@@ -1,0 +1,3 @@
+For Aurora air-pollution work, read [AGENTS.md](../AGENTS.md), the authoritative [workflow skill](../.agents/skills/msresearch-aurora-air-pollution/SKILL.md), and [knowledge/index.md](../knowledge/index.md). The canonical `.agents/skills` directory is the skill source. Use its existing-artifact inspection, exact checkpoint/model contracts, bounded human-approved MCP execution, and evidence rules.
+
+For GitHub Copilot in VS Code, register the local server using [docs/agent-workflow.md](../docs/agent-workflow.md) and its `.vscode/mcp.json` example. Do not assume that this configuration installs a server into GitHub cloud agents or supplies a GPU. No separate Copilot scientific workflow is maintained.

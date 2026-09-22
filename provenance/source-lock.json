@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "fork": {
+    "repository": "https://github.com/midatm1234/aurora",
+    "source_branch": "aurora_finetune_stochastic_refinement",
+    "source_commit": "88f652f04aa75b65e410b8d00cf4ea07f2edd945",
+    "implementation_branch": "agent_skills_to_finetune_aurora",
+    "implementation_commit": "resolved from git HEAD in each execution manifest; see implementation receipt after commit"
+  },
+  "upstream": {
+    "repository": "https://github.com/microsoft/aurora",
+    "reference_commit": "4765abc724c607a18f93df0302dbd0afcaca17fa",
+    "role": "reference only; never installed in place of fork"
+  },
+  "huggingface": {
+    "repository": "microsoft/aurora",
+    "revision": "a96afd7ee6d65e3bd2d476f3be798a25a56f2296",
+    "metadata_source": "https://huggingface.co/api/models/microsoft/aurora?blobs=true",
+    "assets": {
+      "pretrained": {
+        "filename": "aurora-0.4-air-pollution.ckpt",
+        "sha256": "e0186f46fff92df0eb5975471e6117b0812a2ed01558544930b7ec38666c85f5",
+        "bytes": 5096147215,
+        "model_family": "AuroraAirPollution"
+      },
+      "static": {
+        "filename": "aurora-0.4-air-pollution-static.pickle",
+        "sha256": "4a76374694e7c576b41cdfbe11444c2ea50cf1d91b64f23fe2554c15c946b351",
+        "bytes": 17860299,
+        "model_family": "AuroraAirPollution"
+      }
+    }
+  },
+  "observed_at": "2026-09-22",
+  "refinement_distribution": "No public trained refinement URL established. Operator-supplied local assets require SHA256 and architecture metadata. Private historical artifacts are not distributed by this branch."
+}

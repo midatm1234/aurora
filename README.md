@@ -1,3 +1,15 @@
+## Reproduce the air-pollution refinement workflow with an agent
+
+This branch adds a local MCP workflow around this fork's existing `AuroraAirPollution` implementation. Start with [the portable onboarding guide](docs/agent-workflow.md), [workflow inventory](docs/workflow-inventory.md), and [implementation/validation report](docs/workflow-implementation-report.md). Existing notebooks below remain available.
+
+The workflow provides pinned assets, versioned NO2/O3 recipes, four unified residual heads plus the unchanged baseline, bounded human-approved jobs, physical-unit evaluation, and an attributed [OKF knowledge bundle](knowledge/index.md). The canonical recipes use autonomous frozen-backbone rollouts; separately named historical forecast-forced recipes document their exogenous inputs. Replay, resume, warm-start and retraining are distinct modes. Mamba remains optional in the existing research runners and is disabled in the canonical spatial recipes.
+
+Copy this handoff prompt into your local agent:
+
+> Read `AGENTS.md`, `.agents/skills/msresearch-aurora-air-pollution/SKILL.md`, and `knowledge/index.md`. Inspect the checked-out commit, environment, available datasets, baseline outputs, trained checkpoints, and run manifests. Follow `docs/agent-workflow.md` to propose the necessary local setup and register the stdio MCP server. Prefer verified artifact reuse. Ask me to choose replay, resume, reproduce training, or evaluation and select the recipe/head. Use MCP to make a bounded plan, have me approve that exact plan in my terminal, and execute or recover it through MCP. Report actual validation, provenance, missing artifacts, and mixed/negative metrics honestly. Do not substitute weather weights or claim historical reproduction from synthetic tests.
+
+Sharing this URL supplies code and recipes. The recipient supplies compute, credentials, data permissions, and any unpublished trained refinement checkpoint. The default CI uses synthetic CPU fixtures; it does not establish real forecast skill.
+
 <img src="docs/gifs/high_res_2t.gif" alt="high resolution (0.1 degree) temperature at 2m predictions gif" width="150px">&nbsp;&nbsp;&nbsp;<img src="docs/gifs/no2.gif" alt="nitrogen dioxide predictions gif" width="150px">&nbsp;&nbsp;&nbsp;<img src="docs/gifs/wave_direction.gif" alt="ocean wave direction predictions gif" width="150px">&nbsp;&nbsp;&nbsp;<img src="docs/gifs/tc_tracks.gif" alt="tropical cyclone track predictions gif" width="220px">
 
 # Aurora: A Foundation Model for the Earth System

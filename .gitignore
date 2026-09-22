@@ -46,3 +46,19 @@ examples/outputs/
 examples/cams_download_2025_range.log
 finetune/*.pdf
 *.orig
+
+# Portable workflow local configuration and generated artifacts
+workflow.local.json
+.workflow/
+.venv/
+.venv*/
+.pytest_cache/
+__pycache__/
+*.partial
+*.ckpt
+*.pt
+*.pth
+*.pickle
+*.npz
+*.nc
+!tests/workflow/fixtures/**
