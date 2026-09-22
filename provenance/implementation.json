@@ -1,0 +1,116 @@
+{
+  "client_sessions": {
+    "claude_code": "BLOCKED: client unavailable",
+    "codex_registration_parse": "PASSED (0.154.0-alpha.6.2); no paid agent session launched",
+    "copilot_vscode": "BLOCKED: client session unavailable"
+  },
+  "configuration_test_fix_commit": "c25d668928580b29714c46b547a93d0353873d24",
+  "cpu_mcp_fixtures": [
+    {
+      "execution_kind": "fixture",
+      "manifest_sha256": "07b772fe570ccd866aae2a49b725b54798393c6ba8e5a8ca477606a1af901db9",
+      "plan_id": "c962ac19f41b708e359a749e46e58c15faad430bff5c66cd76db0438cf415cbe",
+      "run_id": "reproduction-none-c962ac19f41b",
+      "state": "succeeded"
+    },
+    {
+      "execution_kind": "fixture",
+      "manifest_sha256": "a87bca10099083cd101f55afe40b5fb48c14b99154a91f3dbc1fcb9011268f52",
+      "plan_id": "084bdf92c1ac4b8682278f911b5ca31e9e12be6146b3a66959ea3d83caecea1a",
+      "run_id": "reproduction-flow_matching_transformer-084bdf92c1ac",
+      "state": "succeeded"
+    },
+    {
+      "execution_kind": "fixture",
+      "manifest_sha256": "795fb6a1551969422e0481a41810c030ad2cfb7e77a59c20c1125c2c6e0f38e1",
+      "plan_id": "1a5258da503f63c6409a83619ba0b2138c4e9547bf102df536f00ea272045909",
+      "run_id": "reproduction-diffusion_transformer-1a5258da503f",
+      "state": "succeeded"
+    },
+    {
+      "execution_kind": "fixture",
+      "manifest_sha256": "42de7d81845bf82de24dc2e1ba19984e31f2f88c013ebf270db830cde9f19b17",
+      "plan_id": "5aaaf4690ef6a30c84184501aa2abdbd4279b1f87e518c1666769fa2b6168af9",
+      "run_id": "reproduction-diffusion_unet-5aaaf4690ef6",
+      "state": "succeeded"
+    },
+    {
+      "execution_kind": "fixture",
+      "manifest_sha256": "04ebf83d9517018bec6faf63f571119b5c56554ef85d4b460bdfcae07cd82b2a",
+      "plan_id": "edcb5509e28bfb8e14a7f199ec7de6aa4abbd59c6b59d3948c93cfb0f4ab309b",
+      "run_id": "reproduction-flow_matching_conv_unet-edcb5509e28b",
+      "state": "succeeded"
+    }
+  ],
+  "fork_source_commit": "88f652f04aa75b65e410b8d00cf4ea07f2edd945",
+  "human_scientific_review": false,
+  "implementation_commit": "032a6326a2d05a200ca1963b9fc00a35892d5719",
+  "mcp": {
+    "negotiated_protocol": "2025-11-25",
+    "sdk": "1.30.0",
+    "sdk_real_handshake": true,
+    "tools": 24,
+    "transport": "stdio"
+  },
+  "presentation": {
+    "reason": "Requested .pptx not present",
+    "state": "BLOCKED"
+  },
+  "python": "3.12.3",
+  "real_gpu_execution": {
+    "reason": "Opt-in CAMS/GPU resource authorization not received; no real backbone forecasts generated",
+    "state": "SKIPPED"
+  },
+  "recorded_at": "2026-09-22T20:01:35.748641+00:00",
+  "schema_version": 1,
+  "scientific_skill_claim": null,
+  "selected_dependencies": {
+    "dask": "2026.8.0",
+    "huggingface-hub": "1.17.0",
+    "mcp": "1.30.0",
+    "netCDF4": "1.7.4",
+    "numpy": "2.4.6",
+    "scipy": "1.17.1",
+    "torch": "2.10.0+cpu",
+    "torchvision": "0.25.0+cpu",
+    "xarray": "2026.4.0"
+  },
+  "test_suites": [
+    {
+      "errors": 0,
+      "failed": 0,
+      "junit_sha256": "022cb2df16a9e4aecec6122078a1f0e0e298da118b9b0490f6b5bf8790c7246c",
+      "name": "workflow",
+      "passed": 103,
+      "seconds": 35.818,
+      "skipped": 1,
+      "total": 104
+    },
+    {
+      "errors": 0,
+      "failed": 0,
+      "junit_sha256": "15fd2b24c50145a2fd17d28525c5674c1300e12656cee0e99bfa5099e26089e7",
+      "name": "existing_regression",
+      "passed": 250,
+      "seconds": 1.82,
+      "skipped": 0,
+      "total": 250
+    },
+    {
+      "errors": 0,
+      "failed": 0,
+      "junit_sha256": "28c6ed1ae010e49207fd30b4272fc62c359225cb3ccfca8d5c7e101e3f1a59ce",
+      "name": "lightweight_only",
+      "passed": 47,
+      "seconds": 3.066,
+      "skipped": 6,
+      "total": 53
+    }
+  ],
+  "validated_code_recipe_trust_fingerprint": "3cdd78971468335fc649d9bfcdbd4a95e266344e15b6cded536505c21ca3b333",
+  "validation_note": "Tests ran before the feature commit; successful MCP fixture manifests have an identical code/recipe/trust-file fingerprint to the committed implementation. This subsequent receipt only adds provenance/documentation. Raw temporary test outputs are deliberately excluded from Git.",
+  "warnings": [
+    "Nonfatal installed NumPy/NetCDF binary-compatibility warning observed; data round trips and numerical checks pass.",
+    "Five inherited configuration-only tests initially failed on pinned source due to absent private data paths; test now uses the same validate_config API without filesystem setup side effects."
+  ]
+}

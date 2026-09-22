@@ -1,6 +1,6 @@
 # Implementation and validation handoff
 
-The branch `agent_skills_to_finetune_aurora` adds a working local MCP/CLI backend around the existing fork. Source: `88f652f04aa75b65e410b8d00cf4ea07f2edd945` on `aurora_finetune_stochastic_refinement`. [Source and asset pins](../provenance/source-lock.json), [reference access records](../provenance/references.json), and the post-commit implementation receipt identify the exact lineage. The original working tree, uncommitted experiments, notebooks and trained artifacts were preserved in place; development used a separate worktree.
+The branch `agent_skills_to_finetune_aurora` adds a working local MCP/CLI backend around the existing fork. Source: `88f652f04aa75b65e410b8d00cf4ea07f2edd945` on `aurora_finetune_stochastic_refinement`. [Source and asset pins](../provenance/source-lock.json), [reference access records](../provenance/references.json), and the [post-commit implementation receipt](../provenance/implementation.json) identify the exact lineage. The feature implementation commit is `032a6326a2d05a200ca1963b9fc00a35892d5719`. The original working tree, uncommitted experiments, notebooks and trained artifacts were preserved in place; development used a separate worktree.
 
 ## Implementation
 

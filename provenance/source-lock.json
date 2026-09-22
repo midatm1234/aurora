@@ -1,36 +1,61 @@
 {
-  "schema_version": 1,
   "fork": {
+    "implementation_branch": "agent_skills_to_finetune_aurora",
+    "implementation_commit": "032a6326a2d05a200ca1963b9fc00a35892d5719",
     "repository": "https://github.com/midatm1234/aurora",
     "source_branch": "aurora_finetune_stochastic_refinement",
-    "source_commit": "88f652f04aa75b65e410b8d00cf4ea07f2edd945",
-    "implementation_branch": "agent_skills_to_finetune_aurora",
-    "implementation_commit": "resolved from git HEAD in each execution manifest; see implementation receipt after commit"
-  },
-  "upstream": {
-    "repository": "https://github.com/microsoft/aurora",
-    "reference_commit": "4765abc724c607a18f93df0302dbd0afcaca17fa",
-    "role": "reference only; never installed in place of fork"
+    "source_commit": "88f652f04aa75b65e410b8d00cf4ea07f2edd945"
   },
   "huggingface": {
-    "repository": "microsoft/aurora",
-    "revision": "a96afd7ee6d65e3bd2d476f3be798a25a56f2296",
-    "metadata_source": "https://huggingface.co/api/models/microsoft/aurora?blobs=true",
     "assets": {
       "pretrained": {
-        "filename": "aurora-0.4-air-pollution.ckpt",
-        "sha256": "e0186f46fff92df0eb5975471e6117b0812a2ed01558544930b7ec38666c85f5",
         "bytes": 5096147215,
-        "model_family": "AuroraAirPollution"
+        "filename": "aurora-0.4-air-pollution.ckpt",
+        "model_family": "AuroraAirPollution",
+        "sha256": "e0186f46fff92df0eb5975471e6117b0812a2ed01558544930b7ec38666c85f5"
       },
       "static": {
-        "filename": "aurora-0.4-air-pollution-static.pickle",
-        "sha256": "4a76374694e7c576b41cdfbe11444c2ea50cf1d91b64f23fe2554c15c946b351",
         "bytes": 17860299,
-        "model_family": "AuroraAirPollution"
+        "filename": "aurora-0.4-air-pollution-static.pickle",
+        "model_family": "AuroraAirPollution",
+        "sha256": "4a76374694e7c576b41cdfbe11444c2ea50cf1d91b64f23fe2554c15c946b351"
       }
-    }
+    },
+    "metadata_source": "https://huggingface.co/api/models/microsoft/aurora?blobs=true",
+    "repository": "microsoft/aurora",
+    "revision": "a96afd7ee6d65e3bd2d476f3be798a25a56f2296"
   },
   "observed_at": "2026-09-22",
-  "refinement_distribution": "No public trained refinement URL established. Operator-supplied local assets require SHA256 and architecture metadata. Private historical artifacts are not distributed by this branch."
+  "refinement_artifacts": [
+    {
+      "bytes": 5174941833,
+      "distribution_status": "requires_artifact",
+      "filename": "best.ckpt",
+      "grid": [
+        51,
+        69
+      ],
+      "head_type": "flow_matching_transformer",
+      "identity": "historical-no2-flow-matching-transformer-best",
+      "model_family": "AuroraAirPollution",
+      "point_parameterization": "clean_residual_x1_data_zero_state_t0",
+      "public_url": null,
+      "sha256": "6c9694b7ca6b5d0df6c9b58899655608b7375f9fdd1a796e4450389842372916",
+      "sidecar_sha256": "19c4c5247fd6927e83b0b814e15825122462527bfdd5ab082a51a43ce44119b9",
+      "target_channels": [
+        "no2_1000",
+        "no2_925",
+        "no2_850",
+        "tcno2"
+      ],
+      "validation_evidence": "Actual CPU-only strict head/calibration load; 92 tensors. No historical forecast recomputed."
+    }
+  ],
+  "refinement_distribution": "No public trained refinement URL established. Operator-supplied local assets require SHA256 and architecture metadata. Private historical artifacts are not distributed by this branch.",
+  "schema_version": 1,
+  "upstream": {
+    "reference_commit": "4765abc724c607a18f93df0302dbd0afcaca17fa",
+    "repository": "https://github.com/microsoft/aurora",
+    "role": "reference only; never installed in place of fork"
+  }
 }
