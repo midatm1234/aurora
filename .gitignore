@@ -40,6 +40,8 @@ mlruns/
 .env
 .vscode/
 data/
+!knowledge/data/
+!knowledge/data/**
 output.png
 finetune/outputs/
 examples/outputs/
