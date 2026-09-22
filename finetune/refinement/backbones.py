@@ -65,7 +65,32 @@ def _num_groups(channels: int, max_groups: int = 8) -> int:
 
 
 class _ConditioningEmbedding(nn.Module):
-    """Process time (+ optionally forecast lead time) -> one conditioning vector."""
+    """Fuse the generative-process coordinate with the physical conditioning.
+
+    Inputs, and why each is kept separate:
+
+    ``process_time``
+        the diffusion index ``k`` or flow coordinate ``tau``. Not physical time.
+    ``lead_hours``
+        cumulative physical forecast lead ``ell``, own embedding.
+    ``metadata``
+        the shared calendar / geometry scalars built by
+        :class:`~finetune.refinement.calendar_features.CalendarFeatureBuilder`
+        (valid-time season and UTC, initialization cycle, elapsed hours, ...).
+
+    The three are *not* simply summed. Summing independent embeddings can only
+    express additive corrections -- effectively a set of disconnected lookup
+    tables for "season", "hour" and "lead". Real conditional structure is
+    interactive: the diurnal ozone cycle depends on season, the lead-dependent
+    bias depends on the valid hour. So the concatenated embeddings are passed
+    through a joint nonlinear MLP whose output is *added* to the process
+    embedding through a zero-initialized projection. That keeps construction an
+    exact identity while allowing multiplicative interactions once trained.
+
+    This is feature-wise conditioning (FiLM / adaptive normalization), not
+    attention: no token is created for time, lead or calendar, and batch
+    elements never interact.
+    """
 
     def __init__(
         self,
@@ -74,6 +99,7 @@ class _ConditioningEmbedding(nn.Module):
         lead_time_conditioning: bool = False,
         lead_time_scale_hours: float = 72.0,
         time_embedding_kind: str = "sinusoidal",
+        metadata_features: int = 0,
     ) -> None:
         super().__init__()
         self.process_time_embed = ProcessTimeEmbedding(dim, kind=time_embedding_kind)
@@ -82,29 +108,85 @@ class _ConditioningEmbedding(nn.Module):
             if lead_time_conditioning
             else None
         )
+        self.metadata_features = int(metadata_features)
+        if self.metadata_features > 0:
+            self.metadata_embed = nn.Sequential(
+                nn.Linear(self.metadata_features, dim),
+                nn.SiLU(),
+                nn.Linear(dim, dim),
+            )
+            fusion_inputs = 2 if self.lead_time_embed is None else 3
+            self.fusion = nn.Sequential(
+                nn.Linear(fusion_inputs * dim, dim),
+                nn.SiLU(),
+                nn.Linear(dim, dim),
+            )
+            # Exactly one zero-initialized layer, fed by a non-zero activation:
+            # identity at construction, non-zero gradient on the first backward.
+            nn.init.zeros_(self.fusion[2].weight)
+            nn.init.zeros_(self.fusion[2].bias)
+        else:
+            self.metadata_embed = None
+            self.fusion = None
 
     @property
     def uses_lead_time(self) -> bool:
         return self.lead_time_embed is not None
 
-    def forward(self, process_time: torch.Tensor, lead_hours: torch.Tensor | None) -> torch.Tensor:
+    @property
+    def uses_metadata(self) -> bool:
+        return self.metadata_embed is not None
+
+    def forward(
+        self,
+        process_time: torch.Tensor,
+        lead_hours: torch.Tensor | None,
+        metadata: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         emb = self.process_time_embed(process_time)
-        if self.lead_time_embed is None:
+        entries = process_time.reshape(-1).numel()
+        lead_emb: torch.Tensor | None = None
+        if self.lead_time_embed is not None:
+            if lead_hours is None:
+                raise ValueError(
+                    "Forecast lead-time conditioning is enabled but no forecast_lead_time "
+                    "tensor was supplied."
+                )
+            lead = lead_hours.reshape(-1)
+            if lead.numel() == 1 and entries > 1:
+                lead = lead.expand(entries)
+            if lead.numel() != entries:
+                raise ValueError(
+                    f"forecast_lead_time has {lead.numel()} entries but the batch has "
+                    f"{entries}."
+                )
+            lead_emb = self.lead_time_embed(lead.to(emb.device))
+            emb = emb + lead_emb
+
+        if self.metadata_embed is None:
             return emb
-        if lead_hours is None:
+        if metadata is None:
             raise ValueError(
-                "Forecast lead-time conditioning is enabled but no forecast_lead_time "
-                "tensor was supplied."
+                f"This network was built with metadata_features={self.metadata_features} "
+                "but no calendar/geometry metadata tensor was supplied. Training and "
+                "inference must use the same conditioning contract."
             )
-        lead = lead_hours.reshape(-1)
-        if lead.numel() == 1 and process_time.reshape(-1).numel() > 1:
-            lead = lead.expand(process_time.reshape(-1).numel())
-        if lead.numel() != process_time.reshape(-1).numel():
+        if metadata.ndim != 2 or metadata.shape[-1] != self.metadata_features:
             raise ValueError(
-                f"forecast_lead_time has {lead.numel()} entries but the batch has "
-                f"{process_time.reshape(-1).numel()}."
+                f"metadata must be [batch, {self.metadata_features}], got "
+                f"{tuple(metadata.shape)}."
             )
-        return emb + self.lead_time_embed(lead.to(emb.device))
+        if metadata.shape[0] == 1 and entries > 1:
+            metadata = metadata.expand(entries, self.metadata_features)
+        if metadata.shape[0] != entries:
+            raise ValueError(
+                f"metadata has {metadata.shape[0]} rows but the batch has {entries}."
+            )
+        meta_emb = self.metadata_embed(metadata.to(emb.dtype).to(emb.device))
+        parts = [self.process_time_embed(process_time), meta_emb]
+        if lead_emb is not None:
+            parts.append(lead_emb)
+        return emb + self.fusion(torch.cat(parts, dim=-1))
 
 
 # ---------------------------------------------------------------------------
@@ -153,7 +235,15 @@ class _SpatialSelfAttention2d(nn.Module):
         head_dim = c // self.num_heads
 
         def _heads(t: torch.Tensor) -> torch.Tensor:
-            return t.reshape(b, self.num_heads, head_dim, h * w).transpose(-2, -1)
+            # ``.contiguous()`` is required, not cosmetic. A transposed view
+            # cannot be dispatched to the flash / memory-efficient SDPA kernels,
+            # so PyTorch silently falls back to the math backend and
+            # materializes the full [B, heads, N, N] score matrix. On a global
+            # 451x900 grid with num_levels=3 the bottleneck holds N=25,425
+            # tokens, and that fallback tries to allocate 57.8 GiB for six
+            # rollout leads -- an immediate OOM on an 80/94 GiB card. With a
+            # contiguous layout the same call peaks below 1 GiB.
+            return t.reshape(b, self.num_heads, head_dim, h * w).transpose(-2, -1).contiguous()
 
         out = F.scaled_dot_product_attention(_heads(q), _heads(k), _heads(v))
         out = out.transpose(-2, -1).reshape(b, c, h, w)
@@ -227,6 +317,7 @@ class ConditionalResidualUNet(nn.Module):
         lead_time_scale_hours: float = 72.0,
         lon_periodic: bool = False,
         time_embedding_kind: str = "sinusoidal",
+        metadata_features: int = 0,
     ) -> None:
         super().__init__()
         if num_levels < 1:
@@ -244,6 +335,7 @@ class ConditionalResidualUNet(nn.Module):
             lead_time_conditioning=lead_time_conditioning,
             lead_time_scale_hours=lead_time_scale_hours,
             time_embedding_kind=time_embedding_kind,
+            metadata_features=metadata_features,
         )
 
         widths = [hidden_channels * (2**i) for i in range(num_levels)]
@@ -296,13 +388,14 @@ class ConditionalResidualUNet(nn.Module):
         cond: torch.Tensor,
         process_time: torch.Tensor,
         lead_hours: torch.Tensor | None = None,
+        metadata: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if x.shape[-2:] != cond.shape[-2:]:
             raise ValueError(
                 f"Residual field {tuple(x.shape[-2:])} and conditioning "
                 f"{tuple(cond.shape[-2:])} must share the spatial grid."
             )
-        cond_emb = self.cond_embed(process_time, lead_hours)
+        cond_emb = self.cond_embed(process_time, lead_hours, metadata)
         h = torch.cat([x, cond], dim=1)
 
         skips: list[torch.Tensor] = []
@@ -561,6 +654,12 @@ class _SpatialAttention(nn.Module):
         q, k, v = qkv[0], qkv[1], qkv[2]
         p = self.dropout if self.training else 0.0
         if self.implementation == "sdpa":
+            # Contiguous q/k/v keep SDPA on its flash / memory-efficient
+            # kernels. A permuted view forces the math backend, which
+            # materializes the full [B, heads, N, N] score matrix -- quadratic
+            # in the token count and the difference between fitting on one GPU
+            # and an immediate OOM on a global grid.
+            q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
             # is_causal=False: attention is bidirectional across spatial tokens.
             out = F.scaled_dot_product_attention(
                 q, k, v, attn_mask=attn_mask, dropout_p=p, is_causal=False
@@ -787,6 +886,7 @@ class SpatialResidualTransformer(nn.Module):
         lon_periodic: bool = False,
         time_embedding_kind: str = "sinusoidal",
         local_refinement: bool = True,
+        metadata_features: int = 0,
     ) -> None:
         super().__init__()
         self.patch_h, self.patch_w = int(patch_size[0]), int(patch_size[1])
@@ -813,6 +913,7 @@ class SpatialResidualTransformer(nn.Module):
             lead_time_conditioning=lead_time_conditioning,
             lead_time_scale_hours=lead_time_scale_hours,
             time_embedding_kind=time_embedding_kind,
+            metadata_features=metadata_features,
         )
 
         self.pos_lat: nn.Parameter | None = None
@@ -954,6 +1055,7 @@ class SpatialResidualTransformer(nn.Module):
         cond: torch.Tensor,
         process_time: torch.Tensor,
         lead_hours: torch.Tensor | None = None,
+        metadata: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if x.shape[-2:] != cond.shape[-2:]:
             raise ValueError(
@@ -1001,7 +1103,7 @@ class SpatialResidualTransformer(nn.Module):
         tokens = self.token_proj(tokens)
         tokens = tokens + self._positional(grid_h, grid_w, tokens.device, tokens.dtype).unsqueeze(0)
 
-        cond_emb = self.cond_embed(process_time, lead_hours).to(tokens.dtype)
+        cond_emb = self.cond_embed(process_time, lead_hours, metadata).to(tokens.dtype)
         for block in self.blocks:
             if self.gradient_checkpointing and self.training:
                 tokens = checkpoint(block, tokens, cond_emb, grid_h, grid_w, use_reentrant=False)

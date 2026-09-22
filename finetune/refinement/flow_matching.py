@@ -114,7 +114,8 @@ class _BaseFlowMatchingRefiner(PackedRefiner):
         lead: torch.Tensor | None,
     ) -> torch.Tensor:
         """Evaluate the flow network at model precision and return float32."""
-        prediction = self.net(
+        prediction = self._evaluate_net(
+            self.net,
             state_float32.to(dtype=conditioning.dtype),
             conditioning,
             process_time,

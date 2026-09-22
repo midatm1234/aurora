@@ -7,12 +7,12 @@ This branch wraps the existing fork implementation. Read [AGENTS.md](../AGENTS.m
 After reviewing and approving local setup, clone the intended branch and create the lightweight environment. Use Python 3.12–3.14 compatible with the pinned requirements; the tested Python/package versions are recorded by environment preflight and the implementation validation report.
 
 ```bash
-git clone --branch agent_skills_to_finetune_aurora --single-branch https://github.com/midatm1234/aurora.git
+git clone --branch aurora_finetune_stochastic_refinement --single-branch https://github.com/midatm1234/aurora.git
 cd aurora
 python scripts/bootstrap_workflow.py --venv .venv-workflow
 ```
 
-The clone command applies after the branch has actually been published. For a local handoff, use the existing checked-out branch or a Git bundle. Check its resolved commit before running setup; [provenance/source-lock.json](../provenance/source-lock.json) identifies source lineage. Keep the fork as the imported package. The weather starter project and PyPI-only replacement are not this workflow.
+Check the resolved commit before running setup; [provenance/source-lock.json](../provenance/source-lock.json) identifies source lineage. This target branch includes the reference branch's MCP workflow plus the research improvements described in [the synchronization report](refinement-branch-synchronization.md). Recipes validate the source YAML at their pinned Git commit; newer working-tree YAMLs do not redefine those historical snapshots. Keep full clone history for this verification. Keep the fork as the imported package. The weather starter project and PyPI-only replacement are not this workflow.
 
 The lightweight environment supports metadata/knowledge/MCP inspection. For CPU synthetic science checks, approve the larger dependency installation and add `--science` to the initial bootstrap command. Bootstrap preserves existing environments: if the lightweight environment already exists, create a distinct environment such as `.venv-science` with `--science` and register that Python for scientific execution. Real GPU work additionally needs a compatible CUDA-enabled PyTorch environment and sufficient local device memory; doctor reports actual availability. The documented worker runs on Linux with local CPU/CUDA resources. Native Windows/macOS worker management, hosted services and cluster schedulers are not validated.
 

@@ -674,7 +674,7 @@ def plot_overall(
     plt.close(fig)
 
 
-def generate_overall_maps(config_path: Path) -> list[Path]:
+def generate_overall_maps(config_path: Path, *, selection=None) -> list[Path]:
     """Stream all matched cases and write aggregate NetCDF and PNG maps."""
     settings = load_settings(config_path)
     selections = target_selections(settings["raw"])
@@ -688,6 +688,17 @@ def generate_overall_maps(config_path: Path) -> list[Path]:
     finetuned_files = rollout_files_by_initialization(
         settings["finetuned_dir"], "rollout_predictions_init_*.nc"
     )
+    if selection is not None:
+        baseline_files = {key: path for key, path in baseline_files.items()
+                          if selection.contains(np.datetime64(key, 'ns'))}
+        selected_finetuned = {}
+        for key, path in finetuned_files.items():
+            if not selection.contains(np.datetime64(key, 'ns')):
+                continue
+            with xr.open_dataset(path) as candidate:
+                if selection.accepts(candidate.attrs):
+                    selected_finetuned[key] = path
+        finetuned_files = selected_finetuned
     common_initializations = sorted(set(baseline_files) & set(finetuned_files))
     if not common_initializations:
         raise FileNotFoundError(
@@ -726,9 +737,9 @@ def generate_overall_maps(config_path: Path) -> list[Path]:
             first_finetuned.close()
 
         missing_truth_variables = [
-            selection.variable
-            for selection in selections
-            if selection.variable not in truth.data_vars
+            target_selection.variable
+            for target_selection in selections
+            if target_selection.variable not in truth.data_vars
         ]
         if missing_truth_variables:
             raise KeyError(
@@ -737,8 +748,8 @@ def generate_overall_maps(config_path: Path) -> list[Path]:
             )
 
         accumulators = {
-            selection: Accumulator.create((len(latitude), len(longitude)))
-            for selection in selections
+            target_selection: Accumulator.create((len(latitude), len(longitude)))
+            for target_selection in selections
         }
         lead_tolerance = 1.0e-6
         requested_leads = settings["lead_hours"]
@@ -810,8 +821,8 @@ def generate_overall_maps(config_path: Path) -> list[Path]:
                         valid_time,
                         context=baseline_context,
                     )
-                    for selection in selections:
-                        variable = selection.variable
+                    for target_selection in selections:
+                        variable = target_selection.variable
                         if variable not in baseline.data_vars:
                             raise KeyError(
                                 f"{baseline_context} is missing configured variable "
@@ -842,20 +853,20 @@ def generate_overall_maps(config_path: Path) -> list[Path]:
                         finetuned_field = finetuned_variable.isel(
                             {finetuned_step_dim: finetuned_time_index}
                         )
-                        if selection.level is not None:
+                        if target_selection.level is not None:
                             truth_level = select_level_index(
                                 np.asarray(truth_field["level"].values, dtype=float),
-                                selection.level,
+                                target_selection.level,
                                 settings["level_tolerance"],
                             )
                             baseline_level = select_level_index(
                                 np.asarray(baseline_field["level"].values, dtype=float),
-                                selection.level,
+                                target_selection.level,
                                 settings["level_tolerance"],
                             )
                             finetuned_level = select_level_index(
                                 np.asarray(finetuned_field["level"].values, dtype=float),
-                                selection.level,
+                                target_selection.level,
                                 settings["level_tolerance"],
                             )
                             truth_field = truth_field.isel(level=truth_level)
@@ -888,7 +899,7 @@ def generate_overall_maps(config_path: Path) -> list[Path]:
                                     f"{field_name} {variable!r} at {valid_time} has "
                                     f"shape {values.shape}; expected {expected_shape}."
                                 )
-                        accumulators[selection].update(
+                        accumulators[target_selection].update(
                             truth_values,
                             baseline_values,
                             finetuned_values,
@@ -909,19 +920,19 @@ def generate_overall_maps(config_path: Path) -> list[Path]:
         normalized_longitude = normalized_longitude[longitude_order]
         generated: list[Path] = []
         datasets: list[xr.Dataset] = []
-        for selection in selections:
-            accumulator = accumulators[selection]
+        for target_selection in selections:
+            accumulator = accumulators[target_selection]
             fields = {
                 name: values[:, longitude_order]
                 for name, values in accumulator.means().items()
             }
-            units = str(truth[selection.variable].attrs.get("units") or "")
-            plot_path = figure_dir / f"{selection.label}_overall_differences.png"
+            units = str(truth[target_selection.variable].attrs.get("units") or "")
+            plot_path = figure_dir / f"{target_selection.label}_overall_differences.png"
             plot_overall(
                 fields,
                 latitude,
                 normalized_longitude,
-                selection,
+                target_selection,
                 units,
                 accumulator.forecast_count,
                 settings["map_extent"],
@@ -951,12 +962,12 @@ def generate_overall_maps(config_path: Path) -> list[Path]:
                 ("latitude", "longitude"),
                 accumulator.valid_count[:, longitude_order].astype(np.int32),
             )
-            ds = ds.expand_dims(selection=[selection.label])
+            ds = ds.expand_dims(selection=[target_selection.label])
             ds = ds.assign_coords(
-                variable=("selection", [selection.variable]),
+                variable=("selection", [target_selection.variable]),
                 level=(
                     "selection",
-                    ["surface" if selection.level is None else f"{selection.level:g}"],
+                    ["surface" if target_selection.level is None else f"{target_selection.level:g}"],
                 ),
                 units=("selection", [units]),
                 number_of_forecasts=(
@@ -968,6 +979,8 @@ def generate_overall_maps(config_path: Path) -> list[Path]:
 
         aggregate = xr.concat(datasets, dim="selection", join="exact")
         aggregate_path = output_dir / "overall_spatial_differences.nc"
+        if selection is not None:
+            aggregate.attrs.update(selection.provenance())
         aggregate.to_netcdf(aggregate_path)
         aggregate.close()
         for ds in datasets:

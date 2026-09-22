@@ -3,10 +3,12 @@
 Sequential CAMS downloader in half-month chunks.
 Takes a start_date and end_date and generates date ranges automatically.
 Skips ranges whose output files already exist and pass a basic completeness check.
+Set CAMS_DATA_DIR or --output-dir; the default is this repository's data/cams directory.
 """
 
 import argparse
 import calendar
+import os
 import zipfile
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
@@ -14,13 +16,15 @@ from pathlib import Path
 import numpy as np
 import xarray as xr
 
-OUTPUT_DIR = Path("/data/cams")
+OUTPUT_DIR = Path(os.environ.get(
+    "CAMS_DATA_DIR", str(Path(__file__).resolve().parents[1] / "data" / "cams")
+)).expanduser()
 TIMES_UTC = ["00:00", "12:00"]
 OVERWRITE = False
 REMOVE_ZIP_AFTER_EXTRACTION = True
 
-START_DATE = "2014-07-01"
-END_DATE = "2023-06-30"
+START_DATE = "2024-10-01"
+END_DATE = "2025-12-31"
 
 CAMS_VARIABLES = [
     "10m_u_component_of_wind",
@@ -208,7 +212,7 @@ if __name__ == "__main__":
     parser.add_argument("--overwrite", action="store_true", help="Download and extract even when complete files exist.")
     args = parser.parse_args()
 
-    OUTPUT_DIR = Path(args.output_dir)
+    OUTPUT_DIR = Path(args.output_dir).expanduser()
     OVERWRITE = args.overwrite
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 

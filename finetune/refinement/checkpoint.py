@@ -281,7 +281,7 @@ def load_aurora_state_dict(
     unexplained = [
         k
         for k in report.missing
-        if not (k.startswith("refiner.") or k.startswith("temporal."))
+        if not k.startswith(("refiner.", "temporal.", "temporal_context."))
     ]
     unexplained = [k for k in unexplained if not any(part in k for part in skip)]
     if unexplained:
@@ -307,6 +307,7 @@ def load_refinement_state_dict(
     *,
     prefix: str = "refiner.",
     temporal_prefix: str = "temporal.",
+    temporal_context_prefix: str = "temporal_context.",
     aurora_prefix: str = "aurora.",
 ) -> StateDictReport:
     """Load Phase-2 weights without touching Aurora weights.
@@ -315,13 +316,16 @@ def load_refinement_state_dict(
     the Aurora sub-module is left exactly as it was, which is verified after
     the load.
     """
+    validate_spatiotemporal_contract(model, checkpoint)
     raw = extract_model_state(checkpoint)
     stripped = strip_wrapper_prefixes(raw)
-    incoming = {
-        k: v
-        for k, v in stripped.items()
-        if k.startswith(prefix) or k.startswith(temporal_prefix)
-    }
+    # ``temporal_context.`` is a distinct prefix from ``temporal.``: the ninth
+    # character is ``_``, not ``.``, so it is NOT covered by the legacy Mamba
+    # prefix. Omitting it here would silently discard every temporal-encoder
+    # tensor and, because the context projection is zero-initialized, degrade a
+    # trained temporal model to the spatial-only control with no error at all.
+    refinement_prefixes = (prefix, temporal_prefix, temporal_context_prefix)
+    incoming = {k: v for k, v in stripped.items() if k.startswith(refinement_prefixes)}
     if not incoming:
         legacy = {k: v for k, v in stripped.items() if _is_legacy_refinement_key(k)}
         if legacy:
@@ -368,9 +372,7 @@ def load_refinement_state_dict(
         report.loaded += 1
 
     refiner_keys = {
-        key
-        for key in model_state
-        if key.startswith(prefix) or key.startswith(temporal_prefix)
+        key for key in model_state if key.startswith(refinement_prefixes)
     }
     report.missing = sorted(refiner_keys - set(incoming))
 
@@ -425,6 +427,77 @@ def save_checkpoint_atomic(
     return path
 
 
+def _spatiotemporal_contract(model: torch.nn.Module) -> dict[str, Any]:
+    """Record the joint spatiotemporal conditioning contract of ``model``.
+
+    Feature order, calendar convention, pressure mapping, temporal backend and
+    causal mode are all indexed positionally by a trained network, so they are
+    persisted explicitly. Loading a checkpoint whose contract differs from the
+    running configuration is then a detectable error rather than silent
+    misinterpretation of the first conditioning layer.
+    """
+    contract: dict[str, Any] = {}
+    builder = getattr(model, "calendar_builder", None)
+    if builder is not None and hasattr(builder, "convention"):
+        contract["calendar"] = builder.convention()
+    refiner = getattr(model, "refiner", None)
+    if refiner is not None:
+        vertical = getattr(refiner, "vertical_encoder", None)
+        if vertical is not None and hasattr(vertical, "describe"):
+            contract["vertical"] = vertical.describe()
+        contract["conditioning_widths"] = {
+            "calendar_features": int(getattr(refiner, "calendar_features", 0)),
+            "vertical_features": int(getattr(refiner, "vertical_features", 0)),
+            "metadata_features": int(getattr(refiner, "metadata_features", 0)),
+            "temporal_context_channels": int(
+                getattr(refiner, "temporal_context_channels", 0)
+            ),
+            "spatial_conditioning_channels": int(getattr(refiner, "cond_channels", 0)),
+        }
+    encoder = getattr(model, "temporal_context", None)
+    if encoder is not None and hasattr(encoder, "describe"):
+        contract["temporal_context"] = encoder.describe()
+    config = getattr(model, "refinement_config", None)
+    temporal_cfg = getattr(config, "temporal", None)
+    if temporal_cfg is not None:
+        contract["temporal_mode"] = temporal_cfg.mode
+        contract["uses_future_raw_aurora"] = bool(temporal_cfg.uses_future_raw_aurora)
+    return contract
+
+
+def validate_spatiotemporal_contract(model: torch.nn.Module, checkpoint: Any) -> None:
+    """Reject changed feature semantics before applying any checkpoint tensors.
+
+    Historical spatial-only checkpoints predate this metadata and remain valid.
+    Calendar, vertical identity, and temporal-context models require the saved
+    contract because tensor shapes cannot identify feature order or causality.
+    """
+    current = _spatiotemporal_contract(model)
+    saved = checkpoint.get("spatiotemporal_contract") if isinstance(checkpoint, Mapping) else None
+    active = any(key in current for key in ("calendar", "vertical", "temporal_context"))
+    if saved is None:
+        if active:
+            raise ValueError("Checkpoint is missing spatiotemporal_contract for active conditioning.")
+        return
+    if not isinstance(saved, dict):
+        raise ValueError("Checkpoint spatiotemporal_contract must be a mapping.")
+
+    def comparable(value: dict[str, Any]) -> dict[str, Any]:
+        value = dict(value)
+        if "temporal_context" not in value:
+            # A disabled context encoder has no trajectory-mode semantics.
+            value.pop("temporal_mode", None)
+            value.pop("uses_future_raw_aurora", None)
+        return value
+
+    if comparable(saved) != comparable(current):
+        changed = sorted(
+            key for key in set(saved) | set(current)
+            if comparable(saved).get(key) != comparable(current).get(key)
+        )
+        raise ValueError("Checkpoint spatiotemporal_contract mismatch: " + ", ".join(changed))
+
+
 def build_refinement_checkpoint(
     model: torch.nn.Module,
     *,
@@ -443,6 +516,7 @@ def build_refinement_checkpoint(
     extra: Mapping[str, Any] | None = None,
     refiner_prefix: str = "refiner.",
     temporal_prefix: str = "temporal.",
+    temporal_context_prefix: str = "temporal_context.",
     aurora_prefix: str = "aurora.",
 ) -> dict[str, Any]:
     """Assemble a checkpoint payload recording everything needed for resume.
@@ -451,6 +525,11 @@ def build_refinement_checkpoint(
     ``refinement`` checkpoint deliberately excludes the (unchanged, frozen)
     Aurora weights and instead records the Aurora checkpoint path and
     fingerprint, so it stays small while remaining verifiable.
+
+    ``temporal_context_prefix`` covers the shared causal temporal encoder added
+    for joint spatiotemporal refinement. It is a separate prefix from the legacy
+    ``temporal.`` Mamba post-processor: the two are different modules with
+    different contracts and both must survive a save/load round trip.
     """
     if kind not in {CHECKPOINT_KIND_AURORA, CHECKPOINT_KIND_REFINEMENT, CHECKPOINT_KIND_COMBINED}:
         raise ValueError(f"Unsupported checkpoint kind {kind!r}")
@@ -467,10 +546,9 @@ def build_refinement_checkpoint(
 
     full_state = model.state_dict()
     if kind == CHECKPOINT_KIND_REFINEMENT:
+        saved_prefixes = (refiner_prefix, temporal_prefix, temporal_context_prefix)
         model_state = {
-            k: v
-            for k, v in full_state.items()
-            if k.startswith(refiner_prefix) or k.startswith(temporal_prefix)
+            k: v for k, v in full_state.items() if k.startswith(saved_prefixes)
         }
     elif kind == CHECKPOINT_KIND_AURORA:
         model_state = {k: v for k, v in full_state.items() if k.startswith(aurora_prefix)}
@@ -504,6 +582,9 @@ def build_refinement_checkpoint(
     temporal_config = getattr(model, "temporal_config", None)
     if isinstance(temporal_config, Mapping):
         payload["resolved_temporal_config"] = dict(temporal_config)
+    spatiotemporal = _spatiotemporal_contract(model)
+    if spatiotemporal:
+        payload["spatiotemporal_contract"] = spatiotemporal
     if optimizer is not None:
         payload["optimizer_state_dict"] = optimizer.state_dict()
     if scheduler is not None:

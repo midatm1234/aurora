@@ -2,6 +2,7 @@
 import json
 import os
 from pathlib import Path
+import subprocess
 import time
 import pytest
 from aurora_workflow.common import atomic_json, digest, redact, safe_path, sha256
@@ -124,3 +125,72 @@ def test_reject_write_root_symlink_escape(store,tmp_path):
     (store.settings.cache_root/"official-assets").symlink_to(tmp_path)
     with pytest.raises(ValueError,match="symlink escapes"):
         _run_directory(store,p)
+
+
+def test_recipe_uses_verified_historical_source_and_rejects_tampering(monkeypatch):
+    import copy
+    from aurora_workflow import planning
+    recipe = planning.load_recipe("no2-us-west-v1")
+    original = copy.deepcopy(recipe)
+    monkeypatch.setattr(planning, "load_recipe", lambda _: copy.deepcopy(recipe))
+    result = planning.validate_recipe("no2-us-west-v1")
+    assert result["recipe"]["source_commit"] == original["source_commit"]
+    assert result["config"]["model"]["mamba_temporal"]["enabled"] is False
+    recipe["source_config_sha256"] = "0" * 64
+    with pytest.raises(ValueError, match="checksum mismatch"):
+        planning.validate_recipe("no2-us-west-v1")
+    recipe.update(original)
+    recipe["source_commit"] = "0" * 40
+    with pytest.raises(ValueError, match="fetch the source history"):
+        planning.validate_recipe("no2-us-west-v1")
+
+
+@pytest.mark.parametrize("feature", ["calendar", "solar_geometry", "temporal"])
+def test_portable_recipe_rejects_unwired_experimental_context(monkeypatch, feature):
+    from aurora_workflow import planning
+    recipe = planning.load_recipe("cpu-smoke-v1")
+    config = recipe["head_configs"]["flow_matching_transformer"]
+    if feature == "temporal":
+        config["temporal"] = {"backend": "causal_conv"}
+    else:
+        config.setdefault("conditioning", {})[feature] = True
+    monkeypatch.setattr(planning, "load_recipe", lambda _: recipe)
+    with pytest.raises(ValueError, match="do not yet supply"):
+        planning.validate_recipe("cpu-smoke-v1", "flow_matching_transformer")
+
+
+@pytest.mark.parametrize("temporal_setting", ["flat_enabled", "undeclared"])
+def test_portable_recipe_requires_explicit_legacy_temporal_opt_out(monkeypatch, temporal_setting):
+    from aurora_workflow import planning
+    recipe = planning.load_recipe("cpu-smoke-v1")
+    model = recipe["config"]["model"]
+    model.pop("mamba_temporal", None)
+    model.pop("mamba_temporal_enabled", None)
+    if temporal_setting == "flat_enabled":
+        model["mamba_temporal_enabled"] = True
+    monkeypatch.setattr(planning, "load_recipe", lambda _: recipe)
+    with pytest.raises(ValueError, match="spatial-only"):
+        planning.validate_recipe("cpu-smoke-v1", "flow_matching_transformer")
+
+
+def test_source_fingerprint_preserves_source_edits_and_excludes_private_outputs(tmp_path, monkeypatch):
+    from aurora_workflow import common
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    (tmp_path / ".gitignore").write_text("finetune/outputs/\n")
+    source = tmp_path / "finetune" / "model.py"
+    source.parent.mkdir()
+    source.write_text("value = 1\n")
+    subprocess.run(["git", "-C", str(tmp_path), "add", "finetune/model.py"], check=True)
+    monkeypatch.setattr(common, "REPO", tmp_path)
+    real_git = common.git
+    monkeypatch.setattr(common, "git", lambda *args: "0" * 40 if args == ("rev-parse", "HEAD") else real_git(*args))
+    initial = common.source_fingerprint()["code_hash"]
+    private = tmp_path / "finetune" / "outputs" / "local-metadata.json"
+    private.parent.mkdir()
+    private.write_text('{"private": true}\n')
+    assert common.source_fingerprint()["code_hash"] == initial
+    source.write_text("value = 2\n")
+    assert common.source_fingerprint()["code_hash"] != initial
+    source.write_text("value = 1\n")
+    (source.parent / "new_module.py").write_text("value = 3\n")
+    assert common.source_fingerprint()["code_hash"] != initial

@@ -53,6 +53,9 @@ def _unified_config(*, temporal: bool | None) -> dict:
                 "mamba_temporal_expand": 1,
             }
         )
+        # These cases exercise the per-variable head explicitly rather than
+        # inheriting whichever mode is currently the default.
+        config["model"]["mamba_temporal"] = {"mode": "per_variable"}
     return config
 
 
@@ -151,45 +154,46 @@ def test_legacy_flow_temporal_forward_backward_and_checkpoint_round_trip() -> No
         assert torch.equal(restored.state_dict()[key], value)
 
 
-def test_unified_temporal_omission_preserves_disabled_state_and_numerics() -> None:
+def test_unified_temporal_default_is_enabled_and_disabling_is_exact() -> None:
     implicit = _unified_model(temporal=None)
-    explicit = _unified_model(temporal=False)
+    explicit_off = _unified_model(temporal=False)
 
-    assert not implicit.has_temporal
-    assert implicit.temporal is None
-    assert explicit.temporal is None
-    assert not any(key.startswith("temporal.") for key in implicit.state_dict())
-    assert set(implicit.state_dict()) == set(explicit.state_dict())
-    explicit.load_state_dict(implicit.state_dict(), strict=True)
-    enabled = _unified_model(temporal=True)
-    assert enabled.refiner is not None and implicit.refiner is not None
-    enabled.refiner.load_state_dict(implicit.refiner.state_dict(), strict=True)
+    # Omitting model.mamba_temporal now opts into the packed_joint default
+    # rather than disabling the module.
+    assert implicit.has_temporal
+    assert implicit.temporal is not None
+    assert resolve_temporal_config(_unified_config(temporal=None))["mode"] == "packed_joint"
+    assert any(key.startswith("temporal.") for key in implicit.state_dict())
+
+    # `enabled: false` stays an exact, parameter-free opt-out.
+    assert explicit_off.temporal is None
+    assert not any(key.startswith("temporal.") for key in explicit_off.state_dict())
+
+    # Toggling the temporal module must not disturb the spatial refiner, so its
+    # parameters still transfer between the two models.
+    assert implicit.refiner is not None and explicit_off.refiner is not None
+    explicit_off.refiner.load_state_dict(implicit.refiner.state_dict(), strict=True)
 
     rollout = torch.randn(1, implicit.packing.num_channels, 8, 8)
     implicit.eval()
-    explicit.eval()
-    implicit_out = implicit.refine(
+    explicit_off.eval()
+    enabled_out = implicit.refine(
         rollout,
         forecast_lead_time=torch.tensor([24.0]),
         ensemble_size=2,
         seed=19,
         num_steps=1,
     )
-    explicit_out = explicit.refine(
+    disabled_out = explicit_off.refine(
         rollout,
         forecast_lead_time=torch.tensor([24.0]),
         ensemble_size=2,
         seed=19,
         num_steps=1,
     )
-    enabled.eval()
-    enabled_out = enabled.refine(
-        rollout,
-        forecast_lead_time=torch.tensor([24.0]),
-        ensemble_size=2,
-        seed=19,
-        num_steps=1,
-    )
+    # The temporal decoder is zero-init and its fusion gate opens from zero, so
+    # the new default is identity-at-initialization: enabling it cannot change
+    # numerics until it is trained.
     for field in (
         "member_residuals",
         "members",
@@ -198,8 +202,7 @@ def test_unified_temporal_omission_preserves_disabled_state_and_numerics() -> No
         "refined_normalized",
         "refined_physical",
     ):
-        assert torch.equal(getattr(implicit_out, field), getattr(explicit_out, field))
-        assert torch.equal(getattr(implicit_out, field), getattr(enabled_out, field))
+        assert torch.equal(getattr(enabled_out, field), getattr(disabled_out, field))
 
 
 def test_unified_temporal_objective_is_target_independent_and_detached() -> None:

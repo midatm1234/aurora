@@ -203,3 +203,76 @@ def test_duplicate_coordinate_mapping_is_rejected() -> None:
             1.0e-6,
             name="latitude",
         )
+
+
+@pytest.mark.parametrize('use_inference_selection', [True, False])
+def test_aggregate_write_preserves_inference_provenance_with_multiple_targets(
+    tmp_path, monkeypatch, use_inference_selection,
+):
+    """Exercise the full aggregate writer past both variable-selection loops."""
+    import yaml
+    from finetune import generate_overall_evaluation_maps as maps
+    from finetune.evaluation_selection import InferenceSelection
+
+    baseline_dir = tmp_path / 'baseline'
+    finetuned_dir = tmp_path / 'finetuned'
+    baseline_dir.mkdir()
+    finetuned_dir.mkdir()
+    coords = {'latitude': [52., 51.], 'longitude': [232., 233.]}
+    times = np.array(['2024-01-01T12', '2024-01-02T12'], dtype='datetime64[ns]')
+    variables = ('tcno2', 'gtco3')
+
+    def dataset(value, valid_times):
+        return xr.Dataset(
+            {name: (('time', 'latitude', 'longitude'),
+                    np.full((len(valid_times), 2, 2), value)) for name in variables},
+            coords={**coords, 'time': valid_times},
+        )
+
+    truth_path = tmp_path / 'truth.nc'
+    dataset(5., times).to_netcdf(truth_path)
+    for index, day in enumerate(('20240101', '20240102')):
+        initialization = str(times[index] - np.timedelta64(12, 'h'))
+        baseline = dataset(3., times[index:index + 1])
+        baseline.attrs['initialization_time'] = initialization
+        baseline.to_netcdf(baseline_dir / f'rollout_{day}_000000.nc')
+        fine = dataset(4., times[index:index + 1])
+        fine.attrs.update(initialization_time=initialization,
+                          checkpoint_sha256='latest' if index == 0 else 'stale',
+                          checkpoint_training_run_id='current')
+        fine.to_netcdf(finetuned_dir / f'rollout_predictions_init_{day}T000000.nc')
+
+    output_dir = tmp_path / 'evaluation'
+    config_path = tmp_path / 'config.yaml'
+    config_path.write_text(yaml.safe_dump({
+        'case_name': 'case',
+        'data': {'target_variables': [
+            {'dataset_name': name, 'kind': 'surf'} for name in variables
+        ]},
+        'evaluation': {
+            'ground_truth_path': str(truth_path),
+            'baseline_rollout_path': str(baseline_dir),
+            'finetuned_rollout_path': str(finetuned_dir),
+            'output_dir': str(output_dir),
+            'lead_times_hours': [12],
+        },
+    }))
+    inference_selection = InferenceSelection(
+        np.datetime64('2024-01-01', 'ns'), np.datetime64('2024-01-01T12', 'ns'),
+        tmp_path / 'last.ckpt', 'latest', 'current', 99, False,
+    ) if use_inference_selection else None
+    # Plot rendering is unrelated to the writer bug and requires Cartopy data.
+    monkeypatch.setattr(maps, 'plot_overall', lambda *args: args[-1].write_bytes(b'plot'))
+    generated = maps.generate_overall_maps(config_path, selection=inference_selection)
+    assert len(generated) == 2
+    assert all(path.is_file() for path in generated)
+    with xr.open_dataset(output_dir / 'overall_spatial_differences.nc') as aggregate:
+        assert aggregate.sizes['selection'] == 2
+        np.testing.assert_allclose(aggregate.aurora_bias, -2.)
+        np.testing.assert_allclose(aggregate.finetuned_bias, -1.)
+        np.testing.assert_array_equal(aggregate.number_of_forecasts, [1, 1] if use_inference_selection else [2, 2])
+        if use_inference_selection:
+            for key, value in inference_selection.provenance().items():
+                assert aggregate.attrs[key] == value
+        else:
+            assert 'checkpoint_sha256' not in aggregate.attrs

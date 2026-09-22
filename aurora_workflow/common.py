@@ -123,9 +123,12 @@ def git(*args: str) -> str:
 
 def source_fingerprint() -> dict:
     """Bind approvals to executable source as well as HEAD, including uncommitted edits."""
-    paths = sorted(p for directory in ("aurora_workflow", "aurora", "finetune", "recipes", "provenance")
-                   for p in (REPO / directory).rglob("*")
-                   if p.is_file() and p.suffix in {".py", ".yaml", ".json"})
+    # Private outputs and excluded local helpers are not executable dependencies
+    # of the public workflow. Avoid traversing multi-terabyte production folders.
+    names = git("ls-files", "--cached", "--others", "--exclude-standard", "-z", "--",
+                "aurora_workflow", "aurora", "finetune", "recipes", "provenance").split("\0")
+    paths = sorted({REPO / name for name in names if name
+                    and (REPO / name).is_file() and Path(name).suffix in {".py", ".yaml", ".json"}})
     return {"commit": git("rev-parse", "HEAD"),
             "code_hash": digest({str(p.relative_to(REPO)): sha256(p) for p in paths}),
             "dirty": bool(git("status", "--porcelain")), "imported_workflow_path": str(REPO)}

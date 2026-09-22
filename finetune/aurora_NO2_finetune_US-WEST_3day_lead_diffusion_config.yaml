@@ -5,7 +5,7 @@ paths:
   output_dir: ./outputs
   checkpoint_dir: ./outputs/checkpoints
   pretrained_checkpoint: ""  # Optional local checkpoint path. Empty uses model default HF checkpoint.
-  static_data_path: /data/cams/aurora-0.4-air-pollution-static.pickle  # Pickle with lsm, z, slt (from HuggingFace)
+  static_data_path: ../data/cams/aurora-0.4-air-pollution-static.pickle  # Pickle with lsm, z, slt (from HuggingFace)
 
 # Sub-folder under output_dir / checkpoint_dir for this experiment.
 # When set, all artifacts (best.ckpt, last.ckpt, training_history.*,
@@ -13,9 +13,17 @@ paths:
 #   <output_dir>/<case_name>/  and  <checkpoint_dir>/<case_name>/
 # resume_from="best"/"last" resolves relative to the case folder, so
 # stages chain naturally when you keep case_name fixed across runs.
-case_name: NO2_US-WEST_3day_lead_diffusion
+case_name: NO2_US-WEST_3day_lead_diffusion_mamba
 
 data:
+  split_times:
+    train:
+      start: "2021-01-01T00:00:00"
+      end: "2023-12-31T12:00:00"
+    test:
+      start: "2024-01-01T00:00:00"
+      end: "2024-09-30T12:00:00"
+
   predictor_variables:
     - dataset_name: t2m
       aurora_name: 2t
@@ -288,10 +296,11 @@ model:
       zero_init_output: true
       local_refinement: true
 
-  # Optional causal sequence model. Keep it disabled unless a run explicitly
-  # trains and validates the temporal objective independently.
+  # Causal sequence model trained on the ordered multi-lead rollout and applied
+  # causally at inference. The temporal decoder is zero-init, so the module is
+  # identity-at-init and only departs from the spatial-only product once trained.
   mamba_temporal:
-    enabled: false
+    enabled: true
     mode: packed_joint
     channels: 16
     state_dim: 8
@@ -366,8 +375,8 @@ training:
   # This audited target/scaling/prediction contract is incompatible with the
   # earlier epsilon checkpoint. Start clean; only resume an interrupted run
   # created from this exact contract.
-  resume_training: false
-  resume_from: ""  # "best", "last", or a path to a .ckpt file. Empty = fresh run.
+  resume_training: true
+  resume_from: "last"  # "best", "last", or a path to a .ckpt file. Empty = fresh run.
   resume_skip_scheduler: false
   # MSE for warmup-stage fine-tuning: gradient ∝ (pred-tgt)/std² shrinks as
   # the model converges, which is essential under tight normalisation floors

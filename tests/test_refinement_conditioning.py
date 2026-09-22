@@ -54,6 +54,9 @@ def _conditioning_config(*, temporal: bool = False) -> dict:
             "mamba_temporal_expand": 1,
         }
     )
+    # Pin the per-variable head: these cases inspect its per-variable decoders
+    # rather than whichever mode is currently the default.
+    config["model"]["mamba_temporal"] = {"mode": "per_variable"}
     return config
 
 

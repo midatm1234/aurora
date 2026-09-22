@@ -26,7 +26,11 @@ from finetune.refinement.checkpoint import (
     strip_wrapper_prefixes,
     validate_aurora_reference,
 )
-from finetune.refinement.two_phase import AuroraTwoPhaseRefiner, build_two_phase_refiner
+from finetune.refinement.two_phase import (
+    AuroraTwoPhaseRefiner,
+    build_two_phase_refiner,
+    resolve_temporal_config,
+)
 from torch import nn
 
 from tests.refinement_fixtures import build_packing, refinement_config
@@ -118,8 +122,12 @@ def test_aurora_checkpoint_loads_strictly_into_the_wrapper() -> None:
     report = load_aurora_state_dict(model, {"model_state_dict": source.state_dict()})
     assert report.unexpected == []
     assert report.shape_mismatched == []
-    # Only the newly introduced refiner keys may be missing.
-    assert all(key.startswith("refiner.") for key in report.missing)
+    # Only the newly introduced refinement keys may be missing. Temporal Mamba
+    # is enabled by default for a unified refiner, so its parameters are just as
+    # new to a plain Aurora checkpoint as the refiner's are.
+    assert all(
+        key.startswith(("refiner.", "temporal.")) for key in report.missing
+    )
     assert report.loaded == len(source.state_dict())
     for key, value in source.state_dict().items():
         assert torch.equal(model.state_dict()[f"aurora.{key}"], value)
@@ -154,7 +162,10 @@ def test_refinement_only_checkpoint_never_touches_aurora() -> None:
     payload = build_refinement_checkpoint(
         model, kind=CHECKPOINT_KIND_REFINEMENT, refinement_type="diffusion_unet"
     )
-    assert all(key.startswith("refiner.") for key in payload["model_state_dict"])
+    assert all(
+        key.startswith(("refiner.", "temporal."))
+        for key in payload["model_state_dict"]
+    )
 
     target = build_model()
     before = aurora_only_state(target)
@@ -201,6 +212,27 @@ def test_refinement_only_checkpoint_includes_optional_temporal_state() -> None:
     assert report.unexpected == []
     for key, value in payload["model_state_dict"].items():
         assert torch.equal(target.state_dict()[key], value)
+
+
+def test_old_spatial_checkpoint_without_new_contract_remains_compatible() -> None:
+    model = build_model()
+    payload = build_refinement_checkpoint(model)
+    payload.pop("spatiotemporal_contract")
+    report = load_refinement_state_dict(model, payload)
+    assert report.loaded > 0
+    assert not report.missing
+
+
+def test_aurora_checkpoint_initializes_wrapper_with_new_context_encoder() -> None:
+    config = refinement_config(
+        "flow_matching_conv_unet",
+        temporal={"backend": "causal_conv", "context_channels": 4, "hidden_channels": 8},
+    )
+    model = build_two_phase_refiner(DummyAurora(), build_packing(8, 8), config)
+    model.initialize_refiner(model.conditioning_channels())
+    report = load_aurora_state_dict(model, aurora_only_state(model))
+    assert report.loaded > 0
+    assert any(key.startswith("temporal_context.") for key in report.missing)
 
 
 def test_refinement_checkpoint_with_missing_keys_raises() -> None:
@@ -402,6 +434,10 @@ def test_checkpoint_ignores_inactive_process_and_backbone_sections(
                 "resolved_refinement_config": (
                     saved_model.refinement_config.to_dict()
                 ),
+                # Real checkpoints always record this (see save_checkpoint), so
+                # omitting it here would instead exercise the pre-temporal
+                # migration path.
+                "resolved_temporal_config": resolve_temporal_config(saved_config),
                 "field_packing": packing.to_dict(),
             },
             current_config,

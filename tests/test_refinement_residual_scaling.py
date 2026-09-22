@@ -775,7 +775,12 @@ def test_two_phase_ensemble_guards_complete_mean_plus_innovation(monkeypatch) ->
 
     monkeypatch.setattr(model, "_sample_innovation", innovation)
     output = model.refine(
-        rollout, conditioning=conditioning, ensemble_size=2, return_members=True
+        rollout,
+        conditioning=conditioning,
+        ensemble_size=2,
+        return_members=True,
+        # Temporal Mamba is on by default and conditions on physical lead.
+        forecast_lead_time=torch.tensor([24.0]),
     )
     assert output.member_corrections_normalized is not None
     _, upper = _clipped_bounds(model.refiner)

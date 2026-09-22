@@ -435,6 +435,18 @@ class ConditioningConfig:
     latitude: bool = False
     #: Add periodic sin/cos longitude as two conditioning channels.
     longitude: bool = False
+    #: Calendar scalars derived from every frame's own **valid** timestamp:
+    #: seasonal phase, UTC time of day, initialization cycle, lead and elapsed
+    #: hours. Fused with the process-time embedding through a joint nonlinear
+    #: MLP (see :class:`finetune.refinement.backbones._ConditioningEmbedding`),
+    #: not added as an independent lookup correction.
+    calendar: bool = False
+    #: Seam-safe spherical position, cyclic local **mean solar** hour and the
+    #: cosine of the solar zenith angle, as spatial conditioning channels.
+    solar_geometry: bool = False
+    #: Continuous ``log(p / p_ref)`` plus variable identity and an explicit
+    #: pressure-not-applicable mask for column quantities such as ``gtco3``.
+    vertical_identity: bool = False
 
     _KEYS = (
         "aurora_rollout",
@@ -445,6 +457,9 @@ class ConditioningConfig:
         "forecast_lead_time",
         "latitude",
         "longitude",
+        "calendar",
+        "solar_geometry",
+        "vertical_identity",
     )
     _SPATIAL_KEYS = (
         "aurora_rollout",
@@ -474,6 +489,24 @@ class ConditioningConfig:
                 "aurora_rollout / aurora_input_state instead."
             )
         return out
+
+    @property
+    def metadata_feature_count(self) -> int:
+        """Width of the scalar calendar vector fused into the conditioning MLP."""
+        if not self.calendar:
+            return 0
+        from finetune.refinement.calendar_features import SCALAR_FEATURE_NAMES
+
+        return len(SCALAR_FEATURE_NAMES)
+
+    @property
+    def solar_channel_count(self) -> int:
+        """Number of spatial conditioning channels added by ``solar_geometry``."""
+        if not self.solar_geometry:
+            return 0
+        from finetune.refinement.calendar_features import SPATIAL_FEATURE_NAMES
+
+        return len(SPATIAL_FEATURE_NAMES)
 
     def to_dict(self) -> dict[str, bool]:
         return {key: getattr(self, key) for key in self._KEYS}
@@ -1299,6 +1332,125 @@ class TransformerConfig:
 
 
 @dataclass(frozen=True)
+class TemporalRefinementConfig:
+    """Causal temporal conditioning shared by all four unified refiners.
+
+    This section is deliberately independent of ``refinement.type`` (the spatial
+    backbone) and of ``refinement.transformer.attention_mode`` (spatial
+    attention). Selecting ``backend: causal_conv`` therefore yields a genuinely
+    attention-free temporal mode that adds no attention anywhere else.
+
+    ``backend: none`` is the explicit **spatial-only control**: no temporal
+    module is built and the conditioning width is unchanged, so a spatial-only
+    run is bit-for-bit the previous behaviour.
+    """
+
+    backend: str = "none"
+    #: Width of the per-frame context field appended to the spatial conditioning.
+    context_channels: int = 8
+    #: Internal width of the temporal encoder.
+    hidden_channels: int = 32
+    #: Depth of the temporal mixer.
+    layers: int = 2
+    #: Spatial decimation used for temporal mixing; bounds memory.
+    spatial_stride: int = 4
+    #: Maximum trajectory length accepted before failing loudly.
+    max_sequence_length: int = 64
+    dropout: float = 0.0
+    #: ``mamba`` backend only.
+    state_dim: int = 8
+    conv_kernel: int = 3
+    expansion_factor: int = 2
+    #: ``attention`` backend only.
+    num_heads: int = 4
+    #: ``causal`` streams only past frames. ``full_trajectory`` additionally
+    #: exposes later **raw Aurora** frames of the same initialization, which is
+    #: available before refinement when the whole rollout is produced first. It
+    #: is never later CAMS truth. The two modes are labelled separately because
+    #: their horizon dependence and deployment contracts differ.
+    mode: str = "causal"
+    #: Optimizer learning-rate multiplier for temporal parameters.
+    learning_rate_multiplier: float = 1.0
+
+    _KEYS = (
+        "backend",
+        "context_channels",
+        "hidden_channels",
+        "layers",
+        "spatial_stride",
+        "max_sequence_length",
+        "dropout",
+        "state_dim",
+        "conv_kernel",
+        "expansion_factor",
+        "num_heads",
+        "mode",
+        "learning_rate_multiplier",
+    )
+
+    _MODES = ("causal", "full_trajectory")
+
+    @classmethod
+    def from_mapping(cls, data: Any) -> TemporalRefinementConfig:
+        from finetune.refinement.temporal import TEMPORAL_BACKENDS
+
+        raw = _as_mapping(data)
+        sec = "refinement.temporal"
+        _reject_unknown(sec, raw, cls._KEYS)
+        d = cls()
+        return cls(
+            backend=_as_choice(sec, "backend", raw.get("backend"), d.backend, TEMPORAL_BACKENDS),
+            context_channels=_as_int(
+                sec, "context_channels", raw.get("context_channels"), d.context_channels
+            ),
+            hidden_channels=_as_int(
+                sec, "hidden_channels", raw.get("hidden_channels"), d.hidden_channels
+            ),
+            layers=_as_int(sec, "layers", raw.get("layers"), d.layers),
+            spatial_stride=_as_int(
+                sec, "spatial_stride", raw.get("spatial_stride"), d.spatial_stride
+            ),
+            max_sequence_length=_as_int(
+                sec, "max_sequence_length", raw.get("max_sequence_length"), d.max_sequence_length
+            ),
+            dropout=_as_float(
+                sec, "dropout", raw.get("dropout"), d.dropout, minimum=0.0, maximum=1.0
+            ),
+            state_dim=_as_int(sec, "state_dim", raw.get("state_dim"), d.state_dim),
+            conv_kernel=_as_int(sec, "conv_kernel", raw.get("conv_kernel"), d.conv_kernel),
+            expansion_factor=_as_int(
+                sec, "expansion_factor", raw.get("expansion_factor"), d.expansion_factor
+            ),
+            num_heads=_as_int(sec, "num_heads", raw.get("num_heads"), d.num_heads),
+            mode=_as_choice(sec, "mode", raw.get("mode"), d.mode, cls._MODES),
+            learning_rate_multiplier=_as_float(
+                sec,
+                "learning_rate_multiplier",
+                raw.get("learning_rate_multiplier"),
+                d.learning_rate_multiplier,
+                minimum=0.0,
+            ),
+        )
+
+    @property
+    def is_active(self) -> bool:
+        return str(self.backend).lower() != "none"
+
+    @property
+    def context_channels_if_active(self) -> int:
+        """Conditioning channels contributed by temporal context (0 when off)."""
+        return int(self.context_channels) if self.is_active else 0
+
+    @property
+    def uses_future_raw_aurora(self) -> bool:
+        """``True`` for the explicitly labelled full-trajectory postprocessor."""
+        return self.is_active and self.mode == "full_trajectory"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {key: getattr(self, key) for key in self._KEYS}
+
+
+@dataclass(frozen=True)
 class BiasLossConfig:
     """Alias kept for readability in downstream imports."""
 
@@ -1346,6 +1498,7 @@ class RefinementConfig:
     diffusion: DiffusionConfig = field(default_factory=DiffusionConfig)
     unet: UNetRefinerConfig = field(default_factory=UNetRefinerConfig)
     transformer: TransformerConfig = field(default_factory=TransformerConfig)
+    temporal: TemporalRefinementConfig = field(default_factory=TemporalRefinementConfig)
     #: ``True`` when the configuration was derived from the legacy
     #: ``model.flow_refine_*`` keys rather than an explicit ``refinement`` block.
     from_legacy_keys: bool = False
@@ -1370,6 +1523,7 @@ class RefinementConfig:
         "diffusion",
         "unet",
         "transformer",
+        "temporal",
     )
 
     # -- derived helpers -------------------------------------------------
@@ -1422,6 +1576,7 @@ class RefinementConfig:
             "diffusion": self.diffusion.to_dict(),
             "unet": self.unet.to_dict(),
             "transformer": self.transformer.to_dict(),
+            "temporal": self.temporal.to_dict(),
             "from_legacy_keys": self.from_legacy_keys,
         }
 
@@ -1889,6 +2044,15 @@ def resolve_refinement_config(config: Any) -> RefinementConfig:
     transformer = TransformerConfig.from_mapping(raw.get("transformer"))
     unet = UNetRefinerConfig.from_mapping(raw.get("unet"))
     loss = LossConfig.from_mapping(raw.get("loss"))
+    temporal = TemporalRefinementConfig.from_mapping(raw.get("temporal"))
+    conditioning = ConditioningConfig.from_mapping(raw.get("conditioning"))
+    if temporal.is_active and resolved_type in _LEGACY_TYPES:
+        raise ConfigValidationError(
+            "refinement.temporal is only implemented for the four unified refiners "
+            "(flow_matching_conv_unet, flow_matching_transformer, diffusion_unet, "
+            f"diffusion_transformer); refinement.type={resolved_type!r} is the legacy "
+            "wrapper, whose checkpoint format is preserved unchanged."
+        )
 
     cfg = RefinementConfig(
         enabled=enabled,
@@ -1904,12 +2068,13 @@ def resolve_refinement_config(config: Any) -> RefinementConfig:
         deterministic_inference=deterministic_inference,
         deterministic_head=deterministic_head,
         target_space=TargetSpaceConfig.from_mapping(raw.get("target_space")),
-        conditioning=ConditioningConfig.from_mapping(raw.get("conditioning")),
+        conditioning=conditioning,
         loss=loss,
         flow_matching=flow_matching,
         diffusion=diffusion,
         unet=unet,
         transformer=transformer,
+        temporal=temporal,
     )
 
     raw_diffusion = _as_mapping(raw.get("diffusion"))

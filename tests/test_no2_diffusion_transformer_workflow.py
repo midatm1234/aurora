@@ -233,7 +233,7 @@ def test_target_config_and_notebooks_share_the_factory() -> None:
         transformer["zero_init_output"]
         and diffusion["prediction_type"] == "epsilon"
     )
-    assert config["model"]["mamba_temporal"]["enabled"] is False
+    assert config["model"]["mamba_temporal"]["enabled"] is True
     assert training["mamba_temporal_weight"] == 1.0
     assert training["validation_refinement_ensemble_size"] == 1
     assert training["validation_source"] == "train_tail"
@@ -354,8 +354,10 @@ def test_no2_diffusion_transformer_train_checkpoint_inference_netcdf(
         for name, value in model.temporal.named_parameters()
     }
     training_sequence_shapes = []
-    hook = model.temporal.core.surf_heads["tcno2"].register_forward_hook(
-        lambda _module, args, _output: training_sequence_shapes.append(
+    # The shipped recipe uses the packed_joint head, which mixes every packed
+    # channel in a single module rather than exposing per-variable heads.
+    hook = model.temporal.core.register_forward_pre_hook(
+        lambda _module, args: training_sequence_shapes.append(
             tuple(args[0].shape)
         )
     )
@@ -377,7 +379,10 @@ def test_no2_diffusion_transformer_train_checkpoint_inference_netcdf(
         "temporal_base_loss",
         "temporal_total_loss",
     }
-    assert training_sequence_shapes == [(1, 6, 6, 6)]
+    # [batch, leads, packed channels, lat, lon]: one initialization, the six
+    # supervised leads, and the four packed target channels (no2 at three loss
+    # levels plus the tcno2 column).
+    assert training_sequence_shapes == [(1, 6, 4, 6, 6)]
     hook.remove()
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
@@ -385,12 +390,15 @@ def test_no2_diffusion_transformer_train_checkpoint_inference_netcdf(
         parameter.grad is not None and torch.isfinite(parameter.grad).all()
         for parameter in model.refiner.parameters()
     )
+    # The packed_joint head fuses through a gate initialised at zero, so at step
+    # zero the decoder is gradient-blocked by construction and the gate carries
+    # the signal. Require a real gradient somewhere in the temporal module
+    # rather than asserting on a parameter that warmup intentionally silences.
     assert any(
         parameter.grad is not None
         and torch.isfinite(parameter.grad).all()
         and torch.count_nonzero(parameter.grad) > 0
-        for name, parameter in model.temporal.named_parameters()
-        if ".decoder." in name
+        for parameter in model.temporal.parameters()
     )
     optimizer.step()
     assert any(
@@ -406,8 +414,8 @@ def test_no2_diffusion_transformer_train_checkpoint_inference_netcdf(
     validation_lead_hours = []
     validation_generators = []
     validation_ensemble_sizes = []
-    validation_hook = model.temporal.core.surf_heads["tcno2"].register_forward_hook(
-        lambda _module, args, _output: validation_sequence_lengths.append(
+    validation_hook = model.temporal.core.register_forward_pre_hook(
+        lambda _module, args: validation_sequence_lengths.append(
             int(args[0].shape[1])
         )
     )
@@ -564,6 +572,9 @@ def test_no2_diffusion_transformer_train_checkpoint_inference_netcdf(
     # stochastic member and temporal-corrects members before aggregation.
     packed_rollout = torch.zeros(1, 4, 6, 6)
     direct_history = []
+    # The packed_joint head conditions on physical lead, so the caller must keep
+    # a lead entry per history frame; the refiner refuses to guess one.
+    direct_lead_history = []
     loaded.eval()
     direct_first = loaded.refine(
         packed_rollout,
@@ -572,6 +583,7 @@ def test_no2_diffusion_transformer_train_checkpoint_inference_netcdf(
         seed=77,
         num_steps=2,
         temporal_history=direct_history,
+        temporal_lead_history=direct_lead_history,
     )
     assert direct_first.members.shape == (1, 2, 4, 6, 6)
     assert direct_history[0].shape == (1, 2, 4, 6, 6)
@@ -587,8 +599,10 @@ def test_no2_diffusion_transformer_train_checkpoint_inference_netcdf(
         seed=78,
         num_steps=2,
         temporal_history=direct_history,
+        temporal_lead_history=direct_lead_history,
     )
     assert len(direct_history) == 2
+    assert len(direct_lead_history) == len(direct_history)
 
     member_datasets = []
     member_predictions = []
@@ -596,8 +610,8 @@ def test_no2_diffusion_transformer_train_checkpoint_inference_netcdf(
     loaded.eval()
     inference_sequence_lengths = []
     aurora_rollout_inputs = []
-    inference_hook = loaded.temporal.core.surf_heads["tcno2"].register_forward_hook(
-        lambda _module, args, _output: inference_sequence_lengths.append(
+    inference_hook = loaded.temporal.core.register_forward_pre_hook(
+        lambda _module, args: inference_sequence_lengths.append(
             int(args[0].shape[1])
         )
     )
@@ -707,10 +721,8 @@ def test_no2_diffusion_transformer_train_checkpoint_inference_netcdf(
             }
         )
     )
-    feedback_temporal_hook = loaded.temporal.core.surf_heads[
-        "tcno2"
-    ].register_forward_hook(
-        lambda _module, args, _output: feedback_temporal_lengths.append(
+    feedback_temporal_hook = loaded.temporal.core.register_forward_pre_hook(
+        lambda _module, args: feedback_temporal_lengths.append(
             int(args[0].shape[1])
         )
     )

@@ -59,6 +59,43 @@ def test_checkpoint_roundtrip_optimizer_integer_keys_and_bfloat(tmp_path):
     with pytest.raises(TypeError):save_training_state(p,{"state_dict":object()})
 
 
+@pytest.mark.parametrize("suffix", [".npz", ".pt"])
+def test_reference_spatial_checkpoint_accepts_only_inert_new_defaults(tmp_path, plan, suffix):
+    import torch
+    from tests.refinement_fixtures import build_packing
+
+    expected = checkpoint_contract(effective_config(plan), build_packing(8, 8))
+    historical = copy.deepcopy(expected)
+    historical["refinement"].pop("temporal")
+    for key in ("calendar", "solar_geometry", "vertical_identity"):
+        historical["refinement"]["conditioning"].pop(key)
+    historical["temporal"].update(
+        mode="per_variable", gated_fusion=False,
+        lead_time_conditioning=False, mask_conditioning=False,
+    )
+    path = tmp_path / ("reference-spatial" + suffix)
+    payload = {"contract": historical, "state_dict": {"w": torch.ones(2)}}
+    if suffix == ".npz":
+        save_training_state(path, payload)
+    else:
+        torch.save(payload, path)
+    assert torch.equal(load_training_state(path, expected)["state_dict"]["w"], torch.ones(2))
+
+    for active in ("calendar", "solar_geometry", "vertical_identity"):
+        changed = copy.deepcopy(expected)
+        changed["refinement"]["conditioning"][active] = True
+        with pytest.raises(ValueError):
+            load_training_state(path, changed)
+    changed = copy.deepcopy(expected)
+    changed["temporal"]["enabled"] = True
+    with pytest.raises(ValueError):
+        load_training_state(path, changed)
+    changed = copy.deepcopy(expected)
+    changed["refinement"]["temporal"]["backend"] = "causal_conv"
+    with pytest.raises(ValueError):
+        load_training_state(path, changed)
+
+
 def test_repeatability_and_inference_does_not_read_reference(tmp_path,plan):
     import aurora_workflow.science as science
     a=execute_science("smoke",plan,tmp_path/"a")
@@ -149,13 +186,19 @@ def test_real_rollout_adapter_global_input_regional_output_with_synthetic_backbo
         assert np.all(result_data["fields"][:,1]==3)
 
 
-@pytest.mark.parametrize("change",["feedback","family","future","teacher"])
+@pytest.mark.parametrize("change",["feedback","family","future","teacher","calendar","solar_geometry","context","implicit_mamba","flat_mamba"])
 def test_reject_invalid_scientific_contract(plan,change):
     cfg=effective_config(plan)
     if change=="feedback":cfg["model"]["refinement"]["feedback_to_rollout"]=True
     elif change=="family":cfg["model"]["model_variant"]="aurora_v1p5"
     elif change=="future":cfg["rollout"]["keep_exogenous_predictors"]="refresh_from_dataset"
-    else:cfg["rollout"]["autoregressive_inputs"]=False
+    elif change=="teacher":cfg["rollout"]["autoregressive_inputs"]=False
+    elif change in {"calendar", "solar_geometry"}:cfg["model"]["refinement"].setdefault("conditioning", {})[change]=True
+    elif change=="context":cfg["model"]["refinement"]["temporal"]={"backend":"causal_conv"}
+    elif change=="implicit_mamba":
+        cfg["model"].pop("mamba_temporal",None)
+        cfg["model"].pop("mamba_temporal_enabled",None)
+    else:cfg["model"]["mamba_temporal_enabled"]=True
     with pytest.raises(ValueError):validate_scientific_config(cfg)
 
 

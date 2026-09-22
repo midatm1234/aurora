@@ -146,7 +146,9 @@ class _BaseDiffusionRefiner(PackedRefiner):
     ) -> torch.Tensor:
         """Evaluate the denoiser at model precision, then return float32."""
         model_state = state_float32.to(dtype=conditioning.dtype)
-        prediction = self.net(model_state, conditioning, process_time, lead)
+        prediction = self._evaluate_net(
+            self.net, model_state, conditioning, process_time, lead
+        )
         if prediction.shape != state_float32.shape:
             raise RuntimeError(
                 "Diffusion denoiser output shape must match its state; got "

@@ -1379,7 +1379,9 @@ def _worker(rank: int, world_size: int, local_gpu: int, cfg: dict):
             cfg["runtime"]["training_run_id"] = str(saved_run_id)
         ft.validate_checkpoint_longitude(model, ckpt)
         saved_config = ckpt.get("config", {})
-        saved_temporal = resolve_temporal_config(saved_config)
+        from finetune.refinement.two_phase import resolve_checkpoint_temporal_config
+
+        saved_temporal = resolve_checkpoint_temporal_config(saved_config)
         serialized_temporal = ckpt.get("resolved_temporal_config")
         if isinstance(serialized_temporal, dict):
             saved_temporal.update(serialized_temporal)

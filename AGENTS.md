@@ -4,4 +4,6 @@ For CAMS acquisition, AuroraAirPollution rollout, refinement training/replay/res
 
 Start by inspecting environment, assets and existing runs. Use the local MCP server for agent scientific execution; review a bounded plan before human approval. Setup and registration are described in [docs/agent-workflow.md](docs/agent-workflow.md). Preserve historical notebooks, checkpoint contracts and unrelated working-tree changes. Do not run the Microsoft weather starter generator or substitute Aurora 1.5.
 
+This refinement branch also includes newer research YAMLs and experimental temporal APIs. Read [the branch synchronization report](docs/refinement-branch-synchronization.md). The portable `recipes/*.json` remain pinned spatial-only snapshots; do not substitute a current research YAML or enable unwired temporal/calendar context in MCP execution.
+
 For implementation work, use the existing `finetune` models and the shared `aurora_workflow` backend. Default validation is CPU-only: `python -m pytest --confcutdir=tests/workflow tests/workflow`. Keep generated data, checkpoints, local configuration, credentials and run outputs out of commits. State what actually ran; source-reported studies and synthetic checks are not new scientific reproduction.

@@ -260,12 +260,15 @@ def select_refinement_checkpoint(
     checkpoint_dir: str | Path,
     *,
     require_validated: bool = False,
+    prefer_latest: bool = False,
 ) -> Path:
     """Select a checkpoint from the latest logical training run.
 
     A validated best checkpoint is preferred. With ``require_validated=False``,
     the current run's last checkpoint is an explicit diagnostic fallback.
     Stale best checkpoints from previous runs are never selected implicitly.
+    ``prefer_latest=True`` selects only the current run's last checkpoint,
+    even when an accepted best exists; missing run provenance is an error.
     """
     checkpoint_dir = Path(checkpoint_dir)
     status = refinement_checkpoint_status(checkpoint_dir)
@@ -275,6 +278,26 @@ def select_refinement_checkpoint(
     last_status = status["last"]
     has_marker = bool(status["training_run_marker_present"])
     current_run_id = status["training_run_id"]
+
+    if prefer_latest:
+        if not last_status["exists"]:
+            raise FileNotFoundError(
+                "The latest saved weights require last.ckpt; no best checkpoint fallback. "
+                + _status_detail(status)
+            )
+        marker_missing_run_id = has_marker and not status["run_marker"].get("training_run_id")
+        if marker_missing_run_id or not current_run_id or not last_status["belongs_to_current_run"]:
+            raise ValueError(
+                "last.ckpt has missing or stale training-run provenance. "
+                "Wait for the current fine-tuning run to save its checkpoint. "
+                + _status_detail(status)
+            )
+        if require_validated and not last_status["validated_for_inference"]:
+            raise ValueError(
+                "The latest last.ckpt was not accepted for validated inference. "
+                + _status_detail(status)
+            )
+        return last
 
     if has_marker and current_run_id:
         if (

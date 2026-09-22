@@ -305,10 +305,107 @@ channel axis and aligned to the target grid:
 | `static_fields` | `true` | static/orography-style fields |
 | `masks` | `true` | validity of the inputs (**never** the target mask) |
 | `forecast_lead_time` | `true` | scalar hours, injected through a separate embedding |
+| `latitude` | `false` | `lat / 90` as one channel |
+| `longitude` | `false` | periodic `sin`/`cos` longitude, two channels |
+| `calendar` | `false` | 13 scalar calendar features of each frame's own **valid** time |
+| `solar_geometry` | `false` | 7 spatial channels: spherical position, local mean solar hour, `cos` solar zenith |
+| `vertical_identity` | `false` | continuous `log(p / p_ref)`, variable identity, column/pressure-not-applicable mask |
 
 Never used as conditioning: future target values, future Aurora states
 unavailable at inference, and any statistic derived from the inference-period
 target.
+
+### 5.1 Joint spatiotemporal conditioning
+
+The last three keys, together with `model.refinement.temporal`, provide joint
+calendar / location / vertical / temporal conditioning for all four unified
+refiners. All default to off, so an existing recipe keeps its exact conditioning
+width, state-dict keys and numerical path.
+
+**Four time coordinates are kept strictly separate** and never share an
+embedding or a configuration field:
+
+| coordinate | meaning | where it lives |
+| --- | --- | --- |
+| `t0` | initialization time | `init_cycle_*`, `init_season_*` |
+| `ell` | cumulative forecast lead (hours) | `lead_hours_*`, `LeadTimeEmbedding` |
+| `t_valid = t0 + ell` | this frame's valid time | `valid_season_*`, `valid_utc_*` |
+| `tau` / `k` | flow coordinate / diffusion index | `ProcessTimeEmbedding` |
+
+`finetune/refinement/calendar_features.py` is the single builder used by
+training, inference and evaluation. Every feature is derived from the frame's
+own valid timestamp, so a rollout never reuses the initialization hour.
+Leap years, year rollover, midnight UTC and sub-hour precision are handled
+explicitly; non-Gregorian `cftime` calendars are rejected rather than
+mis-encoded; the machine's local time zone is never consulted.
+
+`cos_solar_zenith` reuses the orbital approximation of `aurora/insolation.py`
+and is validated against it. Local solar time is **mean solar time**
+(`(UTC + lon_east/15) mod 24`), not civil time and not apparent solar time.
+
+`gtco3` is treated as a **column** quantity with its own type embedding and a
+pressure-not-applicable mask. It is never given a fabricated surface or
+zero-pressure level, and no column/profile integral constraint is imposed.
+
+Calendar, lead and process-time embeddings are fused through a **joint
+nonlinear MLP** (zero-initialized output), not summed, so the model can learn
+season × hour × lead × level interactions rather than disconnected lookups.
+
+### 5.2 Temporal backends
+
+`model.refinement.temporal.backend` selects the causal temporal mixer. It is
+independent of `refinement.type` (spatial backbone) and of
+`transformer.attention_mode` (spatial attention).
+
+| backend | kind | adds attention? |
+| --- | --- | --- |
+| `none` | spatial-only control, builds nothing | no |
+| `causal_conv` | dilated causal temporal convolution | **no** |
+| `conv_gru` | forward-only gated recurrence | no |
+| `attention` | causal attention over lead tokens | temporal only |
+| `mamba` | reference selective scan | no |
+
+Mamba is optional; nothing depends on it. This is **not** the legacy
+post-sampling `model.mamba_temporal` adapter: the context produced here is
+concatenated onto the spatial conditioning, so it enters the denoiser / velocity
+network at **every** process evaluation.
+
+Guarantees, all asserted numerically in
+`tests/test_refinement_spatiotemporal.py`:
+
+* **Causal.** Every backend is prefix invariant — the context at lead `j` is
+  unchanged when later leads change. Normalization is per frame, so no statistic
+  is pooled across the lead axis.
+* **Spatially contextual.** A convolutional stem runs before temporal mixing and
+  a second spatial stage after it, so the recurrence is not an isolated
+  per-pixel process.
+* **Process axis separated.** `TemporalContextEncoder.forward` has no argument
+  through which a noised residual could be passed, so temporal state cannot
+  advance between solver evaluations of one frame. `TemporalContextCache` keys on
+  `(initialization, member, lead_index)`.
+* **Trainable identity initialization.** One zero-initialized projection, fed by
+  a non-zero activation. No zero-gate/zero-projection deadlock.
+* **Memory bounded.** Temporal mixing runs on a strided grid
+  (`spatial_stride`, default 4).
+
+`temporal.mode` is `causal` (streaming; default) or `full_trajectory`, the
+separately labelled postprocessor that may also use later **raw Aurora**
+forecasts of the same initialization. It never substitutes later CAMS truth, and
+`uses_future_raw_aurora` is persisted in the checkpoint contract.
+
+### 5.3 Trajectory scores
+
+`finetune/refinement/trajectory.py` supplements the marginal CRPS in
+`evaluation.py` with `tendency_loss`, member-wise event functionals
+(`member_window_maximum`, `member_time_weighted_mean`), `ensemble_crps` (fair /
+empirical, with the fair estimator rejected for `M = 1`),
+`threshold_weighted_crps` (upper and lower tail, scoring **all** cases),
+`exceedance_brier` with reliability bins, `residual_autocorrelation` and
+`peak_timing_error`. Every functional is computed per member **before** ensemble
+scoring.
+
+See `finetune/O3_SPATIOTEMPORAL_REVIEW.md` for the full implementation review,
+the pretrained-backbone `doy` audit, status per recipe and verified commands.
 
 ---
 

@@ -35,13 +35,17 @@ than optional.
 
 from __future__ import annotations
 
+import contextlib
+
 import torch
 
 from finetune.refinement.backbones import ConditionalResidualUNet, SpatialResidualTransformer
 from finetune.refinement.base import RefinerOutput, ResidualRefiner, masked_loss
-from finetune.refinement.config import RefinementConfig
+from finetune.refinement.config import ConfigValidationError, RefinementConfig
 from finetune.refinement.losses import compute_auxiliary_losses
+from finetune.refinement.packing import FieldPacking
 from finetune.refinement.residual_scaling import ResidualScaler
+from finetune.refinement.vertical import VerticalChannelEncoder
 
 __all__ = ["PackedRefiner"]
 
@@ -66,6 +70,35 @@ class PackedRefiner(ResidualRefiner):
         self.lead_time_conditioning = bool(config.conditioning.forecast_lead_time)
         self.lead_time_scale_hours = float(getattr(metadata, "lead_time_scale_hours", 72.0) or 72.0)
         self.lon_periodic = bool(getattr(metadata, "lon_periodic", False))
+        # Calendar / geometry scalars fused into the conditioning vector, and
+        # causal temporal-context channels appended to the spatial conditioning.
+        # Both widths are part of the checkpoint contract: a network trained
+        # with them cannot be evaluated without them, which `_metadata_for` and
+        # `augment_conditioning` enforce at call time.
+        self.calendar_features = int(config.conditioning.metadata_feature_count)
+        self.temporal_context_channels = int(config.temporal.context_channels_if_active)
+        self._frame_metadata: torch.Tensor | None = None
+        self._frame_temporal_context: torch.Tensor | None = None
+
+        # Continuous pressure / variable identity for the packed channel axis.
+        # Lives here rather than on the two-phase wrapper because it modulates
+        # the packed state and therefore belongs in the refiner's state dict.
+        self.vertical_encoder: VerticalChannelEncoder | None = None
+        if config.conditioning.vertical_identity:
+            if not isinstance(metadata, FieldPacking):
+                raise ConfigValidationError(
+                    "refinement.conditioning.vertical_identity needs the FieldPacking "
+                    "metadata to read each channel's pressure level, units and variable "
+                    f"identity; got {type(metadata).__name__}."
+                )
+            self.vertical_encoder = VerticalChannelEncoder(
+                metadata, max(8, int(metadata.num_channels))
+            )
+        self.vertical_features = (
+            0 if self.vertical_encoder is None else self.vertical_encoder.dim
+        )
+        #: Total width of the conditioning vector consumed by the backbone MLP.
+        self.metadata_features = self.calendar_features + self.vertical_features
         target_space = config.target_space
         self.residual_scaler = ResidualScaler(
             self.residual_channels,
@@ -99,11 +132,14 @@ class PackedRefiner(ResidualRefiner):
 
     # -- construction ----------------------------------------------------
     def _build_net(self, config: RefinementConfig) -> torch.nn.Module:
+        # The temporal context is appended to the spatial conditioning, so the
+        # network's declared conditioning width includes it.
+        cond_channels = self.cond_channels + self.temporal_context_channels
         if config.uses_transformer:
             t = config.transformer
             return SpatialResidualTransformer(
                 in_channels=self.residual_channels,
-                cond_channels=self.cond_channels,
+                cond_channels=cond_channels,
                 out_channels=self.residual_channels,
                 patch_size=t.patch_size,
                 embedding_dim=t.embedding_dim,
@@ -124,11 +160,12 @@ class PackedRefiner(ResidualRefiner):
                 lead_time_scale_hours=self.lead_time_scale_hours,
                 lon_periodic=self.lon_periodic,
                 local_refinement=t.local_refinement,
+                metadata_features=self.metadata_features,
             )
         u = config.unet
         return ConditionalResidualUNet(
             in_channels=self.residual_channels,
-            cond_channels=self.cond_channels,
+            cond_channels=cond_channels,
             out_channels=self.residual_channels,
             hidden_channels=u.hidden_channels,
             num_levels=u.num_levels,
@@ -141,6 +178,7 @@ class PackedRefiner(ResidualRefiner):
             lead_time_conditioning=self.lead_time_conditioning,
             lead_time_scale_hours=self.lead_time_scale_hours,
             lon_periodic=self.lon_periodic,
+            metadata_features=self.metadata_features,
         )
 
     @staticmethod
@@ -242,6 +280,160 @@ class PackedRefiner(ResidualRefiner):
     def _lead_for(self, forecast_lead_time: torch.Tensor | None) -> torch.Tensor | None:
         return forecast_lead_time if self.lead_time_conditioning else None
 
+    @contextlib.contextmanager
+    def use_frame_conditioning(
+        self,
+        *,
+        metadata: torch.Tensor | None = None,
+        temporal_context: torch.Tensor | None = None,
+    ):
+        """Bind per-frame calendar metadata and temporal context for this call.
+
+        Both quantities describe the *forecast frame*, so they are constant
+        across every evaluation of the generative process for that frame. They
+        are bound once by the caller and consumed automatically by every
+        internal ``net`` / ``mean_net`` call, which is what guarantees that a
+        denoiser or velocity evaluation can never silently run without the
+        conditioning its checkpoint was trained with.
+
+        Binding rather than threading a parameter through
+        ``_training_loss`` / ``_sample`` / ``_deterministic`` also keeps the
+        subclass API unchanged for the diffusion and flow-matching processes.
+
+        Neither argument may depend on the current noised residual: that is what
+        makes the value reusable across solver evaluations. See
+        :class:`finetune.refinement.temporal.TemporalContextCache`.
+        """
+        previous = (self._frame_metadata, self._frame_temporal_context)
+        self._frame_metadata = metadata
+        self._frame_temporal_context = temporal_context
+        try:
+            yield
+        finally:
+            self._frame_metadata, self._frame_temporal_context = previous
+
+    def _expand_to_members(
+        self, value: torch.Tensor, batch: int, *, name: str
+    ) -> torch.Tensor:
+        """Expand bound per-frame conditioning to a member-replicated batch.
+
+        Batched ensemble generation replicates the conditioning with
+        ``repeat_interleave``, giving the flat layout
+        ``[b0m0, b0m1, ..., b0m(M-1), b1m0, ...]`` (see
+        :meth:`AuroraTwoPhaseRefiner.refine`). Per-frame conditioning must
+        follow *exactly* that layout: a plain ``repeat`` would pair frame 0's
+        calendar with sample 1's field and silently corrupt the ensemble.
+        """
+        rows = int(value.shape[0])
+        if rows == batch:
+            return value
+        if rows == 1:
+            return value.expand(batch, *value.shape[1:])
+        if batch % rows == 0:
+            return value.repeat_interleave(batch // rows, dim=0)
+        raise ValueError(
+            f"Bound {name} has {rows} rows, which is neither the batch size "
+            f"{batch} nor a divisor of it. Ensemble replication uses "
+            "repeat_interleave, so the frame count must divide the packed batch."
+        )
+
+    def _metadata_for(self, batch: int) -> torch.Tensor | None:
+        """Validated conditioning vector for a packed batch of ``batch`` rows.
+
+        Concatenates the bound per-frame calendar scalars with the pooled
+        vertical/variable-identity embedding. The vertical part is identical for
+        every row (it describes the field set, not the frame) but is carried in
+        the same vector so the fusion MLP can form calendar x level interactions.
+        """
+        if self.metadata_features <= 0:
+            return None
+        parts: list[torch.Tensor] = []
+        if self.calendar_features > 0:
+            metadata = self._frame_metadata
+            if metadata is None:
+                raise RuntimeError(
+                    "This refiner was built with "
+                    f"calendar_features={self.calendar_features} but no calendar "
+                    "metadata is bound. Wrap the call in "
+                    "`refiner.use_frame_conditioning(metadata=...)`; running without it "
+                    "would train and deploy different conditioning contracts."
+                )
+            if metadata.shape[-1] != self.calendar_features:
+                raise ValueError(
+                    f"Bound calendar metadata must have {self.calendar_features} "
+                    f"features, got {tuple(metadata.shape)}."
+                )
+            parts.append(self._expand_to_members(metadata, batch, name="calendar metadata"))
+        if self.vertical_encoder is not None:
+            pooled = self.vertical_encoder.pooled()
+            parts.append(pooled[None].expand(batch, pooled.shape[0]))
+        combined = torch.cat([p.to(parts[0].dtype) for p in parts], dim=-1)
+        if combined.shape != (batch, self.metadata_features):
+            raise RuntimeError(
+                f"Conditioning vector must be [{batch}, {self.metadata_features}], "
+                f"built {tuple(combined.shape)}."
+            )
+        return combined
+
+    def augment_conditioning(self, conditioning: torch.Tensor) -> torch.Tensor:
+        """Append the bound temporal context to the spatial conditioning stack.
+
+        The context is *extra conditioning channels*, so temporal information
+        reaches the denoiser at every process evaluation rather than being
+        applied to already-sampled frames.
+        """
+        context = self._frame_temporal_context
+        if self.temporal_context_channels <= 0:
+            if context is not None:
+                raise RuntimeError(
+                    "Temporal context was bound but this refiner was built with "
+                    "temporal_context_channels=0. The conditioning width is part of "
+                    "the checkpoint contract and cannot change at call time."
+                )
+            return conditioning
+        if context is None:
+            raise RuntimeError(
+                "This refiner was built with temporal_context_channels="
+                f"{self.temporal_context_channels} but no temporal context is bound. "
+                "Wrap the call in `refiner.use_frame_conditioning(temporal_context=...)`."
+            )
+        batch = conditioning.shape[0]
+        expected_tail = (self.temporal_context_channels, *conditioning.shape[-2:])
+        if tuple(context.shape[1:]) != expected_tail:
+            raise ValueError(
+                f"Temporal context must have trailing shape {expected_tail}, got "
+                f"{tuple(context.shape[1:])}."
+            )
+        context = self._expand_to_members(context, batch, name="temporal context")
+        return torch.cat([conditioning, context.to(conditioning.dtype)], dim=1)
+
+    def _evaluate_net(
+        self,
+        network: torch.nn.Module,
+        state: torch.Tensor,
+        conditioning: torch.Tensor,
+        process_time: torch.Tensor,
+        lead: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Single funnel for every generative-network evaluation.
+
+        ``lead`` must already have passed through :meth:`_lead_for`.
+
+        The per-channel vertical affine is applied to the network's *input*
+        representation of the packed state. It is an input reparameterization
+        only: the generative process still operates on the unmodified residual,
+        and the affine is an exact identity at construction.
+        """
+        if self.vertical_encoder is not None:
+            state = self.vertical_encoder.apply_channel_modulation(state)
+        return network(
+            state,
+            self.augment_conditioning(conditioning),
+            process_time,
+            lead,
+            self._metadata_for(int(conditioning.shape[0])),
+        )
+
     @torch.no_grad()
     def _output_projection_is_exactly_zero(
         self, network: torch.nn.Module | None = None
@@ -294,7 +486,8 @@ class PackedRefiner(ResidualRefiner):
         )
         context = torch.enable_grad() if differentiable else torch.no_grad()
         with context:
-            prediction = self.mean_net(
+            prediction = self._evaluate_net(
+                self.mean_net,
                 state,
                 conditioning,
                 process_time,

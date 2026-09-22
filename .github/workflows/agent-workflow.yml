@@ -26,3 +26,20 @@ jobs:
         env:
           CUDA_VISIBLE_DEVICES: ''
           OMP_NUM_THREADS: '1'
+          HF_HUB_OFFLINE: '1'
+      - name: Refinement and notebook contract regressions
+        run: >-
+          /tmp/aurora-cpu/bin/python -m pytest -q
+          tests/test_refinement_*.py tests/test_checkpoint*.py
+          tests/test_flow_refine_contract.py tests/test_distributed_refinement_contract.py
+          tests/test_mamba*.py tests/test_no2_diffusion_transformer_workflow.py
+          tests/test_finetune_config_compatibility.py tests/test_prepare_train_test_from_netcdf.py
+          tests/test_overall_evaluation_maps.py tests/test_evaluation_selection.py
+          tests/test_inference_yaml_period.py tests/test_spatiotemporal_tools.py
+          tests/test_case_data_paths.py tests/test_trace_refinement_batch.py
+          tests/test_longitude_periodicity.py tests/test_diagnose_refinement.py
+        env:
+          CUDA_VISIBLE_DEVICES: ''
+          OMP_NUM_THREADS: '1'
+          MKL_NUM_THREADS: '1'
+          HF_HUB_OFFLINE: '1'

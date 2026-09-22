@@ -810,7 +810,7 @@ def test_unified_examples_ship_a_safe_correction_product(name: str) -> None:
     training = raw["training"]
     assert not any(key.startswith("mamba_temporal_") for key in model)
     temporal_raw = model["mamba_temporal"]
-    assert temporal_raw["enabled"] is False
+    assert temporal_raw["enabled"] is True
     assert temporal_raw["mode"] == "packed_joint"
     assert temporal_raw["gated_fusion"] is True
     assert temporal_raw["lead_time_conditioning"] is True
@@ -818,7 +818,7 @@ def test_unified_examples_ship_a_safe_correction_product(name: str) -> None:
     assert temporal_raw["coordinate_conditioning"] is True
     assert temporal_raw["causal"] is True
     temporal = resolve_temporal_config(raw)
-    assert temporal["enabled"] is False
+    assert temporal["enabled"] is True
     assert temporal["mode"] == "packed_joint"
     assert temporal["gated_fusion"] is True
     assert temporal["lead_time_conditioning"] is True
@@ -843,11 +843,11 @@ def test_unified_examples_ship_a_safe_correction_product(name: str) -> None:
         assert cfg.diffusion.prediction_type == "sample"
         assert not (zero_initialized and cfg.diffusion.prediction_type == "epsilon")
 
-    raw["model"]["mamba_temporal"]["enabled"] = True
+    raw["model"]["mamba_temporal"]["enabled"] = False
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", RuntimeWarning)
         ft.validate_config(raw, path)
-    assert resolve_temporal_config(raw)["enabled"] is True
+    assert resolve_temporal_config(raw)["enabled"] is False
 
 
 def test_unified_head_warns_when_legacy_auxiliary_block_is_enabled() -> None:

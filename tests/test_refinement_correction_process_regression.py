@@ -23,6 +23,7 @@ from finetune.refinement.config import (
     resolve_refinement_config,
 )
 from finetune.refinement.schedules import DiffusionSchedule
+from finetune.refinement.two_phase import resolve_temporal_config
 from tests.refinement_fixtures import build_refiner_model
 
 
@@ -392,7 +393,15 @@ def test_config_correction_contract_and_all_unified_no2_switches():
         "diffusion_transformer_config.yaml"
     )
     raw = yaml.safe_load(path.read_text())
-    assert raw["case_name"].endswith("_corrected")
+    # This branch preserves the explicit causal Mamba experiment. Its output
+    # namespace must identify that temporal product while reusing the same data.
+    temporal = resolve_temporal_config(raw)
+    assert temporal["enabled"] is True
+    assert temporal["mode"] == "packed_joint"
+    assert temporal["causal"] is True
+    assert raw["case_name"] == (
+        f"{raw['paths']['data_case_name']}_diffusion_transformer_mamba"
+    )
     for kind in (
         "flow_matching_conv_unet",
         "flow_matching_transformer",

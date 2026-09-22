@@ -111,8 +111,16 @@ def validate_scientific_config(cfg: dict) -> dict:
         raise ValueError("Aurora air-pollution checkpoint cadence is 12 hours")
     if model.get("patch_size") != 3:
         raise ValueError("AuroraAirPollution patch size must be 3")
-    if model.get("mamba_temporal_enabled",False) or model.get("mamba_temporal",{}).get("enabled",False):
+    unified_active = ref.get("enabled", True) and ref.get("type", "none") not in {"none", "flow_matching_unet"}
+    temporal_enabled = model.get("mamba_temporal", {}).get(
+        "enabled", model.get("mamba_temporal_enabled", unified_active)
+    )
+    if temporal_enabled or model.get("mamba_temporal_enabled", False):
         raise ValueError("Portable cached workflow currently supports spatial heads; use the preserved sequence-aware Mamba runner for a separately identified temporal experiment")
+    if ref.get("temporal", {}).get("backend", "none") != "none":
+        raise ValueError("Portable cached workflow does not supply temporal context; use the experimental sequence API")
+    if any(ref.get("conditioning", {}).get(key, False) for key in ("calendar", "solar_geometry")):
+        raise ValueError("Portable cached workflow does not supply calendar/solar context; use the experimental conditioning API")
     return {"valid": True, "model_family": "AuroraAirPollution", "head": ref["type"],
             "feedback_to_rollout": False, "input_provenance": "explicit initialization-issued forecast exogenous fields" if historical else "two past analysis times; autonomous thereafter"}
 
@@ -179,6 +187,29 @@ def save_training_state(path: Path, payload: dict) -> str:
     return _hash(path)
 
 
+def _comparable_checkpoint_contract(contract: dict) -> dict:
+    """Hydrate only legacy-safe, inactive options added after schema v1.
+
+    The reference branch predates optional calendar/vertical/context features.
+    Their disabled defaults add no tensors or inputs. Active configurations,
+    including feature order and every existing scientific field, remain strict.
+    """
+    result = copy.deepcopy(contract)
+    refinement = result.get("refinement")
+    if isinstance(refinement, dict):
+        conditioning = refinement.get("conditioning")
+        if isinstance(conditioning, dict):
+            for key in ("calendar", "solar_geometry", "vertical_identity"):
+                conditioning.setdefault(key, False)
+        context = refinement.get("temporal", {"backend": "none"})
+        if isinstance(context, dict) and context.get("backend", "none") == "none":
+            refinement["temporal"] = {"backend": "none"}
+    temporal = result.get("temporal")
+    if isinstance(temporal, dict) and temporal.get("enabled") is False:
+        result["temporal"] = {"enabled": False}
+    return result
+
+
 def load_training_state(path: Path, expected: dict, *, model=None, cfg=None) -> dict:
     import numpy as np
     import torch
@@ -187,7 +218,7 @@ def load_training_state(path: Path, expected: dict, *, model=None, cfg=None) -> 
         # retry with weights_only=False. A trusted owner can explicitly export
         # those artifacts; incompatibility is not a request to retrain.
         raw = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
-        if isinstance(raw, dict) and raw.get("contract") == expected:
+        if isinstance(raw, dict) and isinstance(raw.get("contract"), dict) and _comparable_checkpoint_contract(raw["contract"]) == _comparable_checkpoint_contract(expected):
             payload = raw
         elif isinstance(raw, dict) and model is not None and cfg is not None:
             from finetune.model_factory import validate_unified_checkpoint_contract
@@ -240,10 +271,10 @@ def load_training_state(path: Path, expected: dict, *, model=None, cfg=None) -> 
                 raise ValueError("Checkpoint root must be a mapping")
             contract_tree=next((v for k,v in tree["dict"] if k=="contract"),None)
             actual_contract=decode(contract_tree)
-            if actual_contract!=expected:
+            if not isinstance(actual_contract, dict) or _comparable_checkpoint_contract(actual_contract)!=_comparable_checkpoint_contract(expected):
                 raise ValueError("Checkpoint incompatibility before tensor loading")
             payload = decode(tree)
-    if payload.get("contract") != expected:
+    if not isinstance(payload.get("contract"), dict) or _comparable_checkpoint_contract(payload["contract"]) != _comparable_checkpoint_contract(expected):
         actual = payload.get("contract", {})
         differences = [k for k in expected if actual.get(k) != expected[k]]
         raise ValueError(f"Checkpoint incompatibility before state loading: {differences}")

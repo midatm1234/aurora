@@ -46,6 +46,9 @@ output.png
 finetune/outputs/
 examples/outputs/
 examples/cams_download_2025_range.log
+/examples/cams_download_*.log
+/finetune/ablations/
+/pilot*.json
 finetune/*.pdf
 *.orig
 

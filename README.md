@@ -2,6 +2,8 @@
 
 This branch adds a local MCP workflow around this fork's existing `AuroraAirPollution` implementation. Start with [the portable onboarding guide](docs/agent-workflow.md), [workflow inventory](docs/workflow-inventory.md), and [implementation/validation report](docs/workflow-implementation-report.md). Existing notebooks below remain available.
 
+On `aurora_finetune_stochastic_refinement`, the public workflow is synchronized with `agent_skills_to_finetune_aurora` while retaining the original refinement experiments. Read [the branch synchronization report](docs/refinement-branch-synchronization.md) for the differences, excluded local artifacts, and validation. Portable recipes retain their pinned spatial-only configuration; the research YAMLs include separate temporal experiments.
+
 The workflow provides pinned assets, versioned NO2/O3 recipes, four unified residual heads plus the unchanged baseline, bounded human-approved jobs, physical-unit evaluation, and an attributed [OKF knowledge bundle](knowledge/index.md). The canonical recipes use autonomous frozen-backbone rollouts; separately named historical forecast-forced recipes document their exogenous inputs. Replay, resume, warm-start and retraining are distinct modes. Mamba remains optional in the existing research runners and is disabled in the canonical spatial recipes.
 
 Copy this handoff prompt into your local agent:

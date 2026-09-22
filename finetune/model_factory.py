@@ -126,7 +126,10 @@ def validate_unified_checkpoint_contract(
 ) -> None:
     """Validate the complete unified refinement architecture and packing contract."""
     from finetune.refinement.integration import describe_refinement
-    from finetune.refinement.two_phase import resolve_temporal_config
+    from finetune.refinement.two_phase import (
+        resolve_checkpoint_temporal_config,
+        resolve_temporal_config,
+    )
 
     saved = checkpoint.get("resolved_refinement_config")
     if not isinstance(saved, dict):
@@ -169,6 +172,10 @@ def validate_unified_checkpoint_contract(
         active_scientific_keys.append(
             "transformer" if current_type.endswith("_transformer") else "unet"
         )
+    saved_context = saved.get("temporal", {"backend": "none"})
+    current_context = current.get("temporal", {"backend": "none"})
+    if saved_context.get("backend", "none") != "none" or current_context.get("backend", "none") != "none":
+        active_scientific_keys.append("temporal")
     scientific_keys = (*common_scientific_keys, *active_scientific_keys)
     mismatches = [
         key for key in scientific_keys if saved.get(key) != current.get(key)
@@ -179,6 +186,10 @@ def validate_unified_checkpoint_contract(
             for key in mismatches
         )
         raise ValueError("Checkpoint unified refinement mismatch: " + details)
+
+    from finetune.refinement.checkpoint import validate_spatiotemporal_contract
+
+    validate_spatiotemporal_contract(model, checkpoint)
 
     saved_packing = checkpoint.get("field_packing")
     if not isinstance(saved_packing, dict):
@@ -247,7 +258,7 @@ def validate_unified_checkpoint_contract(
                 f"got {current_value!r}."
             )
 
-    saved_temporal = resolve_temporal_config(saved_config)
+    saved_temporal = resolve_checkpoint_temporal_config(saved_config)
     serialized_temporal = checkpoint.get("resolved_temporal_config")
     if isinstance(serialized_temporal, dict):
         # Hydrate newly added fields from legacy-safe raw-config defaults while

@@ -4419,6 +4419,7 @@ def save_checkpoint(
     # a checkpoint is self-describing and resume is verifiable.
     from finetune.refinement.checkpoint import (  # noqa: PLC0415
         CHECKPOINT_SCHEMA_VERSION,
+        _spatiotemporal_contract,
         aurora_state_fingerprint,
     )
     from finetune.refinement.integration import describe_refinement  # noqa: PLC0415
@@ -4440,6 +4441,7 @@ def save_checkpoint(
     }
     if isinstance(_inner, _ATP):
         payload["field_packing"] = _inner.packing.to_dict()
+        payload["spatiotemporal_contract"] = _spatiotemporal_contract(_inner)
         payload["aurora_fingerprint"] = aurora_state_fingerprint(
             {
                 key[len("aurora.") :]: value
@@ -4774,9 +4776,12 @@ def validate_checkpoint_refinement_contract(
             "Checkpoint refinement configuration mismatch: " + detail
         )
 
-    from finetune.refinement.two_phase import resolve_temporal_config
+    from finetune.refinement.two_phase import (
+        resolve_checkpoint_temporal_config,
+        resolve_temporal_config,
+    )
 
-    saved_temporal = resolve_temporal_config(checkpoint_cfg)
+    saved_temporal = resolve_checkpoint_temporal_config(checkpoint_cfg)
     serialized_temporal = checkpoint.get("resolved_temporal_config")
     if isinstance(serialized_temporal, dict):
         saved_temporal.update(serialized_temporal)

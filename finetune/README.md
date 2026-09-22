@@ -6,6 +6,17 @@ This folder provides a config-first, notebook-driven fine-tuning workflow:
 - `aurora_finetune_rollout_config.yaml`
 - `aurora_finetune_utils.py`
 
+For this branch's maintained NO2/O3 research YAMLs, set the `paths` section for
+your prepared datasets and trusted model/static assets before running notebooks.
+Their default static file is `data/cams/aurora-0.4-air-pollution-static.pickle`
+relative to the repository (resolved through the YAML project root). An existing
+installation can keep its files in place and override `paths.static_data_path`
+with its own absolute path. The downloader and preparer accept `CAMS_DATA_DIR`
+or their explicit directory arguments; setting that environment variable does
+not rewrite the YAML. Obtain and verify official assets through the portable
+workflow; never substitute an untrusted pickle. Keep workstation overrides in
+an excluded local configuration, not in the committed templates.
+
 ## Expected Input Format
 
 Provide train/val/test datasets as NetCDF or Zarr with coordinates:
@@ -154,6 +165,14 @@ python finetune/diagnose_refinement.py \
 
 ## Mamba Temporal Module (optional, for long-lead rollouts)
 
+> **Superseded for new work.** The module described in this section is applied
+> *after* sampling, as a deterministic correction to already-drawn frames, so
+> the generative network never sees temporal context. For joint spatiotemporal
+> refinement use `model.refinement.temporal` instead (next section), which feeds
+> causal temporal context into the denoiser / velocity field at every process
+> evaluation. This module is retained unchanged for checkpoint compatibility and
+> for the historical `MAMBA_ABLATION.md` study.
+
 The spatial refinement heads can be explicitly aware of cumulative forecast
 lead but still correct each rollout step *independently* — they have no
 memory of how the field (or Aurora's error in it) evolves through time, which is
@@ -214,6 +233,58 @@ Key properties:
   `keep_exogenous_predictors: refresh_from_dataset`;
 - assertions fail loudly if any target would be sourced from CAMS or is not
   model-advanced, and `verbose_provenance` logs the per-step split.
+
+## Joint Spatiotemporal Refinement (`model.refinement.temporal`)
+
+This section describes the experimental lower-level refiner API and synthetic pilot. The production notebook/distributed trainer does not yet supply the required calendar and temporal context; its supported temporal route remains the separate legacy Mamba adapter. Portable MCP recipes keep both temporal routes off and reject unwired context requests. See [branch contracts](../docs/refinement-branch-synchronization.md) before selecting a research YAML or checkpoint.
+
+Adds calendar / location / vertical / temporal conditioning to **all four**
+unified refiners (`flow_matching_conv_unet`, `flow_matching_transformer`,
+`diffusion_unet`, `diffusion_transformer`). All keys default to off, so an
+existing recipe is unchanged.
+
+```yaml
+model:
+  refinement:
+    type: flow_matching_conv_unet
+    conditioning:
+      calendar: true           # 13 scalars from each frame's own VALID time
+      solar_geometry: true     # spherical position, local mean solar hour, cos(SZA)
+      vertical_identity: true  # continuous log(p/p_ref), gtco3 as a column
+    temporal:
+      backend: causal_conv     # none | causal_conv | conv_gru | attention | mamba
+      mode: causal             # causal (streaming) | full_trajectory
+      context_channels: 8
+      spatial_stride: 4        # bounds temporal-mixing memory
+```
+
+Key properties (all covered by `tests/test_refinement_spatiotemporal.py`):
+
+- **Temporal context reaches the generative process.** It is concatenated onto
+  the spatial conditioning, so the denoiser / velocity network sees it at every
+  process evaluation — not as a filter applied to already-sampled frames.
+- **Strictly causal.** Every backend is prefix invariant; lead `j` never sees
+  lead `j+1`. Normalization is per frame, so no statistic is pooled over time.
+- **`backend: none` is the spatial-only control** and reproduces the previous
+  behaviour exactly.
+- **Mamba is optional.** `causal_conv` is an attention-free temporal mode and
+  adds no attention anywhere else. The temporal backend is independent of the
+  spatial backbone and of `transformer.attention_mode`.
+- **Four time coordinates stay separate**: `t0`, lead `ell`, valid time
+  `t0 + ell`, and the flow/diffusion coordinate `tau`/`k`.
+- Physical-time recurrence never advances between solver evaluations of one
+  frame; recurrence state is isolated per initialization and per ensemble member.
+
+Matched ablation grid and bounded pilot:
+
+```bash
+python -m finetune.generate_spatiotemporal_configs --list
+python -m finetune.generate_spatiotemporal_configs --out finetune/ablations
+python -m finetune.pilot_spatiotemporal --all-heads --steps 1500 --json pilot.json
+```
+
+Full implementation review, the pretrained-backbone day-of-year audit, per-recipe
+status and verified commands: [`O3_SPATIOTEMPORAL_REVIEW.md`](O3_SPATIOTEMPORAL_REVIEW.md).
 
 ## Case Folders
 

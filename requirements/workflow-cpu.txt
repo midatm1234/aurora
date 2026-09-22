@@ -1,4 +1,5 @@
 -r workflow-light.txt
+matplotlib==3.10.9
 # Install torch/torchvision CPU wheels first, using bootstrap_workflow.py --science.
 numpy==2.4.6
 scipy==1.17.1

@@ -8,7 +8,7 @@ paths:
   output_dir: ./outputs
   checkpoint_dir: ./outputs/checkpoints
   pretrained_checkpoint: ""  # Optional local checkpoint path. Empty uses model default HF checkpoint.
-  static_data_path: /data/cams/aurora-0.4-air-pollution-static.pickle  # Pickle with lsm, z, slt (from HuggingFace)
+  static_data_path: ../data/cams/aurora-0.4-air-pollution-static.pickle  # Pickle with lsm, z, slt (from HuggingFace)
   optional_resume_checkpoint: ""
 
 # Sub-folder under output_dir / checkpoint_dir for this experiment.
@@ -43,6 +43,14 @@ evaluation:
   generate_overall_maps: true
 
 data:
+  split_times:
+    train:
+      start: "2023-07-01T00:00:00"
+      end: "2024-06-30T12:00:00"
+    test:
+      start: "2024-07-01T00:00:00"
+      end: "2024-09-30T12:00:00"
+
   # v4 uses ALL predictor variables available in CAMS (and supported by the
   # AuroraAirPollution variant). O3 chemistry is coupled to other species
   # (NOx titration/production, CO, SO2, aerosols), so feeding the full set of
@@ -320,6 +328,52 @@ model:
       forecast_lead_time: true
       latitude: true
       longitude: true
+      # Joint calendar/solar conditioning is available to the lower-level
+      # refiner API, but the production fine-tune trainer does not yet pass
+      # CalendarSpec or temporal_context into training_step(). Keep these
+      # disabled for this config until that trainer wiring is complete.
+      #
+      # ORDERING WARNING. LeadStepBuffer.pack emits rows LEAD-BLOCKED,
+      # `position * batch + sample`, i.e. [l0b0, l0b1, ..., l1b0, ...].
+      # build_temporal_context works on [B, S, ...] and its flattened output is
+      # LEAD-MAJOR. Use the explicit converters, never a bare reshape:
+      #   CalendarFeatureBuilder.expand_initializations_lead_blocked(...)
+      #   CalendarFeatureBuilder.lead_blocked_to_sequence(rollout_n, B, S)
+      #   CalendarFeatureBuilder.sequence_to_lead_blocked(context)
+      # Pairing the two conventions naively attaches each frame's calendar and
+      # temporal context to the WRONG sample, with correct shapes and no error.
+      #
+      # What each key adds when enabled:
+      # calendar: 13 scalar features derived from EVERY frame's own valid
+      #   timestamp (t0 + lead): seasonal phase, UTC time of day, the
+      #   initialization cycle, cumulative lead and actual elapsed hours.
+      #   Leap years, year rollover and midnight UTC are handled by the
+      #   shared builder in finetune/refinement/calendar_features.py; the
+      #   machine's local time zone is never consulted. These are fused with
+      #   the flow/diffusion process-time embedding through a joint nonlinear
+      #   MLP, so the model can learn season x hour x lead interactions
+      #   rather than three disconnected additive lookups.
+      #
+      #   This is a NEW refinement-side feature set. It does not change the
+      #   frozen AuroraAirPollution backbone, whose own dynamic-variable path
+      #   computes "doy_cos"/"doy_sin" from datetime.day (day of MONTH, not
+      #   day of year) - see finetune/O3_SPATIOTEMPORAL_REVIEW.md. Correcting
+      #   the backbone convention would invalidate the pretrained checkpoint
+      #   and is deliberately NOT done here.
+      calendar: false
+      # solar_geometry: 7 spatial channels - seam-safe spherical position
+      #   (cos(lat)cos(lon), cos(lat)sin(lon), sin(lat)), explicit
+      #   non-periodic latitude, cyclic local MEAN SOLAR hour
+      #   (UTC + lon_east/15, not civil time and not apparent solar time),
+      #   and the cosine of the solar zenith angle from the same orbital
+      #   approximation as aurora/insolation.py.
+      solar_geometry: false
+      # vertical_identity: continuous log(p/1000 hPa) plus variable identity
+      #   and an explicit pressure-not-applicable mask. gtco3 is treated as a
+      #   COLUMN quantity with its own type embedding; it is never given a
+      #   fabricated surface or zero-pressure level, and no column/profile
+      #   integral constraint is imposed.
+      vertical_identity: true
 
     loss:
       generative: mse
@@ -366,9 +420,56 @@ model:
       num_residual_blocks: 2
       time_embedding_dim: 128
       dropout: 0.0
+      # ATTENTION STATUS: bottleneck spatial self-attention is ON for this
+      # recipe. The attention-off control is
+      # aurora_O3_global_..._spatial_only_config.yaml. A U-Net here is NOT
+      # attention-free and must not be described as one.
       bottleneck_attention: true
       attention_heads: 4
       zero_init_output: true
+
+    # ------------------------------------------------------------------
+    # Causal temporal conditioning for the lower-level refiner API. This is
+    # disabled above in the production recipe; the supported training path is
+    # model.mamba_temporal below.
+    #
+    # This is NOT the legacy post-sampling Mamba adapter below. The context
+    # produced here is concatenated onto the spatial conditioning, so it
+    # enters the flow/diffusion network at EVERY process evaluation rather
+    # than being applied to already-sampled frames.
+    #
+    # The context depends only on the causal trajectory (raw Aurora
+    # forecasts through lead j plus previously refined states) and never on
+    # the current noised residual, so it is invariant across solver
+    # evaluations of one frame and may be cached per frame.
+    #
+    # backend:
+    #   none        spatial-only control (previous behaviour, exactly)
+    #   causal_conv dilated causal temporal convolution - ATTENTION-FREE
+    #   conv_gru    forward-only gated recurrence
+    #   attention   causal temporal attention over lead tokens
+    #   mamba       selective state-space scan (optional, never required)
+    # The temporal backend is independent of refinement.type and of
+    # transformer.attention_mode.
+    #
+    # mode:
+    #   causal          streaming: only leads <= j (default, deployable)
+    #   full_trajectory also later RAW AURORA leads of the same
+    #                   initialization. Never later CAMS truth. Label it
+    #                   separately and state its horizon dependence.
+    #
+    # The production trainer currently supports the legacy packed_joint Mamba
+    # path below, not this newer nested temporal-context path.
+    temporal:
+      backend: none
+      mode: causal
+      context_channels: 8
+      hidden_channels: 32
+      layers: 2
+      spatial_stride: 4
+      max_sequence_length: 64
+      dropout: 0.0
+      learning_rate_multiplier: 1.0
   # ------------------------------------------------------------------
   # Mamba temporal module (long-lead rollout corrector).
   # Adds a selective state-space (Mamba) corrector on top of the
@@ -380,7 +481,7 @@ model:
   # (see training.mamba_temporal_weight) and applied causally at rollout.
   # Requires the active unified refinement head and >= 2 target_lead_times.
   mamba_temporal:
-    enabled: false
+    enabled: true
     mode: packed_joint
     channels: 16
     state_dim: 8

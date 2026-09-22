@@ -19,6 +19,11 @@ import xarray as xr
 import yaml
 from finetune import aurora_finetune_utils as ft
 from finetune.refinement.config import resolve_refinement_config
+from finetune.refinement.two_phase import (
+    resolve_checkpoint_temporal_config,
+    resolve_temporal_config,
+    temporal_config_is_declared,
+)
 
 from aurora import Batch, Metadata
 
@@ -97,38 +102,110 @@ def test_notebook_config_is_resolved_after_papermill_parameters(notebook_name: s
         if "parameters" in cell.get("metadata", {}).get("tags", [])
     )
     parameter_source = "".join(parameter_cell["source"])
-    assert "CONFIG_PATH_NAME" in parameter_source
-    assert "ft.load_config" not in parameter_source
+    parameter_tree = ast.parse(parameter_source)
+    parameter_assignments = {
+        target.id: node.value
+        for node in parameter_tree.body
+        if isinstance(node, ast.Assign)
+        for target in node.targets
+        if isinstance(target, ast.Name)
+    }
+    assert "CONFIG_PATH_NAME" in parameter_assignments
+    assert not any(
+        isinstance(node, ast.Call) and ast.unparse(node.func) == "ft.load_config"
+        for node in ast.walk(parameter_tree)
+    )
     if notebook_name == "aurora_inference_rollout.ipynb":
-        for name in ("CHECKPOINT_PATH", "ROLLOUT_NUM_STEPS", "OUTPUT_DIR"):
-            assignment = next(
-                line for line in parameter_cell["source"] if line.startswith(f"{name} =")
-            )
-            assert "#" not in assignment
+        for name in ("ROLLOUT_NUM_STEPS", "OUTPUT_DIR"):
+            assert ast.literal_eval(parameter_assignments[name]) is None
+        # The diagnostic notebook derives the latest checkpoint from the
+        # overridden YAML, so a parameter must not pin an earlier run's path.
+        assert "CHECKPOINT_PATH" not in parameter_assignments
 
-    later_source = "".join(
-        line
+    later_source = "\n".join(
+        "".join(cell.get("source", []))
         for cell in notebook["cells"][parameter_index + 1 :]
         if cell.get("cell_type") == "code"
-        for line in cell.get("source", [])
     )
-    assert "CONFIG_PATH =" in later_source
-    assert "ft.load_config(CONFIG_PATH" in later_source
+    later_tree = ast.parse(later_source)
+    assignments = [node for node in ast.walk(later_tree) if isinstance(node, ast.Assign)]
+    assert any(
+        isinstance(target, ast.Name) and target.id == "CONFIG_PATH"
+        for node in assignments
+        for target in node.targets
+    )
+    config_load = next(
+        node
+        for node in ast.walk(later_tree)
+        if isinstance(node, ast.Call) and ast.unparse(node.func) == "ft.load_config"
+    )
+    assert ast.unparse(config_load.args[0]) == "CONFIG_PATH"
     if notebook_name == "aurora_inference_rollout.ipynb":
-        assert "flow_sampling_steps_override=SAMPLING_STEPS_OVERRIDE" in later_source
+        checkpoint_assignment = next(
+            node
+            for node in assignments
+            if any(
+                isinstance(target, ast.Name) and target.id == "CHECKPOINT_PATH"
+                for target in node.targets
+            )
+        )
+        checkpoint_selection = next(
+            node
+            for node in ast.walk(checkpoint_assignment.value)
+            if isinstance(node, ast.Call)
+            and ast.unparse(node.func) == "ft.select_refinement_checkpoint"
+        )
+        assert checkpoint_assignment.lineno > config_load.lineno
+        assert ast.unparse(checkpoint_selection.args[0]) == "cfg['paths']['checkpoint_dir']"
+        selection_options = {
+            keyword.arg: ast.literal_eval(keyword.value)
+            for keyword in checkpoint_selection.keywords
+        }
+        assert selection_options["prefer_latest"] is True
+        assert selection_options["require_validated"] is False
+        checkpoint_load = next(
+            node
+            for node in ast.walk(later_tree)
+            if isinstance(node, ast.Call)
+            and ast.unparse(node.func) == "ft.load_model_from_checkpoint"
+        )
+        load_options = {
+            keyword.arg: ast.unparse(keyword.value) for keyword in checkpoint_load.keywords
+        }
+        assert load_options["flow_sampling_steps_override"] == "SAMPLING_STEPS_OVERRIDE"
         assert (
-            "allow_unsafe_temporal_sampling_override=" "ALLOW_UNSAFE_MAMBA_SAMPLING_OVERRIDE"
-        ) in later_source
-        assert "model.sampling_steps = int(SAMPLING_STEPS_OVERRIDE)" not in later_source
-        assert "temporal_control=TEMPORAL_CONTROL" in later_source
+            load_options["allow_unsafe_temporal_sampling_override"]
+            == "ALLOW_UNSAFE_MAMBA_SAMPLING_OVERRIDE"
+        )
+        assert load_options["require_validated"] == "False"
+        assert not any(
+            ast.unparse(target) == "model.sampling_steps"
+            for node in assignments
+            for target in node.targets
+        )
+        assert any(
+            isinstance(node, ast.Call)
+            and ast.unparse(node.func) == "ft.run_rollout"
+            and any(
+                keyword.arg == "temporal_control"
+                and ast.unparse(keyword.value) == "TEMPORAL_CONTROL"
+                for keyword in node.keywords
+            )
+            for node in ast.walk(later_tree)
+        )
+        assigned_targets = {ast.unparse(target) for node in assignments for target in node.targets}
         for provenance_key in (
             "checkpoint_sha256",
+            "checkpoint_selection",
+            "checkpoint_training_run_id",
+            "checkpoint_validated_for_inference",
+            "checkpoint_validation_status",
             "resolved_flow_sampling_steps",
             "resolved_temporal_config",
             "trajectory_policy",
             "member_seeds",
         ):
-            assert f"rollout_ds.attrs['{provenance_key}']" in later_source
+            assert f"rollout_ds.attrs['{provenance_key}']" in assigned_targets
 
 
 def test_finetune_notebook_default_config_loads_as_unified_refinement() -> None:
@@ -150,9 +227,11 @@ def test_finetune_notebook_default_config_loads_as_unified_refinement() -> None:
     )
     config_name = ast.literal_eval(assignment.value)
 
-    config = ft.load_config(CONFIG_DIR / config_name)
+    config_path = CONFIG_DIR / config_name
+    config = _raw_config(config_path)
+    ft.validate_config(config, config_path)
     refinement = resolve_refinement_config(config)
-    assert refinement.type == "flow_matching_conv_unet"
+    assert refinement.type == "diffusion_transformer"
     assert refinement.backend == "unified"
     assert refinement.target_space.residual_clip_standard_deviations == 4.0
 
@@ -263,10 +342,9 @@ def _synthetic_dataset(config: dict) -> xr.Dataset:
 
 @pytest.mark.parametrize("path", PRIMARY_FINETUNE_CONFIGS)
 def test_repository_configs_pass_shared_schema_and_dataset_contract(path: Path) -> None:
-    # load_config is the production entrypoint and includes schema validation;
-    # call validate_config explicitly as a regression guard for callers that
-    # already hold a parsed mapping.
-    config = ft.load_config(path)
+    # Validate the public YAML and synthetic dataset without resolving private
+    # train/test files through the production load_config entrypoint.
+    config = _raw_config(path)
     ft.validate_config(config, path)
     dataset = _synthetic_dataset(config)
     specs = ft.resolve_variable_specs(dataset, config)
@@ -283,7 +361,7 @@ def test_unified_no2_configs_share_packed_geophysical_temporal_preset(
     path: Path,
 ) -> None:
     temporal = _raw_config(path)["model"]["mamba_temporal"]
-    assert temporal["enabled"] is False
+    assert temporal["enabled"] is True
     assert temporal["mode"] == "packed_joint"
     assert temporal["lead_time_conditioning"] is True
     assert temporal["mask_conditioning"] is True
@@ -302,11 +380,42 @@ def test_shared_validation_rejects_string_legacy_feedback_boolean() -> None:
         ft.validate_config(config, O3_CONFIG)
 
 
+def test_pre_temporal_checkpoint_config_is_not_read_as_opting_into_the_default() -> None:
+    """A checkpoint predating the temporal module must not inherit the new default.
+
+    ``resolve_temporal_config`` enables temporal Mamba for a unified refiner, so
+    reading a stored config the same way would claim a pre-temporal checkpoint
+    already had ``temporal.*`` parameters. That would hide a real architecture
+    migration and surface later as an opaque missing-key load failure.
+    """
+    pre_temporal = _raw_config(NO2_CONFIG)
+    pre_temporal["model"].pop("mamba_temporal", None)
+
+    assert temporal_config_is_declared(pre_temporal) is False
+    # A live recipe resolves to the new default ...
+    assert resolve_temporal_config(pre_temporal)["enabled"] is True
+    # ... while the same config read back off a checkpoint stays disabled.
+    assert resolve_checkpoint_temporal_config(pre_temporal)["enabled"] is False
+
+    # An explicit choice is always honoured, in both directions.
+    declared = _raw_config(NO2_CONFIG)
+    assert declared["model"]["mamba_temporal"]["enabled"] is True
+    assert temporal_config_is_declared(declared) is True
+    assert resolve_checkpoint_temporal_config(declared)["enabled"] is True
+    declared["model"]["mamba_temporal"]["enabled"] = False
+    assert resolve_checkpoint_temporal_config(declared)["enabled"] is False
+
+
 @pytest.mark.parametrize("path", UNIFIED_NO2_CONFIGS)
 def test_unified_no2_mamba_is_a_single_enable_toggle(path: Path) -> None:
     config = _raw_config(path)
     assert config["training"]["mamba_temporal_weight"] > 0.0
-    config["model"]["mamba_temporal"]["enabled"] = True
+    assert config["model"]["mamba_temporal"]["enabled"] is True
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        ft.validate_config(config, path)
+
+    config["model"]["mamba_temporal"]["enabled"] = False
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", RuntimeWarning)
         ft.validate_config(config, path)

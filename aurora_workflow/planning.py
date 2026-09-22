@@ -1,7 +1,10 @@
 """Typed planning, immutable effective configurations, and input fingerprinting."""
 from __future__ import annotations
 import copy
+import hashlib
 from pathlib import Path
+import re
+import subprocess
 from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field
 from .common import REPO, artifact, digest, environment_fingerprint, identifier, read_json, safe_path, sha256, source_fingerprint
@@ -62,15 +65,36 @@ def validate_recipe(name: str, head: Head | None = None) -> dict:
         raise ValueError("This workflow only supports AuroraAirPollution")
     if model["refinement"].get("feedback_to_rollout", False):
         raise ValueError("Canonical recipe forbids refinement feedback")
-    if model.get("mamba_temporal", {}).get("enabled"):
+    temporal = model.get("mamba_temporal", {})
+    unified = head in {"flow_matching_conv_unet", "flow_matching_transformer", "diffusion_unet", "diffusion_transformer"}
+    temporal_enabled = temporal.get("enabled", model.get("mamba_temporal_enabled", unified))
+    if temporal_enabled or model.get("mamba_temporal_enabled", False):
         raise ValueError("Canonical recipe must be spatial-only; temporal experiments require a separate recipe")
+    refinement = model["refinement"]
+    if refinement.get("temporal", {}).get("backend", "none") != "none":
+        raise ValueError("Portable recipes do not yet supply temporal context; use the documented experimental API")
+    if any(refinement.get("conditioning", {}).get(key, False) for key in ("calendar", "solar_geometry")):
+        raise ValueError("Portable recipes do not yet supply calendar/solar context; use the documented experimental API")
     if config["data"]["input_time_steps"] != 2 or config["rollout"]["rollout_step_hours"] != 12:
         raise ValueError("Air-pollution model requires two history times at 12 hour cadence")
     if set(config["data"]["atmos_levels"]) != {50,100,150,200,250,300,400,500,600,700,850,925,1000}:
         raise ValueError("Full 13-level backbone grid is required")
-    src = REPO / recipe["source_config"]
-    if sha256(src) != recipe["source_config_sha256"]:
-        raise ValueError("Pinned source configuration changed; version and review the recipe")
+    # Recipes are immutable snapshots derived from a named historical commit.
+    # Later notebook/YAML experiments must not silently change or invalidate them.
+    source_commit, source_path = recipe["source_commit"], recipe["source_config"]
+    if not re.fullmatch(r"[0-9a-f]{40}", source_commit):
+        raise ValueError("Recipe source must be pinned to a full Git commit")
+    if not isinstance(source_path, str) or not source_path.startswith("finetune/") or ".." in Path(source_path).parts:
+        raise ValueError("Recipe source must be a repository-relative finetune configuration")
+    try:
+        source = subprocess.check_output(
+            ["git", "-C", str(REPO), "show", f"{source_commit}:{source_path}"],
+            stderr=subprocess.DEVNULL, timeout=15,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        raise ValueError("Pinned recipe source is unavailable; fetch the source history") from exc
+    if hashlib.sha256(source).hexdigest() != recipe["source_config_sha256"]:
+        raise ValueError("Pinned source configuration checksum mismatch; version and review the recipe")
     return {"state": "validated", "recipe": recipe, "config": config, "head": head,
             "configuration_hash": digest(config), "warnings": recipe.get("changes_from_source", [])}
 

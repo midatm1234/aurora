@@ -7,15 +7,18 @@ This script:
 2. Loads and merges multiple surface/atmospheric NetCDF files.
 3. Converts CAMS forecast dims to Aurora-style dims (`time`, `level`, `latitude`, `longitude`).
 4. Splits by date ranges into train, validation (optional), and test sets.
+5. Builds replacements separately, then backs up existing outputs before installing them.
 
 Example:
     # Run with defaults configured below:
     python finetune/prepare_train_test_from_netcdf.py
 
-    # Or override specific values:
+    # Date ranges normally come from data.split_times in the YAML. Override
+    # specific values from the command line when needed:
     python finetune/prepare_train_test_from_netcdf.py \
-      --val-start-time 2026-03-14T00:00:00 \
-      --test-start-time 2026-03-16T00:00:00
+      --config finetune/aurora_O3_global_finetune_3day_lead_config.yaml \
+      --train-start-time 2023-07-01T00:00:00 \
+      --test-end-time 2024-09-30T12:00:00
 """
 
 from __future__ import annotations
@@ -23,10 +26,14 @@ from __future__ import annotations
 import argparse
 import contextlib
 import itertools
+import os
+import shutil
 import sys
+import tempfile
 import threading
 import time
 from collections import OrderedDict
+from datetime import datetime, timezone
 from glob import glob as _glob
 from pathlib import Path
 from typing import Any
@@ -50,22 +57,20 @@ except ImportError:  # pragma: no cover - fallback for minimal environments.
 
 CONFIG = {
     # Path to finetune config YAML
-    "config": "aurora_O3_global_finetune_3day_lead_config.yaml",
+    "config": str(Path(__file__).resolve().with_name(
+        "aurora_NO2_finetune_US-WEST_3day_lead_flow_matching_config.yaml"
+    )),
 
-    # Folder containing input NetCDF files (searched with glob patterns)
-    "data_folder": "/data/cams",
+    # Same portable raw-data default as the downloader and rollout notebook.
+    "data_folder": Path(os.environ.get(
+        "CAMS_DATA_DIR", str(Path(__file__).resolve().parents[1] / "data" / "cams")
+    )).expanduser(),
 
     # Output NetCDF files. These are derived from paths.data_dir/case_name
     # in the YAML config unless explicitly overridden to the same case folder.
     "train_out": None,
     "val_out": None,  # Set to path for validation set, or None to skip
     "test_out": None,
-
-    # Date-based split (ISO format: YYYY-MM-DDTHH:MM:SS)
-    "train_start_time": "2023-07-01T00:00:00",
-    "train_end_time": "2024-06-30T12:00:00",
-    "test_start_time": "2024-07-01T00:00:00",
-    "test_end_time": "2024-09-30T12:00:00",
 
     # Spatial domain subset (set to None to disable)
     "lat_min": None,
@@ -186,26 +191,26 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--train-start-time",
         type=str,
-        default=CONFIG["train_start_time"],
-        help="ISO timestamp; train set starts at this time.",
+        default=None,
+        help="Optional ISO timestamp override; otherwise use data.split_times.train.start.",
     )
     parser.add_argument(
         "--train-end-time",
         type=str,
-        default=CONFIG["train_end_time"],
-        help="ISO timestamp; train set ends at this time (inclusive).",
+        default=None,
+        help="Optional ISO timestamp override; otherwise use data.split_times.train.end.",
     )
     parser.add_argument(
         "--test-start-time",
         type=str,
-        default=CONFIG["test_start_time"],
-        help="ISO timestamp; test set starts at this time.",
+        default=None,
+        help="Optional ISO timestamp override; otherwise use data.split_times.test.start.",
     )
     parser.add_argument(
         "--test-end-time",
         type=str,
-        default=CONFIG["test_end_time"],
-        help="ISO timestamp; test set ends at this time (inclusive).",
+        default=None,
+        help="Optional ISO timestamp override; otherwise use data.split_times.test.end.",
     )
     parser.add_argument(
         "--lat-min", type=float, default=CONFIG["lat_min"],
@@ -249,6 +254,35 @@ def _read_config(path: Path) -> dict[str, Any]:
     if not isinstance(cfg, dict):
         raise ValueError(f"Config must be a YAML mapping: {path}")
     return cfg
+
+
+def _resolve_split_times(cfg: dict[str, Any], args: argparse.Namespace) -> None:
+    """Resolve date bounds from YAML, allowing explicit CLI overrides."""
+    split_times = cfg.get("data", {}).get("split_times")
+    if not isinstance(split_times, dict):
+        raise ValueError(
+            "Config must define data.split_times.train/test with start and end "
+            "ISO timestamps."
+        )
+
+    resolved: dict[str, str] = {}
+    for split in ("train", "test"):
+        bounds = split_times.get(split)
+        if not isinstance(bounds, dict):
+            raise ValueError(
+                f"data.split_times.{split} must be a mapping with start and end."
+            )
+        for bound in ("start", "end"):
+            value = bounds.get(bound)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(
+                    f"data.split_times.{split}.{bound} must be a non-empty ISO timestamp."
+                )
+            resolved[f"{split}_{bound}_time"] = value
+
+    for name, value in resolved.items():
+        if getattr(args, name) is None:
+            setattr(args, name, value)
 
 
 def _resolve_path(value: str | Path, project_root: Path) -> Path:
@@ -1229,6 +1263,48 @@ def _pair_surface_atmos_files(
     return [(Path(s), Path(a)) for s, a in zip(surface_files, atmos_files)]
 
 
+@contextlib.contextmanager
+def _staged_output_paths(args: argparse.Namespace):
+    """Keep current outputs intact until all replacements have been written.
+
+    Backups are independent copies in a unique timestamped directory. A failed
+    build leaves current outputs untouched; a failed installation still leaves
+    every previous output recoverable from that directory.
+    """
+    outputs = {
+        name: Path(getattr(args, name)).resolve()
+        for name in ("train_out", "val_out", "test_out")
+        if getattr(args, name) is not None
+    }
+    if len(set(outputs.values())) != len(outputs):
+        raise ValueError("Train, validation, and test output paths must be distinct.")
+    parents = {path.parent for path in outputs.values()}
+    if len(parents) != 1:
+        raise ValueError("Prepared outputs must share one case data folder.")
+    parent = next(iter(parents))
+    parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".prepare-", dir=parent) as staging_dir:
+        staged = argparse.Namespace(**vars(args))
+        for name, path in outputs.items():
+            setattr(staged, name, Path(staging_dir) / path.name)
+        yield staged
+        for name in outputs:
+            if not Path(getattr(staged, name)).is_file():
+                raise ValueError(f"Preparation did not create required output: {name}")
+
+        existing = [path for path in outputs.values() if path.exists()]
+        if existing:
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
+            backup_dir = Path(tempfile.mkdtemp(prefix=f"backup_{stamp}_", dir=parent))
+            _log(f"Backing up existing datasets to: {backup_dir}")
+            # Complete every backup before replacing any active output.
+            for path in existing:
+                shutil.copy2(path, backup_dir / path.name)
+                _log(f"  Backup: {backup_dir / path.name}")
+        for name, path in outputs.items():
+            Path(getattr(staged, name)).replace(path)
+
+
 def _stream_write_outputs(
     *,
     cfg: dict[str, Any],
@@ -1244,7 +1320,7 @@ def _stream_write_outputs(
 
     for path in [train_path, val_path, test_path]:
         if path is not None and path.exists():
-            path.unlink()
+            raise FileExistsError(f"Streaming output already exists: {path}; use staged output paths.")
 
     total_train = 0
     total_val = 0
@@ -1322,6 +1398,7 @@ def main() -> None:
     args = _parse_args()
     _log(f"Reading config: {args.config}")
     cfg = _read_config(args.config)
+    _resolve_split_times(cfg, args)
     train_out, val_out, test_out, case_data_dir = _resolve_case_data_paths(
         cfg,
         Path(args.config).expanduser().resolve(),
@@ -1377,18 +1454,19 @@ def main() -> None:
     )
 
     if args.streaming_write:
-        _log("Streaming write enabled: output files will be created first and extended by time chunk.")
+        _log("Streaming write enabled: building staged files; existing outputs will be backed up before replacement.")
         if args.dry_run:
             _log("Dry run enabled; no files were written.")
             return
-        train_count, val_count, test_count = _stream_write_outputs(
-            cfg=cfg,
-            surface_files=surface_files,
-            atmos_files=atmos_files,
-            requested=requested,
-            args=args,
-            time_dim=time_dim,
-        )
+        with _staged_output_paths(args) as staged_args:
+            train_count, val_count, test_count = _stream_write_outputs(
+                cfg=cfg,
+                surface_files=surface_files,
+                atmos_files=atmos_files,
+                requested=requested,
+                args=staged_args,
+                time_dim=time_dim,
+            )
         print("\n" + "=" * 70)
         print("Selected variables:", ", ".join(requested.keys()))
         print(f"Wrote train times: {train_count} -> {args.train_out}")
@@ -1453,21 +1531,21 @@ def main() -> None:
         print("\nDry run enabled; no files were written.")
         return
 
-    print("\nWriting output files...", flush=True)
-    _write_netcdf(
-        train_ds, args.train_out, compression_level=args.compression_level, cfg=cfg,
-    )
-    print(f"✓ Wrote train dataset: {args.train_out}", flush=True)
-
-    if val_ds is not None:
+    print("\nWriting staged output files...", flush=True)
+    with _staged_output_paths(args) as staged_args:
         _write_netcdf(
-            val_ds, args.val_out, compression_level=args.compression_level, cfg=cfg,
+            train_ds, staged_args.train_out, compression_level=args.compression_level, cfg=cfg,
         )
+        if val_ds is not None:
+            _write_netcdf(
+                val_ds, staged_args.val_out, compression_level=args.compression_level, cfg=cfg,
+            )
+        _write_netcdf(
+            test_ds, staged_args.test_out, compression_level=args.compression_level, cfg=cfg,
+        )
+    print(f"✓ Wrote train dataset: {args.train_out}", flush=True)
+    if val_ds is not None:
         print(f"✓ Wrote validation dataset: {args.val_out}", flush=True)
-
-    _write_netcdf(
-        test_ds, args.test_out, compression_level=args.compression_level, cfg=cfg,
-    )
     print(f"✓ Wrote test dataset: {args.test_out}", flush=True)
     print("\nDone!", flush=True)
 

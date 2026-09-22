@@ -42,6 +42,7 @@ Aurora's per-rollout-step packed fields and forecast lead times.
 
 from __future__ import annotations
 
+import contextlib
 import math
 import warnings
 from dataclasses import dataclass, field
@@ -53,6 +54,7 @@ from torch import nn
 
 from finetune.mamba_temporal import PackedMambaTemporalAdapter
 from finetune.refinement.base import ChunkNoiseSource, ResidualRefiner, build_refiner
+from finetune.refinement.calendar_features import CalendarFeatureBuilder, CalendarSpec
 from finetune.refinement.config import (
     PerformanceConfig,
     RefinementConfig,
@@ -62,12 +64,21 @@ from finetune.refinement.config import (
 from finetune.refinement.losses import area_weights_from_latitudes
 from finetune.refinement.packing import FieldPacking
 from finetune.refinement.target_space import NormalizedTargetSpace
+from finetune.refinement.temporal import (
+    TemporalContextEncoder,
+    assert_increasing_leads,
+    build_temporal_encoder,
+    elapsed_hours_from_leads,
+)
+from finetune.refinement.vertical import VerticalChannelEncoder
 
 __all__ = [
     "AuroraTwoPhaseRefiner",
     "TwoPhaseStepOutput",
     "build_two_phase_refiner",
+    "resolve_checkpoint_temporal_config",
     "resolve_temporal_config",
+    "temporal_config_is_declared",
 ]
 
 
@@ -156,6 +167,60 @@ def _positive_temporal_int(value: Any, field_name: str) -> int:
     return integer
 
 
+def _unified_refinement_is_active(config: Mapping[str, Any] | None) -> bool:
+    """Whether a unified refinement backend exists to own a temporal module.
+
+    Temporal Mamba is a refinement add-on, so defaulting it on is only
+    meaningful where a unified refiner exists. Aurora-only and legacy-flow
+    recipes keep the legacy-safe defaults: ``packed_joint`` is unsupported by
+    the legacy wrapper, and enabling temporal refinement without an active
+    refiner is rejected by ``validate_config``.
+    """
+    try:
+        with warnings.catch_warnings():
+            # The refinement resolver deduplicates its advisories globally, so
+            # silence them here: merely asking about the backend must not
+            # consume the single warning a caller is meant to see.
+            warnings.simplefilter("ignore")
+            return resolve_refinement_config(config).backend == "unified"
+    except (TypeError, ValueError):
+        # An invalid refinement section is reported by the refinement resolver
+        # itself; never surface that failure from the temporal resolver.
+        return False
+
+
+def temporal_config_is_declared(config: Mapping[str, Any] | None) -> bool:
+    """Whether *config* explicitly states an on/off choice for temporal Mamba.
+
+    Configs written before the temporal module existed omit the setting
+    entirely. They must not be read as opting into the current default.
+    """
+    model = (config or {}).get("model", {})
+    if not isinstance(model, Mapping):
+        return False
+    if "mamba_temporal_enabled" in model:
+        return True
+    nested = model.get("mamba_temporal")
+    return isinstance(nested, Mapping) and "enabled" in nested
+
+
+def resolve_checkpoint_temporal_config(
+    config: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Resolve the temporal settings a stored checkpoint was actually trained with.
+
+    Unlike :func:`resolve_temporal_config`, an undeclared setting resolves to
+    disabled rather than to the current default. A pre-temporal checkpoint has
+    no ``temporal.*`` parameters, so reading it as enabled would hide a real
+    architecture migration and turn it into an opaque missing-key failure at
+    ``load_state_dict`` time.
+    """
+    resolved = resolve_temporal_config(config)
+    if not temporal_config_is_declared(config):
+        resolved["enabled"] = False
+    return resolved
+
+
 def resolve_temporal_config(
     config: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
@@ -197,6 +262,14 @@ def resolve_temporal_config(
                 )
 
     resolved = dict(_TEMPORAL_DEFAULTS)
+    # Temporal Mamba is the default wherever a unified refiner can own it, so a
+    # recipe never has to opt in. Explicit settings below still win, so
+    # `enabled: false` remains a one-key opt-out. Checkpoint comparisons must
+    # use resolve_checkpoint_temporal_config so a pre-temporal checkpoint is not
+    # misread as having opted into this default.
+    if _unified_refinement_is_active(config):
+        resolved["enabled"] = True
+        resolved["mode"] = "packed_joint"
     for name, legacy_key in _TEMPORAL_LEGACY_KEYS.items():
         if legacy_key in model:
             resolved[name] = model[legacy_key]
@@ -577,7 +650,68 @@ class AuroraTwoPhaseRefiner(nn.Module):
                 causal=self.temporal_config["causal"],
             )
         self._area_weight_cache: dict[tuple[int, torch.device, torch.dtype], torch.Tensor] = {}
+        self._build_spatiotemporal_conditioning()
         self._apply_aurora_freeze()
+
+    # ------------------------------------------------------------------
+    # Joint spatiotemporal conditioning
+    # ------------------------------------------------------------------
+    def _build_spatiotemporal_conditioning(self) -> None:
+        """Construct the shared calendar / vertical / temporal components.
+
+        All three are inert unless their configuration keys are enabled, so an
+        existing recipe keeps its exact conditioning width and checkpoint.
+        """
+        cond = self.refinement_config.conditioning
+        temporal_cfg = self.refinement_config.temporal
+
+        self.calendar_builder: CalendarFeatureBuilder | None = None
+        if cond.calendar or cond.solar_geometry or temporal_cfg.is_active:
+            if not self.packing.lat or not self.packing.lon:
+                raise ValueError(
+                    "Calendar / solar / temporal conditioning needs FieldPacking "
+                    "latitude and longitude coordinates. Build the packing with "
+                    "explicit lat/lon rather than array indices."
+                )
+            self.calendar_builder = CalendarFeatureBuilder(
+                self.packing.lat,
+                self.packing.lon,
+                lead_time_scale_hours=self.packing.lead_time_scale_hours,
+            )
+
+        if cond.vertical_identity and not self.refinement_config.is_active:
+            raise ValueError(
+                "refinement.conditioning.vertical_identity requires an active "
+                "refinement type; the encoder is owned by the refiner."
+            )
+
+        self.temporal_context: TemporalContextEncoder | None = None
+        if temporal_cfg.is_active:
+            if not self.refinement_config.is_active:
+                raise ValueError(
+                    "refinement.temporal.backend requires an active refinement type."
+                )
+            self.temporal_context = build_temporal_encoder(
+                temporal_cfg.backend,
+                input_channels=self.packing.num_channels,
+                lon_periodic=bool(self.packing.lon_periodic),
+                metadata_features=(
+                    self.calendar_builder.num_scalar_features
+                    if self.calendar_builder is not None
+                    else 0
+                ),
+                context_channels=temporal_cfg.context_channels,
+                hidden_channels=temporal_cfg.hidden_channels,
+                layers=temporal_cfg.layers,
+                spatial_stride=temporal_cfg.spatial_stride,
+                max_sequence_length=temporal_cfg.max_sequence_length,
+                state_dim=temporal_cfg.state_dim,
+                conv_kernel=temporal_cfg.conv_kernel,
+                expansion_factor=temporal_cfg.expansion_factor,
+                num_heads=temporal_cfg.num_heads,
+                dropout=temporal_cfg.dropout,
+            )
+
 
     # ------------------------------------------------------------------
     # Construction
@@ -627,6 +761,7 @@ class AuroraTwoPhaseRefiner(nn.Module):
             total += 1
         if cond.longitude:
             total += 2
+        total += cond.solar_channel_count
         if cond.masks:
             total += 1
         return total
@@ -654,6 +789,17 @@ class AuroraTwoPhaseRefiner(nn.Module):
             cond_channels=int(cond_channels),
             metadata=self.packing,
         )
+
+    @property
+    def vertical_encoder(self) -> VerticalChannelEncoder | None:
+        """The refiner-owned vertical encoder, exposed read-only.
+
+        Deliberately a property rather than an attribute: assigning the module
+        here would register a *second* copy of the same parameters under a
+        top-level ``vertical_encoder.`` prefix, which a refinement checkpoint
+        (saved under the ``refiner.`` prefix) would then fail to restore.
+        """
+        return getattr(self.refiner, "vertical_encoder", None)
 
     # ------------------------------------------------------------------
     # Conditioning
@@ -690,6 +836,7 @@ class AuroraTwoPhaseRefiner(nn.Module):
         input_state_normalized: torch.Tensor | None = None,
         static_fields: torch.Tensor | None = None,
         input_valid_mask: torch.Tensor | None = None,
+        calendar: CalendarSpec | None = None,
     ) -> torch.Tensor:
         """Concatenate the configured spatial conditioning fields.
 
@@ -697,7 +844,12 @@ class AuroraTwoPhaseRefiner(nn.Module):
         target* are used. The ground-truth mask is never conditioning: that
         would leak target information. Enabled coordinate channels are appended
         after dynamic/static fields in latitude, sin(longitude), cos(longitude)
-        order, followed by the validity mask.
+        order, then the solar/geometry channels, then the validity mask.
+
+        Args:
+            calendar: required when ``refinement.conditioning.solar_geometry``
+                is enabled. Its timestamps are the **valid** times of the frames
+                in ``rollout_normalized``, in the same lead-major order.
         """
         cond_cfg = self.refinement_config.conditioning
         if (cond_cfg.latitude or cond_cfg.longitude) and rollout_normalized.ndim != 4:
@@ -768,6 +920,24 @@ class AuroraTwoPhaseRefiner(nn.Module):
                     .expand(rollout_normalized.shape[0], 1, size[0], size[1])
                 )
 
+        if cond_cfg.solar_geometry:
+            if calendar is None:
+                raise RuntimeError(
+                    "refinement.conditioning.solar_geometry is enabled but no "
+                    "CalendarSpec was supplied. Solar geometry must be derived from "
+                    "each frame's own valid timestamp, so it cannot be defaulted."
+                )
+            assert self.calendar_builder is not None
+            solar = self.calendar_builder.spatial_features(
+                calendar, device=rollout_normalized.device, dtype=dtype
+            )
+            if solar.shape[0] != rollout_normalized.shape[0]:
+                raise ValueError(
+                    "Solar/geometry features must provide one frame per packed sample; "
+                    f"got {solar.shape[0]} for batch {rollout_normalized.shape[0]}."
+                )
+            parts.append(_align_to(solar, size))
+
         if cond_cfg.masks:
             if input_valid_mask is None:
                 mask = torch.isfinite(rollout_normalized).all(dim=1, keepdim=True).to(dtype)
@@ -792,6 +962,148 @@ class AuroraTwoPhaseRefiner(nn.Module):
                 return None
             self._area_weight_cache[key] = weights
         return self._area_weight_cache[key]
+
+    # ------------------------------------------------------------------
+    # Joint spatiotemporal conditioning helpers
+    # ------------------------------------------------------------------
+    def calendar_spec(
+        self,
+        init_time: Sequence[Any],
+        lead_hours: torch.Tensor,
+        *,
+        elapsed_hours: torch.Tensor | None = None,
+        has_predecessor: torch.Tensor | None = None,
+    ) -> CalendarSpec:
+        """Build the :class:`CalendarSpec` for a lead-major packed batch."""
+        return CalendarSpec(
+            init_time=tuple(init_time),
+            lead_hours=lead_hours.detach().reshape(-1).float(),
+            elapsed_hours=None if elapsed_hours is None else elapsed_hours.detach().reshape(-1),
+            has_predecessor=(
+                None if has_predecessor is None else has_predecessor.detach().reshape(-1)
+            ),
+        )
+
+    def calendar_metadata(
+        self,
+        calendar: CalendarSpec | None,
+        *,
+        device: torch.device,
+        dtype: torch.dtype = torch.float32,
+    ) -> torch.Tensor | None:
+        """Scalar calendar vector for the conditioning MLP, or ``None`` when off."""
+        if not self.refinement_config.conditioning.calendar:
+            return None
+        if calendar is None:
+            raise RuntimeError(
+                "refinement.conditioning.calendar is enabled but no CalendarSpec was "
+                "supplied. Calendar features must come from each frame's own valid "
+                "timestamp; there is no safe default."
+            )
+        assert self.calendar_builder is not None
+        return self.calendar_builder.scalar_features(calendar, device=device, dtype=dtype)
+
+    @property
+    def has_temporal_context(self) -> bool:
+        """Whether a causal temporal encoder feeds the generative network."""
+        return self.temporal_context is not None
+
+    def build_temporal_context(
+        self,
+        sequence: torch.Tensor,
+        *,
+        lead_hours: torch.Tensor,
+        init_time: Sequence[Any] | None = None,
+        valid_step_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor | None:
+        """Causal per-frame context for a ``[B, S, C, H, W]`` trajectory.
+
+        ``sequence`` must contain only information available at each frame's own
+        lead: raw Aurora forecasts and previously refined states. It must never
+        contain verifying CAMS truth. ``lead_hours`` is ``[B, S]`` cumulative
+        physical hours and is checked to be strictly increasing, which is what
+        stops two initializations from being merged into one trajectory.
+        """
+        if self.temporal_context is None:
+            return None
+        if sequence.ndim != 5:
+            raise ValueError(
+                "Temporal context needs [batch, lead, channel, latitude, longitude], "
+                f"got {tuple(sequence.shape)}."
+            )
+        batch, steps = int(sequence.shape[0]), int(sequence.shape[1])
+        if lead_hours.shape != (batch, steps):
+            raise ValueError(
+                f"lead_hours must be [{batch}, {steps}], got {tuple(lead_hours.shape)}."
+            )
+        assert_increasing_leads(lead_hours)
+        elapsed = elapsed_hours_from_leads(lead_hours, valid_step_mask)
+
+        metadata = None
+        if self.calendar_builder is not None:
+            if init_time is None:
+                raise RuntimeError(
+                    "Temporal context needs one initialization timestamp per sample so "
+                    "every frame's calendar comes from its own valid time."
+                )
+            if len(init_time) != batch:
+                raise ValueError(
+                    f"init_time must have one timestamp per sample; got "
+                    f"{len(init_time)} for batch {batch}."
+                )
+            predecessor = torch.zeros_like(lead_hours)
+            if steps > 1:
+                predecessor[:, 1:] = 1.0
+            spec = CalendarSpec(
+                init_time=CalendarFeatureBuilder.expand_initializations(init_time, steps),
+                lead_hours=lead_hours.detach().reshape(-1).float(),
+                elapsed_hours=elapsed.detach().reshape(-1).float(),
+                has_predecessor=predecessor.reshape(-1),
+            )
+            metadata = self.calendar_builder.scalar_features(
+                spec, device=sequence.device, dtype=sequence.dtype
+            ).reshape(batch, steps, -1)
+
+        return self.temporal_context(
+            sequence,
+            valid_step_mask=valid_step_mask,
+            metadata=metadata,
+        )
+
+    @contextlib.contextmanager
+    def _frame_conditioning(
+        self,
+        metadata: torch.Tensor | None,
+        temporal_context: torch.Tensor | None,
+    ):
+        """Bind per-frame conditioning on the active refiner for one call.
+
+        Validates the pairing between configuration and supplied tensors so a
+        run can never silently train with temporal context and deploy without
+        it (or the reverse).
+        """
+        refiner = self.refiner
+        expects_context = bool(
+            refiner is not None and getattr(refiner, "temporal_context_channels", 0) > 0
+        )
+        if expects_context and temporal_context is None:
+            raise RuntimeError(
+                "refinement.temporal is active but no temporal context was supplied "
+                "for this call. Build it with build_temporal_context(); refining "
+                "without it would use a different conditioning contract than training."
+            )
+        if temporal_context is not None and not expects_context:
+            raise RuntimeError(
+                "A temporal context was supplied but refinement.temporal.backend is "
+                "'none'. Enable a temporal backend or drop the context."
+            )
+        if refiner is None or not hasattr(refiner, "use_frame_conditioning"):
+            yield
+            return
+        with refiner.use_frame_conditioning(
+            metadata=metadata, temporal_context=temporal_context
+        ):
+            yield
 
     # ------------------------------------------------------------------
     @staticmethod
@@ -833,6 +1145,8 @@ class AuroraTwoPhaseRefiner(nn.Module):
         forecast_lead_time: torch.Tensor | None = None,
         lead_index: torch.Tensor | None = None,
         generator: torch.Generator | None = None,
+        calendar: CalendarSpec | None = None,
+        temporal_context: torch.Tensor | None = None,
     ) -> TwoPhaseStepOutput:
         """One Phase-2 training-objective evaluation for a set of rollout steps.
 
@@ -841,6 +1155,12 @@ class AuroraTwoPhaseRefiner(nn.Module):
         per leading entry. ``forecast_lead_time`` carries the matching physical
         lead time in hours; ``lead_index`` the rollout-step index used only to
         group the bias-aware auxiliary losses.
+
+        ``calendar`` supplies each frame's own valid timestamp and is required
+        when calendar or solar conditioning is enabled. ``temporal_context`` is
+        the causal per-frame context from :meth:`build_temporal_context`,
+        flattened to lead-major ``[N, context_channels, H, W]``; it enters the
+        generative network at every process evaluation.
         """
         if not self.refinement_config.is_active:
             raise RuntimeError(
@@ -854,6 +1174,7 @@ class AuroraTwoPhaseRefiner(nn.Module):
                 rollout,
                 input_state_normalized=input_state_normalized,
                 static_fields=static_fields,
+                calendar=calendar,
             )
         forecast_lead_time = self._forecast_lead_vector(
             forecast_lead_time,
@@ -877,18 +1198,20 @@ class AuroraTwoPhaseRefiner(nn.Module):
                 valid, target, torch.zeros_like(target)
             )
 
-        result = self.refiner.compute_training_loss(
-            process_target,
-            conditioning,
-            forecast_lead_time=forecast_lead_time,
-            mask=valid,
-            generator=generator,
-            lead_index=lead_index,
-            area_weight=self.area_weight(
-                rollout.shape[-2], rollout.device, torch.float32
-            ),
-            rollout_normalized=rollout,
-        )
+        metadata = self.calendar_metadata(calendar, device=conditioning.device)
+        with self._frame_conditioning(metadata, temporal_context):
+            result = self.refiner.compute_training_loss(
+                process_target,
+                conditioning,
+                forecast_lead_time=forecast_lead_time,
+                mask=valid,
+                generator=generator,
+                lead_index=lead_index,
+                area_weight=self.area_weight(
+                    rollout.shape[-2], rollout.device, torch.float32
+                ),
+                rollout_normalized=rollout,
+            )
         estimated_process_target = result.predicted_correction_normalized
         estimated_correction = None
         estimated_correction_physical = None
@@ -1320,6 +1643,42 @@ class AuroraTwoPhaseRefiner(nn.Module):
     # ------------------------------------------------------------------
     @torch.no_grad()
     def refine(
+        self,
+        rollout_normalized: torch.Tensor,
+        *,
+        calendar: CalendarSpec | None = None,
+        temporal_context: torch.Tensor | None = None,
+        **kwargs: Any,
+    ) -> TwoPhaseStepOutput:
+        """Deterministic plus (optionally) refined ensemble inference.
+
+        The deterministic rollout is always returned unchanged; refinement only
+        adds fields.
+
+        ``calendar`` carries each frame's own valid timestamp (required when
+        calendar or solar conditioning is enabled) and ``temporal_context`` the
+        causal context from :meth:`build_temporal_context`. Both are bound for
+        the whole call, so every solver evaluation of every ensemble member sees
+        exactly the conditioning the checkpoint was trained with.
+        """
+        if self.refinement_config.is_active:
+            conditioning = kwargs.get("conditioning")
+            if conditioning is None:
+                conditioning = self.build_conditioning(
+                    rollout_normalized.float(),
+                    input_state_normalized=kwargs.get("input_state_normalized"),
+                    static_fields=kwargs.get("static_fields"),
+                    calendar=calendar,
+                )
+                kwargs["conditioning"] = conditioning
+            self.initialize_refiner(conditioning.shape[1])
+            metadata = self.calendar_metadata(calendar, device=conditioning.device)
+            with self._frame_conditioning(metadata, temporal_context):
+                return self._refine_impl(rollout_normalized, **kwargs)
+        return self._refine_impl(rollout_normalized, **kwargs)
+
+    @torch.no_grad()
+    def _refine_impl(
         self,
         rollout_normalized: torch.Tensor,
         *,
