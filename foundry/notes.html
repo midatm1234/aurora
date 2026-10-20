@@ -1,0 +1,699 @@
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../" data-theme="light">
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>Resources &#8212; Aurora: A Foundation Model of the Atmosphere</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "light";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "light";
+  </script>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../_static/styles/theme.css?digest=dfe6caa3a7d634c4db9b" rel="stylesheet" />
+<link href="../_static/styles/bootstrap.css?digest=dfe6caa3a7d634c4db9b" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=dfe6caa3a7d634c4db9b" rel="stylesheet" />
+
+  
+  <link href="../_static/vendor/fontawesome/6.5.2/css/all.min.css?digest=dfe6caa3a7d634c4db9b" rel="stylesheet" />
+  <link rel="preload" as="font" type="font/woff2" crossorigin href="../_static/vendor/fontawesome/6.5.2/webfonts/fa-solid-900.woff2" />
+<link rel="preload" as="font" type="font/woff2" crossorigin href="../_static/vendor/fontawesome/6.5.2/webfonts/fa-brands-400.woff2" />
+<link rel="preload" as="font" type="font/woff2" crossorigin href="../_static/vendor/fontawesome/6.5.2/webfonts/fa-regular-400.woff2" />
+
+    <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=03e43079" />
+    <link rel="stylesheet" type="text/css" href="../_static/styles/sphinx-book-theme.css?v=eba8b062" />
+    <link rel="stylesheet" type="text/css" href="../_static/togglebutton.css?v=9c3e77be" />
+    <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="../_static/mystnb.11b39860a7a0cbfd473a3ad8a317855267ff0bd372690045ca344a6b62be495e.css" />
+    <link rel="stylesheet" type="text/css" href="../_static/sphinx-thebe.css?v=4fa983c6" />
+    <link rel="stylesheet" type="text/css" href="../_static/sphinx-design.min.css?v=95c83b7e" />
+  
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=dfe6caa3a7d634c4db9b" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=dfe6caa3a7d634c4db9b" />
+  <script src="../_static/vendor/fontawesome/6.5.2/js/all.min.js?digest=dfe6caa3a7d634c4db9b"></script>
+
+    <script src="../_static/documentation_options.js?v=9eb32ce0"></script>
+    <script src="../_static/doctools.js?v=9a2dae69"></script>
+    <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../_static/copybutton.js?v=f281be69"></script>
+    <script src="../_static/scripts/sphinx-book-theme.js?v=887ef09a"></script>
+    <script>let toggleHintShow = 'Click to show';</script>
+    <script>let toggleHintHide = 'Click to hide';</script>
+    <script>let toggleOpenOnPrint = 'true';</script>
+    <script src="../_static/togglebutton.js?v=b8b12719"></script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script src="../_static/design-tabs.js?v=f930bc37"></script>
+    <script>const THEBE_JS_URL = "https://unpkg.com/thebe@0.8.2/lib/index.js"; const thebe_selector = ".thebe,.cell"; const thebe_selector_input = "pre"; const thebe_selector_output = ".output, .cell_output"</script>
+    <script async="async" src="../_static/sphinx-thebe.js?v=c100c467"></script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>const THEBE_JS_URL = "https://unpkg.com/thebe@0.8.2/lib/index.js"; const thebe_selector = ".thebe,.cell"; const thebe_selector_input = "pre"; const thebe_selector_output = ".output, .cell_output"</script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'foundry/notes';</script>
+    <link rel="index" title="Index" href="../genindex.html" />
+    <link rel="search" title="Search" href="../search.html" />
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  </head>
+  
+  
+  <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="light">
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+
+  
+  <input type="checkbox"
+          class="sidebar-toggle"
+          id="pst-primary-sidebar-checkbox"/>
+  <label class="overlay overlay-primary" for="pst-primary-sidebar-checkbox"></label>
+  
+  <input type="checkbox"
+          class="sidebar-toggle"
+          id="pst-secondary-sidebar-checkbox"/>
+  <label class="overlay overlay-secondary" for="pst-secondary-sidebar-checkbox"></label>
+  
+  <div class="search-button__wrapper">
+    <div class="search-button__overlay"></div>
+    <div class="search-button__search-container">
+<form class="bd-search d-flex align-items-center"
+      action="../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         id="search-input"
+         placeholder="Search this book..."
+         aria-label="Search this book..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form></div>
+  </div>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+        
+      
+      <div class="bd-sidebar-primary bd-sidebar">
+        
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+    
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../intro.html">
+  
+  
+  
+  
+  
+    
+    
+    
+    <img src="../_static/aurora.jpg" class="logo__image only-light" alt="Aurora: A Foundation Model of the Atmosphere - Home"/>
+    <script>document.write(`<img src="../_static/aurora.jpg" class="logo__image only-dark" alt="Aurora: A Foundation Model of the Atmosphere - Home"/>`);</script>
+  
+  
+</a></div>
+        <div class="sidebar-primary-item">
+
+ <script>
+ document.write(`
+   <button class="btn search-button-field search-button__button" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <i class="fa-solid fa-magnifying-glass"></i>
+    <span class="search-button__default-text">Search</span>
+    <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+   </button>
+ `);
+ </script></div>
+        <div class="sidebar-primary-item"><nav class="bd-links bd-docs-nav" aria-label="Main">
+    <div class="bd-toc-item navbar-nav active">
+        
+        <ul class="nav bd-sidenav bd-sidenav__home-link">
+            <li class="toctree-l1">
+                <a class="reference internal" href="../intro.html">
+                    Aurora: A Foundation Model for the Earth System
+                </a>
+            </li>
+        </ul>
+        <p aria-level="2" class="caption" role="heading"><span class="caption-text">Main Usage</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../usage.html">Usage</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../batch.html">Form of a Batch</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../models.html">Available Models</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../tracking.html">Tropical Cyclone Tracking</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../beware.html">Beware!</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../finetuning.html">Fine-Tuning</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../finetuning_ozone.html">Case Study: Fine-Tuning Aurora Air Pollution on Ozone</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ai_models_plugin.html">Plugin for ECMWF’s <code class="docutils literal notranslate"><span class="pre">ai-models</span></code></a></li>
+<li class="toctree-l1"><a class="reference internal" href="../api.html">Application Programming Interface</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Examples</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../example_era5.html">Predictions for ERA5</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../example_hres_t0.html">Predictions for HRES T0</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../example_hres_0.1.html">Predictions for HRES at 0.1 Degrees</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../example_cams.html">Predictions for Air Pollution</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../example_wave.html">Predictions for Ocean Waves</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../example_tc_tracking.html">Track Predictions for Typhoon Nanmadol</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../example_v1p5.html">Predictions with Aurora 1.5</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Foundry</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="intro.html">Aurora on Azure AI Foundry</a></li>
+<li class="toctree-l1"><a class="reference internal" href="submission.html">Submitting Predictions</a></li>
+<li class="toctree-l1"><a class="reference internal" href="demo_hres_t0.html">Demo: HRES T0</a></li>
+<li class="toctree-l1"><a class="reference internal" href="demo_v1p5.html">Demo: Aurora 1.5 on Foundry</a></li>
+<li class="toctree-l1"><a class="reference internal" href="server.html">Creating an Endpoint</a></li>
+<li class="toctree-l1"><a class="reference internal" href="api.html">Application Programming Interface</a></li>
+</ul>
+
+    </div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+  </div>
+  
+  <div id="rtd-footer-container"></div>
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+
+<div class="sbt-scroll-pixel-helper"></div>
+
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item"><button class="sidebar-toggle primary-toggle btn btn-sm" title="Toggle primary sidebar" data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <span class="fa-solid fa-bars"></span>
+</button></div>
+      
+    </div>
+  
+  
+    <div class="header-article-items__end">
+      
+        <div class="header-article-item">
+
+<div class="article-header-buttons">
+
+
+
+
+
+<div class="dropdown dropdown-source-buttons">
+  <button class="btn dropdown-toggle" type="button" data-bs-toggle="dropdown" aria-expanded="false" aria-label="Source repositories">
+    <i class="fab fa-github"></i>
+  </button>
+  <ul class="dropdown-menu">
+      
+      
+      
+      <li><a href="https://github.com/microsoft/aurora" target="_blank"
+   class="btn btn-sm btn-source-repository-button dropdown-item"
+   title="Source repository"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fab fa-github"></i>
+  </span>
+<span class="btn__text-container">Repository</span>
+</a>
+</li>
+      
+      
+      
+      
+      <li><a href="https://github.com/microsoft/aurora/issues/new?title=Issue%20on%20page%20%2Ffoundry/notes.html&body=Your%20issue%20content%20here." target="_blank"
+   class="btn btn-sm btn-source-issues-button dropdown-item"
+   title="Open an issue"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-lightbulb"></i>
+  </span>
+<span class="btn__text-container">Open issue</span>
+</a>
+</li>
+      
+  </ul>
+</div>
+
+
+
+
+
+
+<div class="dropdown dropdown-download-buttons">
+  <button class="btn dropdown-toggle" type="button" data-bs-toggle="dropdown" aria-expanded="false" aria-label="Download this page">
+    <i class="fas fa-download"></i>
+  </button>
+  <ul class="dropdown-menu">
+      
+      
+      
+      <li><a href="../_sources/foundry/notes.md" target="_blank"
+   class="btn btn-sm btn-download-source-button dropdown-item"
+   title="Download source file"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-file"></i>
+  </span>
+<span class="btn__text-container">.md</span>
+</a>
+</li>
+      
+      
+      
+      
+      <li>
+<button onclick="window.print()"
+  class="btn btn-sm btn-download-pdf-button dropdown-item"
+  title="Print to PDF"
+  data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-file-pdf"></i>
+  </span>
+<span class="btn__text-container">.pdf</span>
+</button>
+</li>
+      
+  </ul>
+</div>
+
+
+
+
+<button onclick="toggleFullScreen()"
+  class="btn btn-sm btn-fullscreen-button"
+  title="Fullscreen mode"
+  data-bs-placement="bottom" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-expand"></i>
+  </span>
+
+</button>
+
+
+
+<script>
+document.write(`
+  <button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button" title="light/dark" aria-label="light/dark" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <i class="theme-switch fa-solid fa-sun fa-lg" data-mode="light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg" data-mode="dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"></i>
+  </button>
+`);
+</script>
+
+
+<script>
+document.write(`
+  <button class="btn btn-sm pst-navbar-icon search-button search-button__button" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <i class="fa-solid fa-magnifying-glass fa-lg"></i>
+  </button>
+`);
+</script>
+<button class="sidebar-toggle secondary-toggle btn btn-sm" title="Toggle secondary sidebar" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <span class="fa-solid fa-list"></span>
+</button>
+</div></div>
+      
+    </div>
+  
+</div>
+</div>
+              
+              
+
+<div id="jb-print-docs-body" class="onlyprint">
+    <h1>Resources</h1>
+    <!-- Table of contents -->
+    <div id="print-main-content">
+        <div id="jb-print-toc">
+            
+            <div>
+                <h2> Contents </h2>
+            </div>
+            <nav aria-label="Page">
+                <ul class="visible nav section-nav flex-column">
+<li class="toc-h1 nav-item toc-entry"><a class="reference internal nav-link" href="#">Resources</a></li>
+<li class="toc-h1 nav-item toc-entry"><a class="reference internal nav-link" href="#quickstart">Quickstart</a></li>
+<li class="toc-h1 nav-item toc-entry"><a class="reference internal nav-link" href="#intended-use">Intended Use</a><ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#primary-use-cases">Primary Use Cases</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#out-of-scope-use-cases">Out-of-Scope Use Cases</a></li>
+</ul>
+</li>
+<li class="toc-h1 nav-item toc-entry"><a class="reference internal nav-link" href="#responsible-ai-considerations">Responsible AI Considerations</a></li>
+<li class="toc-h1 nav-item toc-entry"><a class="reference internal nav-link" href="#training-data">Training Data</a></li>
+<li class="toc-h1 nav-item toc-entry"><a class="reference internal nav-link" href="#license">License</a></li>
+<li class="toc-h1 nav-item toc-entry"><a class="reference internal nav-link" href="#security">Security</a></li>
+<li class="toc-h1 nav-item toc-entry"><a class="reference internal nav-link" href="#responsible-ai-transparency-documentation">Responsible AI Transparency Documentation</a><ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#limitations">Limitations</a></li>
+</ul>
+</li>
+<li class="toc-h1 nav-item toc-entry"><a class="reference internal nav-link" href="#trademarks">Trademarks</a></li>
+</ul>
+
+            </nav>
+        </div>
+    </div>
+</div>
+
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <section id="resources">
+<h1>Resources<a class="headerlink" href="#resources" title="Link to this heading">#</a></h1>
+<ul class="simple">
+<li><p><a class="reference external" href="https://microsoft.github.io/aurora/intro.html">Documentation of the Aurora model</a></p></li>
+<li><p><a class="reference external" href="https://microsoft.github.io/aurora/example_v1p5.html">Aurora 1.5 example notebook</a></p></li>
+<li><p><a class="reference external" href="https://github.com/microsoft/aurora">Implementation of the Aurora model</a></p></li>
+<li><p><a class="reference external" href="https://www.nature.com/articles/s41586-025-09005-y">Paper with detailed evaluation</a></p></li>
+</ul>
+</section>
+<section id="quickstart">
+<h1>Quickstart<a class="headerlink" href="#quickstart" title="Link to this heading">#</a></h1>
+<p>First install the model:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>pip<span class="w"> </span>install<span class="w"> </span>microsoft-aurora
+</pre></div>
+</div>
+<p>Then you can make predictions with an Azure Foundry AI endpoint as follows:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">aurora</span><span class="w"> </span><span class="kn">import</span> <span class="n">Batch</span>
+
+<span class="kn">from</span><span class="w"> </span><span class="nn">aurora.foundry</span><span class="w"> </span><span class="kn">import</span> <span class="n">BlobStorageChannel</span><span class="p">,</span> <span class="n">FoundryClient</span><span class="p">,</span> <span class="n">submit</span>
+
+
+<span class="n">initial_condition</span> <span class="o">=</span> <span class="n">Batch</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>  <span class="c1"># Create initial condition for the model.</span>
+
+<span class="k">for</span> <span class="n">pred</span> <span class="ow">in</span> <span class="n">submit</span><span class="p">(</span>
+    <span class="n">initial_condition</span><span class="p">,</span>
+    <span class="n">model_name</span><span class="o">=</span><span class="s2">"aurora-0.25-v1.5"</span><span class="p">,</span>
+    <span class="n">num_steps</span><span class="o">=</span><span class="mi">4</span><span class="p">,</span>  <span class="c1"># Every major step predicts six hours ahead.</span>
+    <span class="n">fine_lead_times</span><span class="o">=</span><span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">3</span><span class="p">,</span> <span class="mi">4</span><span class="p">,</span> <span class="mi">5</span><span class="p">,</span> <span class="mi">6</span><span class="p">],</span>  <span class="c1"># Specify sub-steps like this for hourly forecasts.</span>
+    <span class="n">foundry_client</span><span class="o">=</span><span class="n">FoundryClient</span><span class="p">(</span>
+        <span class="n">endpoint</span><span class="o">=</span><span class="s2">"https://endpoint/"</span><span class="p">,</span>
+        <span class="n">token</span><span class="o">=</span><span class="s2">"ENDPOINT_TOKEN"</span><span class="p">,</span>
+    <span class="p">),</span>
+    <span class="c1"># Communication with the endpoint happens via an intermediate blob storage container. You</span>
+    <span class="c1"># will need to create one and generate an URL with a SAS token that has both read and write</span>
+    <span class="c1"># rights.</span>
+    <span class="n">channel</span><span class="o">=</span><span class="n">BlobStorageChannel</span><span class="p">(</span>
+        <span class="s2">"https://storageaccount.blob.core.windows.net/container?&lt;READ_WRITE_SAS_TOKEN&gt;"</span>
+    <span class="p">),</span>
+<span class="p">):</span>
+    <span class="k">pass</span>  <span class="c1"># Do something with `pred`, which is a `Batch`.</span>
+</pre></div>
+</div>
+</section>
+<section id="intended-use">
+<h1>Intended Use<a class="headerlink" href="#intended-use" title="Link to this heading">#</a></h1>
+<section id="primary-use-cases">
+<h2>Primary Use Cases<a class="headerlink" href="#primary-use-cases" title="Link to this heading">#</a></h2>
+<p>Aurora 1.5 is intended for medium-range deterministic and probabilistic weather prediction. The
+model can be further adapted to specialised atmospheric forecasting tasks with relatively limited
+task-specific training data, if desired, due to its foundation-model architecture.</p>
+<p>Aurora 1.5 extends the original Aurora with substantially expanded surface variables (26 input,
+7 output-only), variable lead-time embeddings enabling predictions at any lead time as fine as
+one hour, and an ensemble version for probabilistic forecasting.</p>
+<p>The ensemble version (<code class="docutils literal notranslate"><span class="pre">AuroraV1p5Ensemble</span></code>) supports stochastic noise injection for generating
+physically plausible ensemble members, producing temporally coherent probabilistic forecasts
+suitable for uncertainty quantification in weather prediction research.</p>
+</section>
+<section id="out-of-scope-use-cases">
+<h2>Out-of-Scope Use Cases<a class="headerlink" href="#out-of-scope-use-cases" title="Link to this heading">#</a></h2>
+<p>Aurora is not designed or evaluated for direct operational decision-making without expert review,
+applications requiring guaranteed forecast accuracy, or non-environmental prediction tasks.
+Use in safety-critical planning or automated decision pipelines should be accompanied by
+appropriate domain validation. Developers should assess the suitability of the model for their
+specific downstream use case, and evaluate and mitigate for accuracy and reliability before
+deployment, particularly for high-risk scenarios. We do not recommend using Aurora in commercial
+or real‑world applications without further testing and development.</p>
+</section>
+</section>
+<section id="responsible-ai-considerations">
+<h1>Responsible AI Considerations<a class="headerlink" href="#responsible-ai-considerations" title="Link to this heading">#</a></h1>
+<p>Aurora is a research forecasting model and should not be treated as an operational weather service.
+While the model can match or exceed traditional numerical baselines on established benchmarks,
+its reliability can degrade in out-of-distribution conditions
+(e.g., rare extremes, regime shifts, or regions/variables with limited historical fidelity
+in underlying reanalyses and simulations).
+Outputs may also be misinterpreted if users overlook uncertainty, ensemble spread,
+or known limitations of the underlying training data.</p>
+<p>The primary Responsible AI risks are
+(1) unintended use by non-experts and
+(2) downstream use in consequential decision-making without domain validation
+(e.g., emergency response, critical infrastructure operations, safety-of-life planning).
+To mitigate these risks, developers should:
+clearly communicate that the release is for research evaluation and reproducibility;
+require domain-expert review before any real-world decisions are informed by outputs;
+implement basic input validation to ensure initial conditions come from credible sources
+(e.g., established meteorological agencies and data providers);
+and benchmark performance against accepted physical modelling systems for the specific
+geography, horizon, and variable(s) relevant to the intended application.</p>
+<p>Aurora is best integrated as a decision-support component for expert analysis,
+not as a fully autonomous trigger for actions.
+For higher-risk scenarios, apply additional safeguards such as human-in-the-loop review,
+conservative thresholds for alerts, calibration/verification tests,
+and ongoing monitoring for drift when changing input sources or pre/post-processing.</p>
+</section>
+<section id="training-data">
+<h1>Training Data<a class="headerlink" href="#training-data" title="Link to this heading">#</a></h1>
+<p>The models included in the code have been trained on a variety of publicly available data,
+totalling over 1,000,000 hours of heterogeneous Earth-system data spanning atmosphere,
+air quality, and ocean-wave domains.
+A description of all data, including download links, can be found in
+<a class="reference external" href="https://www.nature.com/articles/s41586-025-09005-y">Supplementary C of the paper</a>.
+The checkpoints include data from
+ERA5, CMIP6 (CMCC-CM2-VHR4 and ECMWF-IFS-HR), HRES forecasts, GFS T0, GFS forecasts,
+HRES T0, HRES analysis, HRES-WAM analysis, CAMS reanalysis, and CAMS analysis.</p>
+<p>For Aurora 1.5, the model was further fine-tuned via three stages:
+(1) adding additional surface variables and increasing temporal resolution to 1 hour,
+(2) injecting Gaussian noise during training and optimizing a CRPS objective to improve
+probabilistic calibration, and
+(3) auto-regressive fine-tuning over multiple 6-hour steps on ECMWF HRES operational analysis (2018–2023).
+Unless otherwise noted, the training data are sourced from ERA5 spanning 1981-2023.</p>
+</section>
+<section id="license">
+<h1>License<a class="headerlink" href="#license" title="Link to this heading">#</a></h1>
+<p>This model and the associated model weights are released under the <a class="reference external" href="https://spdx.org/licenses/MIT">MIT licence</a>.</p>
+</section>
+<section id="security">
+<h1>Security<a class="headerlink" href="#security" title="Link to this heading">#</a></h1>
+<p>See <a class="reference external" href="https://github.com/microsoft/aurora/blob/main/SECURITY.md">SECURITY</a>.</p>
+</section>
+<section id="responsible-ai-transparency-documentation">
+<h1>Responsible AI Transparency Documentation<a class="headerlink" href="#responsible-ai-transparency-documentation" title="Link to this heading">#</a></h1>
+<p>An AI system includes not only the technology, but also the people who will use it,
+the people who will be affected by it, and the environment in which it is deployed.
+Creating a system that is fit for its intended purpose requires an understanding of how the technology works,
+its capabilities and limitations, and how to achieve the best performance.
+Microsoft has a broad effort to put our AI principles into practice.</p>
+<p>To find out more, see <a class="reference external" href="https://www.microsoft.com/en-us/ai/responsible-ai">Responsible AI principles from Microsoft</a>.</p>
+<section id="limitations">
+<h2>Limitations<a class="headerlink" href="#limitations" title="Link to this heading">#</a></h2>
+<p>Although Aurora was trained to accurately predict future weather, air pollution, and ocean waves,
+Aurora is based on neural networks, which means that there are no strict guarantees that predictions will always be accurate.
+Altering the inputs, providing a sample that was not in the training set,
+or even providing a sample that was in the training set but is simply unlucky may result in arbitrarily poor predictions.
+In addition, even though Aurora was trained on a wide variety of data sets,
+it is possible that Aurora inherits biases present in any one of those data sets.
+A forecasting system like Aurora is only one piece of the puzzle in a weather prediction pipeline,
+and its outputs are not meant to be directly used by people or businesses to plan their operations.
+A series of additional verification tests are needed before it can become operationally useful.</p>
+</section>
+</section>
+<section id="trademarks">
+<h1>Trademarks<a class="headerlink" href="#trademarks" title="Link to this heading">#</a></h1>
+<p>This project may contain trademarks or logos for projects, products, or services.
+Authorized use of Microsoft trademarks or logos is subject to and must follow
+<a class="reference external" href="https://www.microsoft.com/en-us/legal/intellectualproperty/trademarks/usage/general">Microsoft’s Trademark &amp; Brand Guidelines</a>.
+Use of Microsoft trademarks or logos in modified versions of this project must not cause confusion or imply Microsoft sponsorship.
+Any use of third-party trademarks or logos are subject to those third-party’s policies.</p>
+</section>
+
+    <script type="text/x-thebe-config">
+    {
+        requestKernel: true,
+        binderOptions: {
+            repo: "binder-examples/jupyter-stacks-datascience",
+            ref: "master",
+        },
+        codeMirrorConfig: {
+            theme: "abcdef",
+            mode: "python"
+        },
+        kernelOptions: {
+            name: "python3",
+            path: "./foundry"
+        },
+        predefinedOutput: true
+    }
+    </script>
+    <script>kernelName = 'python3'</script>
+
+                </article>
+              
+
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+</div>
+                </footer>
+              
+            </div>
+            
+            
+              
+                <div class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item">
+  <div class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> Contents
+  </div>
+  <nav class="bd-toc-nav page-toc">
+    <ul class="visible nav section-nav flex-column">
+<li class="toc-h1 nav-item toc-entry"><a class="reference internal nav-link" href="#">Resources</a></li>
+<li class="toc-h1 nav-item toc-entry"><a class="reference internal nav-link" href="#quickstart">Quickstart</a></li>
+<li class="toc-h1 nav-item toc-entry"><a class="reference internal nav-link" href="#intended-use">Intended Use</a><ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#primary-use-cases">Primary Use Cases</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#out-of-scope-use-cases">Out-of-Scope Use Cases</a></li>
+</ul>
+</li>
+<li class="toc-h1 nav-item toc-entry"><a class="reference internal nav-link" href="#responsible-ai-considerations">Responsible AI Considerations</a></li>
+<li class="toc-h1 nav-item toc-entry"><a class="reference internal nav-link" href="#training-data">Training Data</a></li>
+<li class="toc-h1 nav-item toc-entry"><a class="reference internal nav-link" href="#license">License</a></li>
+<li class="toc-h1 nav-item toc-entry"><a class="reference internal nav-link" href="#security">Security</a></li>
+<li class="toc-h1 nav-item toc-entry"><a class="reference internal nav-link" href="#responsible-ai-transparency-documentation">Responsible AI Transparency Documentation</a><ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#limitations">Limitations</a></li>
+</ul>
+</li>
+<li class="toc-h1 nav-item toc-entry"><a class="reference internal nav-link" href="#trademarks">Trademarks</a></li>
+</ul>
+
+  </nav></div>
+
+</div></div>
+              
+            
+          </div>
+          <footer class="bd-footer-content">
+            
+<div class="bd-footer-content__inner container">
+  
+  <div class="footer-item">
+    
+<p class="component-author">
+By Microsoft Corporation
+</p>
+
+  </div>
+  
+  <div class="footer-item">
+    
+
+  <p class="copyright">
+    
+      © Copyright 2024.
+      <br/>
+    
+  </p>
+
+  </div>
+  
+  <div class="footer-item">
+    
+  </div>
+  
+  <div class="footer-item">
+    
+  </div>
+  
+</div>
+          </footer>
+        
+
+      </main>
+    </div>
+  </div>
+  
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script src="../_static/scripts/bootstrap.js?digest=dfe6caa3a7d634c4db9b"></script>
+<script src="../_static/scripts/pydata-sphinx-theme.js?digest=dfe6caa3a7d634c4db9b"></script>
+
+  <footer class="bd-footer">
+  </footer>
+  </body>
+</html>

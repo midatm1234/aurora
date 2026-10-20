@@ -1,0 +1,847 @@
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="./" data-theme="light">
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>Form of a Batch &#8212; Aurora: A Foundation Model of the Atmosphere</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "light";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "light";
+  </script>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="_static/styles/theme.css?digest=dfe6caa3a7d634c4db9b" rel="stylesheet" />
+<link href="_static/styles/bootstrap.css?digest=dfe6caa3a7d634c4db9b" rel="stylesheet" />
+<link href="_static/styles/pydata-sphinx-theme.css?digest=dfe6caa3a7d634c4db9b" rel="stylesheet" />
+
+  
+  <link href="_static/vendor/fontawesome/6.5.2/css/all.min.css?digest=dfe6caa3a7d634c4db9b" rel="stylesheet" />
+  <link rel="preload" as="font" type="font/woff2" crossorigin href="_static/vendor/fontawesome/6.5.2/webfonts/fa-solid-900.woff2" />
+<link rel="preload" as="font" type="font/woff2" crossorigin href="_static/vendor/fontawesome/6.5.2/webfonts/fa-brands-400.woff2" />
+<link rel="preload" as="font" type="font/woff2" crossorigin href="_static/vendor/fontawesome/6.5.2/webfonts/fa-regular-400.woff2" />
+
+    <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=03e43079" />
+    <link rel="stylesheet" type="text/css" href="_static/styles/sphinx-book-theme.css?v=eba8b062" />
+    <link rel="stylesheet" type="text/css" href="_static/togglebutton.css?v=9c3e77be" />
+    <link rel="stylesheet" type="text/css" href="_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="_static/mystnb.11b39860a7a0cbfd473a3ad8a317855267ff0bd372690045ca344a6b62be495e.css" />
+    <link rel="stylesheet" type="text/css" href="_static/sphinx-thebe.css?v=4fa983c6" />
+    <link rel="stylesheet" type="text/css" href="_static/sphinx-design.min.css?v=95c83b7e" />
+  
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="_static/scripts/bootstrap.js?digest=dfe6caa3a7d634c4db9b" />
+<link rel="preload" as="script" href="_static/scripts/pydata-sphinx-theme.js?digest=dfe6caa3a7d634c4db9b" />
+  <script src="_static/vendor/fontawesome/6.5.2/js/all.min.js?digest=dfe6caa3a7d634c4db9b"></script>
+
+    <script src="_static/documentation_options.js?v=9eb32ce0"></script>
+    <script src="_static/doctools.js?v=9a2dae69"></script>
+    <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="_static/copybutton.js?v=f281be69"></script>
+    <script src="_static/scripts/sphinx-book-theme.js?v=887ef09a"></script>
+    <script>let toggleHintShow = 'Click to show';</script>
+    <script>let toggleHintHide = 'Click to hide';</script>
+    <script>let toggleOpenOnPrint = 'true';</script>
+    <script src="_static/togglebutton.js?v=b8b12719"></script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script src="_static/design-tabs.js?v=f930bc37"></script>
+    <script>const THEBE_JS_URL = "https://unpkg.com/thebe@0.8.2/lib/index.js"; const thebe_selector = ".thebe,.cell"; const thebe_selector_input = "pre"; const thebe_selector_output = ".output, .cell_output"</script>
+    <script async="async" src="_static/sphinx-thebe.js?v=c100c467"></script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>const THEBE_JS_URL = "https://unpkg.com/thebe@0.8.2/lib/index.js"; const thebe_selector = ".thebe,.cell"; const thebe_selector_input = "pre"; const thebe_selector_output = ".output, .cell_output"</script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'batch';</script>
+    <link rel="index" title="Index" href="genindex.html" />
+    <link rel="search" title="Search" href="search.html" />
+    <link rel="next" title="Available Models" href="models.html" />
+    <link rel="prev" title="Usage" href="usage.html" />
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  </head>
+  
+  
+  <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="light">
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+
+  
+  <input type="checkbox"
+          class="sidebar-toggle"
+          id="pst-primary-sidebar-checkbox"/>
+  <label class="overlay overlay-primary" for="pst-primary-sidebar-checkbox"></label>
+  
+  <input type="checkbox"
+          class="sidebar-toggle"
+          id="pst-secondary-sidebar-checkbox"/>
+  <label class="overlay overlay-secondary" for="pst-secondary-sidebar-checkbox"></label>
+  
+  <div class="search-button__wrapper">
+    <div class="search-button__overlay"></div>
+    <div class="search-button__search-container">
+<form class="bd-search d-flex align-items-center"
+      action="search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         id="search-input"
+         placeholder="Search this book..."
+         aria-label="Search this book..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form></div>
+  </div>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <div class="bd-sidebar-primary bd-sidebar">
+        
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+    
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="intro.html">
+  
+  
+  
+  
+  
+    
+    
+    
+    <img src="_static/aurora.jpg" class="logo__image only-light" alt="Aurora: A Foundation Model of the Atmosphere - Home"/>
+    <script>document.write(`<img src="_static/aurora.jpg" class="logo__image only-dark" alt="Aurora: A Foundation Model of the Atmosphere - Home"/>`);</script>
+  
+  
+</a></div>
+        <div class="sidebar-primary-item">
+
+ <script>
+ document.write(`
+   <button class="btn search-button-field search-button__button" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <i class="fa-solid fa-magnifying-glass"></i>
+    <span class="search-button__default-text">Search</span>
+    <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+   </button>
+ `);
+ </script></div>
+        <div class="sidebar-primary-item"><nav class="bd-links bd-docs-nav" aria-label="Main">
+    <div class="bd-toc-item navbar-nav active">
+        
+        <ul class="nav bd-sidenav bd-sidenav__home-link">
+            <li class="toctree-l1">
+                <a class="reference internal" href="intro.html">
+                    Aurora: A Foundation Model for the Earth System
+                </a>
+            </li>
+        </ul>
+        <p aria-level="2" class="caption" role="heading"><span class="caption-text">Main Usage</span></p>
+<ul class="current nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="usage.html">Usage</a></li>
+<li class="toctree-l1 current active"><a class="current reference internal" href="#">Form of a Batch</a></li>
+<li class="toctree-l1"><a class="reference internal" href="models.html">Available Models</a></li>
+<li class="toctree-l1"><a class="reference internal" href="tracking.html">Tropical Cyclone Tracking</a></li>
+<li class="toctree-l1"><a class="reference internal" href="beware.html">Beware!</a></li>
+<li class="toctree-l1"><a class="reference internal" href="finetuning.html">Fine-Tuning</a></li>
+<li class="toctree-l1"><a class="reference internal" href="finetuning_ozone.html">Case Study: Fine-Tuning Aurora Air Pollution on Ozone</a></li>
+<li class="toctree-l1"><a class="reference internal" href="ai_models_plugin.html">Plugin for ECMWF’s <code class="docutils literal notranslate"><span class="pre">ai-models</span></code></a></li>
+<li class="toctree-l1"><a class="reference internal" href="api.html">Application Programming Interface</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Examples</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="example_era5.html">Predictions for ERA5</a></li>
+<li class="toctree-l1"><a class="reference internal" href="example_hres_t0.html">Predictions for HRES T0</a></li>
+<li class="toctree-l1"><a class="reference internal" href="example_hres_0.1.html">Predictions for HRES at 0.1 Degrees</a></li>
+<li class="toctree-l1"><a class="reference internal" href="example_cams.html">Predictions for Air Pollution</a></li>
+<li class="toctree-l1"><a class="reference internal" href="example_wave.html">Predictions for Ocean Waves</a></li>
+<li class="toctree-l1"><a class="reference internal" href="example_tc_tracking.html">Track Predictions for Typhoon Nanmadol</a></li>
+<li class="toctree-l1"><a class="reference internal" href="example_v1p5.html">Predictions with Aurora 1.5</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Foundry</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="foundry/intro.html">Aurora on Azure AI Foundry</a></li>
+<li class="toctree-l1"><a class="reference internal" href="foundry/submission.html">Submitting Predictions</a></li>
+<li class="toctree-l1"><a class="reference internal" href="foundry/demo_hres_t0.html">Demo: HRES T0</a></li>
+<li class="toctree-l1"><a class="reference internal" href="foundry/demo_v1p5.html">Demo: Aurora 1.5 on Foundry</a></li>
+<li class="toctree-l1"><a class="reference internal" href="foundry/server.html">Creating an Endpoint</a></li>
+<li class="toctree-l1"><a class="reference internal" href="foundry/api.html">Application Programming Interface</a></li>
+</ul>
+
+    </div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+  </div>
+  
+  <div id="rtd-footer-container"></div>
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+
+<div class="sbt-scroll-pixel-helper"></div>
+
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item"><button class="sidebar-toggle primary-toggle btn btn-sm" title="Toggle primary sidebar" data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <span class="fa-solid fa-bars"></span>
+</button></div>
+      
+    </div>
+  
+  
+    <div class="header-article-items__end">
+      
+        <div class="header-article-item">
+
+<div class="article-header-buttons">
+
+
+
+
+
+<div class="dropdown dropdown-source-buttons">
+  <button class="btn dropdown-toggle" type="button" data-bs-toggle="dropdown" aria-expanded="false" aria-label="Source repositories">
+    <i class="fab fa-github"></i>
+  </button>
+  <ul class="dropdown-menu">
+      
+      
+      
+      <li><a href="https://github.com/microsoft/aurora" target="_blank"
+   class="btn btn-sm btn-source-repository-button dropdown-item"
+   title="Source repository"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fab fa-github"></i>
+  </span>
+<span class="btn__text-container">Repository</span>
+</a>
+</li>
+      
+      
+      
+      
+      <li><a href="https://github.com/microsoft/aurora/issues/new?title=Issue%20on%20page%20%2Fbatch.html&body=Your%20issue%20content%20here." target="_blank"
+   class="btn btn-sm btn-source-issues-button dropdown-item"
+   title="Open an issue"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-lightbulb"></i>
+  </span>
+<span class="btn__text-container">Open issue</span>
+</a>
+</li>
+      
+  </ul>
+</div>
+
+
+
+
+
+
+<div class="dropdown dropdown-download-buttons">
+  <button class="btn dropdown-toggle" type="button" data-bs-toggle="dropdown" aria-expanded="false" aria-label="Download this page">
+    <i class="fas fa-download"></i>
+  </button>
+  <ul class="dropdown-menu">
+      
+      
+      
+      <li><a href="_sources/batch.md" target="_blank"
+   class="btn btn-sm btn-download-source-button dropdown-item"
+   title="Download source file"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-file"></i>
+  </span>
+<span class="btn__text-container">.md</span>
+</a>
+</li>
+      
+      
+      
+      
+      <li>
+<button onclick="window.print()"
+  class="btn btn-sm btn-download-pdf-button dropdown-item"
+  title="Print to PDF"
+  data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-file-pdf"></i>
+  </span>
+<span class="btn__text-container">.pdf</span>
+</button>
+</li>
+      
+  </ul>
+</div>
+
+
+
+
+<button onclick="toggleFullScreen()"
+  class="btn btn-sm btn-fullscreen-button"
+  title="Fullscreen mode"
+  data-bs-placement="bottom" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-expand"></i>
+  </span>
+
+</button>
+
+
+
+<script>
+document.write(`
+  <button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button" title="light/dark" aria-label="light/dark" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <i class="theme-switch fa-solid fa-sun fa-lg" data-mode="light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg" data-mode="dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"></i>
+  </button>
+`);
+</script>
+
+
+<script>
+document.write(`
+  <button class="btn btn-sm pst-navbar-icon search-button search-button__button" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <i class="fa-solid fa-magnifying-glass fa-lg"></i>
+  </button>
+`);
+</script>
+<button class="sidebar-toggle secondary-toggle btn btn-sm" title="Toggle secondary sidebar" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <span class="fa-solid fa-list"></span>
+</button>
+</div></div>
+      
+    </div>
+  
+</div>
+</div>
+              
+              
+
+<div id="jb-print-docs-body" class="onlyprint">
+    <h1>Form of a Batch</h1>
+    <!-- Table of contents -->
+    <div id="print-main-content">
+        <div id="jb-print-toc">
+            
+            <div>
+                <h2> Contents </h2>
+            </div>
+            <nav aria-label="Page">
+                <ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#overall-structure">Overall Structure</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#batch-surf-vars"><code class="docutils literal notranslate"><span class="pre">Batch.surf_vars</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#batch-static-vars"><code class="docutils literal notranslate"><span class="pre">Batch.static_vars</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#batch-atmos-vars"><code class="docutils literal notranslate"><span class="pre">Batch.atmos_vars</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#batch-metadata"><code class="docutils literal notranslate"><span class="pre">Batch.metadata</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#model-output">Model Output</a></li>
+</ul>
+            </nav>
+        </div>
+    </div>
+</div>
+
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <section id="form-of-a-batch">
+<h1>Form of a Batch<a class="headerlink" href="#form-of-a-batch" title="Link to this heading">#</a></h1>
+<p>You must feed data to the model in the form of a <code class="docutils literal notranslate"><span class="pre">aurora.Batch</span></code>.
+We now explain the exact form of <code class="docutils literal notranslate"><span class="pre">aurora.Batch</span></code>.</p>
+<section id="overall-structure">
+<h2>Overall Structure<a class="headerlink" href="#overall-structure" title="Link to this heading">#</a></h2>
+<p>Batches contain four things:</p>
+<ol class="arabic simple">
+<li><p>some surface-level variables,</p></li>
+<li><p>some static variables,</p></li>
+<li><p>some atmospheric variables all at the same collection of pressure levels, and</p></li>
+<li><p>metadata describing these variables: latitudes, longitudes,
+the pressure levels of the atmospheric variables, and the time of the data.</p></li>
+</ol>
+<p>All variables in a batch are unnormalised.
+Normalisation happens internally in the model.</p>
+<p>Before we explain the four components in detail, here is an example with randomly generated data:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">datetime</span><span class="w"> </span><span class="kn">import</span> <span class="n">datetime</span>
+
+<span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+
+<span class="kn">from</span><span class="w"> </span><span class="nn">aurora</span><span class="w"> </span><span class="kn">import</span> <span class="n">Batch</span><span class="p">,</span> <span class="n">Metadata</span>
+
+<span class="n">batch</span> <span class="o">=</span> <span class="n">Batch</span><span class="p">(</span>
+    <span class="n">surf_vars</span><span class="o">=</span><span class="p">{</span><span class="n">k</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">17</span><span class="p">,</span> <span class="mi">32</span><span class="p">)</span> <span class="k">for</span> <span class="n">k</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">"2t"</span><span class="p">,</span> <span class="s2">"10u"</span><span class="p">,</span> <span class="s2">"10v"</span><span class="p">,</span> <span class="s2">"msl"</span><span class="p">)},</span>
+    <span class="n">static_vars</span><span class="o">=</span><span class="p">{</span><span class="n">k</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">17</span><span class="p">,</span> <span class="mi">32</span><span class="p">)</span> <span class="k">for</span> <span class="n">k</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">"lsm"</span><span class="p">,</span> <span class="s2">"z"</span><span class="p">,</span> <span class="s2">"slt"</span><span class="p">)},</span>
+    <span class="n">atmos_vars</span><span class="o">=</span><span class="p">{</span><span class="n">k</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">4</span><span class="p">,</span> <span class="mi">17</span><span class="p">,</span> <span class="mi">32</span><span class="p">)</span> <span class="k">for</span> <span class="n">k</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">"z"</span><span class="p">,</span> <span class="s2">"u"</span><span class="p">,</span> <span class="s2">"v"</span><span class="p">,</span> <span class="s2">"t"</span><span class="p">,</span> <span class="s2">"q"</span><span class="p">)},</span>
+    <span class="n">metadata</span><span class="o">=</span><span class="n">Metadata</span><span class="p">(</span>
+        <span class="n">lat</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">linspace</span><span class="p">(</span><span class="mi">90</span><span class="p">,</span> <span class="o">-</span><span class="mi">90</span><span class="p">,</span> <span class="mi">17</span><span class="p">),</span>
+        <span class="n">lon</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">linspace</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="mi">360</span><span class="p">,</span> <span class="mi">32</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)[:</span><span class="o">-</span><span class="mi">1</span><span class="p">],</span>
+        <span class="n">time</span><span class="o">=</span><span class="p">(</span><span class="n">datetime</span><span class="p">(</span><span class="mi">2020</span><span class="p">,</span> <span class="mi">6</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">12</span><span class="p">,</span> <span class="mi">0</span><span class="p">),),</span>
+        <span class="n">atmos_levels</span><span class="o">=</span><span class="p">(</span><span class="mi">100</span><span class="p">,</span> <span class="mi">250</span><span class="p">,</span> <span class="mi">500</span><span class="p">,</span> <span class="mi">850</span><span class="p">),</span>
+    <span class="p">),</span>
+<span class="p">)</span>
+</pre></div>
+</div>
+</section>
+<section id="batch-surf-vars">
+<h2><code class="docutils literal notranslate"><span class="pre">Batch.surf_vars</span></code><a class="headerlink" href="#batch-surf-vars" title="Link to this heading">#</a></h2>
+<p><code class="docutils literal notranslate"><span class="pre">Batch.surf_vars</span></code> is a dictionary mapping names of surface-level variables to the numerical values
+of the variables.
+The surface-level variables must be of the form <code class="docutils literal notranslate"><span class="pre">(b,</span> <span class="pre">t,</span> <span class="pre">h,</span> <span class="pre">w)</span></code> where <code class="docutils literal notranslate"><span class="pre">b</span></code> is the batch size,
+<code class="docutils literal notranslate"><span class="pre">t</span></code> the history dimension, <code class="docutils literal notranslate"><span class="pre">h</span></code> the number of latitudes, and <code class="docutils literal notranslate"><span class="pre">w</span></code> the number of longitudes.</p>
+<p>All Aurora models produce the prediction for the next step from the current <em>and</em> previous step.
+<code class="docutils literal notranslate"><span class="pre">surf_vars[:,</span> <span class="pre">1,</span> <span class="pre">:,</span> <span class="pre">:]</span></code> must correspond to the current step,
+and <code class="docutils literal notranslate"><span class="pre">surf_vars[:,</span> <span class="pre">0,</span> <span class="pre">:,</span> <span class="pre">:]</span></code> must correspond to the previous step, so the step before that.</p>
+<p>The following surface-level variables are allowed:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Name</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">2t</span></code></p></td>
+<td><p>Two-meter temperature in <code class="docutils literal notranslate"><span class="pre">K</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">10u</span></code></p></td>
+<td><p>Ten-meter eastward wind speed in <code class="docutils literal notranslate"><span class="pre">m/s</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">10v</span></code></p></td>
+<td><p>Ten-meter southward wind speed in <code class="docutils literal notranslate"><span class="pre">m/s</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">msl</span></code></p></td>
+<td><p>Mean sea-level pressure in <code class="docutils literal notranslate"><span class="pre">Pa</span></code></p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>For <a class="reference internal" href="models.html#aurora-air-pollution"><span class="std std-ref">Aurora 0.4° Air Pollution</span></a>, the following surface-level variables are
+also allowed:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Name</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">pm1</span></code></p></td>
+<td><p>Particulate matter less than <code class="docutils literal notranslate"><span class="pre">1</span> <span class="pre">um</span></code> in <code class="docutils literal notranslate"><span class="pre">kg/m^3</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">pm2p5</span></code></p></td>
+<td><p>Particulate matter less than <code class="docutils literal notranslate"><span class="pre">2.5</span> <span class="pre">um</span></code> in <code class="docutils literal notranslate"><span class="pre">kg/m^3</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">pm10</span></code></p></td>
+<td><p>Particulate matter less than <code class="docutils literal notranslate"><span class="pre">10</span> <span class="pre">um</span></code> in <code class="docutils literal notranslate"><span class="pre">kg/m^3</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">tcco</span></code></p></td>
+<td><p>Total column carbon monoxide in <code class="docutils literal notranslate"><span class="pre">kg/m^2</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">tc_no</span></code></p></td>
+<td><p>Total column nitrogen monoxide in <code class="docutils literal notranslate"><span class="pre">kg/m^2</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">tcno2</span></code></p></td>
+<td><p>Total column nitrogen dioxide in <code class="docutils literal notranslate"><span class="pre">kg/m^2</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">tcso2</span></code></p></td>
+<td><p>Total column sulphur dioxide in <code class="docutils literal notranslate"><span class="pre">kg/m^2</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">gtco3</span></code></p></td>
+<td><p>Total column ozone in <code class="docutils literal notranslate"><span class="pre">kg/m^2</span></code></p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>For <a class="reference internal" href="models.html#aurora-wave"><span class="std std-ref">Aurora 0.25° Wave</span></a>, the following surface-level variables are also allowed:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Name</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">swh</span></code></p></td>
+<td><p>Significant wave height of the total wave in <code class="docutils literal notranslate"><span class="pre">m</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">mwd</span></code></p></td>
+<td><p>Mean wave direction of the total wave in <code class="docutils literal notranslate"><span class="pre">degrees</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">mwp</span></code></p></td>
+<td><p>Mean wave period of the total wave in <code class="docutils literal notranslate"><span class="pre">s</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">pp1d</span></code></p></td>
+<td><p>Peak wave period of the total wave in <code class="docutils literal notranslate"><span class="pre">s</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">shww</span></code></p></td>
+<td><p>Significant wave height of the wind wave component in <code class="docutils literal notranslate"><span class="pre">m</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">mdww</span></code></p></td>
+<td><p>Mean wave direction of the wind wave component in <code class="docutils literal notranslate"><span class="pre">degrees</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">mpww</span></code></p></td>
+<td><p>Mean wave period of the wind wave component in <code class="docutils literal notranslate"><span class="pre">s</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">shts</span></code></p></td>
+<td><p>Significant wave height of the total swell component in <code class="docutils literal notranslate"><span class="pre">m</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">mdts</span></code></p></td>
+<td><p>Mean wave direction of the total swell component in <code class="docutils literal notranslate"><span class="pre">degrees</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">mpts</span></code></p></td>
+<td><p>Mean wave period of the total swell component in <code class="docutils literal notranslate"><span class="pre">s</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">swh1</span></code></p></td>
+<td><p>Significant wave height of the first swell component in <code class="docutils literal notranslate"><span class="pre">m</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">mwd1</span></code></p></td>
+<td><p>Mean wave direction of the first swell component in <code class="docutils literal notranslate"><span class="pre">degrees</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">mwp1</span></code></p></td>
+<td><p>Mean wave period of the first swell component in <code class="docutils literal notranslate"><span class="pre">s</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">swh2</span></code></p></td>
+<td><p>Significant wave height of the second swell component in <code class="docutils literal notranslate"><span class="pre">m</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">mwd2</span></code></p></td>
+<td><p>Mean wave direction of the second swell component in <code class="docutils literal notranslate"><span class="pre">degrees</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">mwp2</span></code></p></td>
+<td><p>Mean wave period of the second swell component in <code class="docutils literal notranslate"><span class="pre">s</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">wind</span></code></p></td>
+<td><p>Ten-meter neutral wind speed in <code class="docutils literal notranslate"><span class="pre">m/s</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">10u_wind</span></code></p></td>
+<td><p>Ten-meter eastward neutral wind speed in <code class="docutils literal notranslate"><span class="pre">m/s</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">10v_wind</span></code></p></td>
+<td><p>Ten-meter southward neutral wind speed in <code class="docutils literal notranslate"><span class="pre">m/s</span></code></p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="batch-static-vars">
+<h2><code class="docutils literal notranslate"><span class="pre">Batch.static_vars</span></code><a class="headerlink" href="#batch-static-vars" title="Link to this heading">#</a></h2>
+<p><code class="docutils literal notranslate"><span class="pre">Batch.static_vars</span></code> is a dictionary mapping names of static variables to the
+numerical values of the variables.
+The static variables must be of the form <code class="docutils literal notranslate"><span class="pre">(h,</span> <span class="pre">w)</span></code> where <code class="docutils literal notranslate"><span class="pre">h</span></code> is the number of latitudes
+and <code class="docutils literal notranslate"><span class="pre">w</span></code> the number of longitudes.</p>
+<p>The following static variables are allowed:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Name</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">lsm</span></code></p></td>
+<td><p><a class="reference external" href="https://codes.ecmwf.int/grib/param-db/172">Land-sea mask</a></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">slt</span></code></p></td>
+<td><p><a class="reference external" href="https://codes.ecmwf.int/grib/param-db/43">Soil type</a></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">z</span></code></p></td>
+<td><p>Surface-level geopotential in <code class="docutils literal notranslate"><span class="pre">m^2/s^2</span></code></p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p><a class="reference internal" href="models.html#aurora-air-pollution"><span class="std std-ref">Aurora 0.4° Air Pollution</span></a>
+and <a class="reference internal" href="models.html#aurora-wave"><span class="std std-ref">Aurora 0.25° Wave</span></a> require additional static variables, but these are not
+easy to obtain yourself.
+You need to obtain these from the HuggingFace repository.
+See the description of the models.</p>
+</section>
+<section id="batch-atmos-vars">
+<h2><code class="docutils literal notranslate"><span class="pre">Batch.atmos_vars</span></code><a class="headerlink" href="#batch-atmos-vars" title="Link to this heading">#</a></h2>
+<p><code class="docutils literal notranslate"><span class="pre">Batch.atmos_vars</span></code> is a dictionary mapping names of atmospheric variables to the
+numerical values of the variables.
+The atmospheric variables must be of the form <code class="docutils literal notranslate"><span class="pre">(b,</span> <span class="pre">t,</span> <span class="pre">c,</span> <span class="pre">h,</span> <span class="pre">w)</span></code> where <code class="docutils literal notranslate"><span class="pre">b</span></code> is the batch size,
+<code class="docutils literal notranslate"><span class="pre">t</span></code> the history dimension, <code class="docutils literal notranslate"><span class="pre">c</span></code> the number of pressure levels, <code class="docutils literal notranslate"><span class="pre">h</span></code> the number of latitudes,
+and <code class="docutils literal notranslate"><span class="pre">w</span></code> the number of longitudes.
+All atmospheric variables must contain the same collection of pressure levels in the same order.</p>
+<p>The following atmospheric variables are allowed:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Name</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">t</span></code></p></td>
+<td><p>Temperature in <code class="docutils literal notranslate"><span class="pre">K</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">u</span></code></p></td>
+<td><p>Eastward wind speed in <code class="docutils literal notranslate"><span class="pre">m/s</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">v</span></code></p></td>
+<td><p>Southward wind speed in <code class="docutils literal notranslate"><span class="pre">m/s</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">q</span></code></p></td>
+<td><p>Specific humidity in <code class="docutils literal notranslate"><span class="pre">kg/kg</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">z</span></code></p></td>
+<td><p>Geopotential in <code class="docutils literal notranslate"><span class="pre">m^2/s^2</span></code></p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>For <a class="reference internal" href="models.html#aurora-air-pollution"><span class="std std-ref">Aurora 0.4° Air Pollution</span></a>, the following atmospheric variables are
+also allowed:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Name</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">co</span></code></p></td>
+<td><p>Carbon monoxide in <code class="docutils literal notranslate"><span class="pre">kg/kg</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">no</span></code></p></td>
+<td><p>Nitrogen monoxide in <code class="docutils literal notranslate"><span class="pre">kg/kg</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">no2</span></code></p></td>
+<td><p>Nitrogen dioxide in <code class="docutils literal notranslate"><span class="pre">kg/kg</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">so2</span></code></p></td>
+<td><p>Sulphur dioxide in <code class="docutils literal notranslate"><span class="pre">kg/kg</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">go3</span></code></p></td>
+<td><p>Ozone in <code class="docutils literal notranslate"><span class="pre">kg/kg</span></code></p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="batch-metadata">
+<h2><code class="docutils literal notranslate"><span class="pre">Batch.metadata</span></code><a class="headerlink" href="#batch-metadata" title="Link to this heading">#</a></h2>
+<p><code class="docutils literal notranslate"><span class="pre">Batch.metadata</span></code> must be a <code class="docutils literal notranslate"><span class="pre">Metadata</span></code>, which contains the following fields:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">Metadata.lat</span></code> is the vector of latitudes.
+The latitudes must be <em>decreasing</em>.
+The latitudes can either include both endpoints, like <code class="docutils literal notranslate"><span class="pre">linspace(90,</span> <span class="pre">-90,</span> <span class="pre">721)</span></code>,
+or not include the south pole, like <code class="docutils literal notranslate"><span class="pre">linspace(90,</span> <span class="pre">-90,</span> <span class="pre">721)[:-1]</span></code>.
+For curvilinear grids, this can also be a matrix, in which case the foregoing conditions
+apply to every <em>column</em>.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">Metadata.lon</span></code> is the vector of longitudes.
+The longitudes must be <em>increasing</em>.
+The longitudes must be in the range <code class="docutils literal notranslate"><span class="pre">[0,</span> <span class="pre">360)</span></code>, so they can include zero and cannot include 360.
+For curvilinear grids, this can also be a matrix, in which case the foregoing conditions
+apply to every <em>row</em>.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">Metadata.atmos_levels</span></code> is a <code class="docutils literal notranslate"><span class="pre">tuple</span></code> of the pressure levels of the atmospheric variables in hPa.
+Note that these levels must be in exactly correspond to the order of the atmospheric variables.
+Note also that <code class="docutils literal notranslate"><span class="pre">Metadata.atmos_levels</span></code> should be a <code class="docutils literal notranslate"><span class="pre">tuple</span></code>, not a <code class="docutils literal notranslate"><span class="pre">list</span></code>.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">Metadata.time</span></code> is a <code class="docutils literal notranslate"><span class="pre">tuple</span></code> with, for each batch element, a <code class="docutils literal notranslate"><span class="pre">datetime.datetime</span></code> representing the time of the data.
+If the batch size is one, then this will be a one-element <code class="docutils literal notranslate"><span class="pre">tuple</span></code>, e.g. <code class="docutils literal notranslate"><span class="pre">(datetime(2024,</span> <span class="pre">1,</span> <span class="pre">1,</span> <span class="pre">12,</span> <span class="pre">0),)</span></code>.
+Since all Aurora models require variables for the current <em>and</em> previous step,
+<code class="docutils literal notranslate"><span class="pre">Metadata.time</span></code> corresponds to the time of the <em>current</em> step.
+Specifically, <code class="docutils literal notranslate"><span class="pre">Metadata.time[i]</span></code> corresponds to the time of <code class="docutils literal notranslate"><span class="pre">Batch.surf_vars[i,</span> <span class="pre">-1]</span></code>.</p></li>
+</ul>
+</section>
+<section id="model-output">
+<h2>Model Output<a class="headerlink" href="#model-output" title="Link to this heading">#</a></h2>
+<p>The output of <code class="docutils literal notranslate"><span class="pre">aurora.forward(batch)</span></code> will again be a <code class="docutils literal notranslate"><span class="pre">Batch</span></code>.
+This batch is of exactly the same form, with only one difference:
+the history dimension will have size one.</p>
+</section>
+</section>
+
+    <script type="text/x-thebe-config">
+    {
+        requestKernel: true,
+        binderOptions: {
+            repo: "binder-examples/jupyter-stacks-datascience",
+            ref: "master",
+        },
+        codeMirrorConfig: {
+            theme: "abcdef",
+            mode: "python"
+        },
+        kernelOptions: {
+            name: "python3",
+            path: "./."
+        },
+        predefinedOutput: true
+    }
+    </script>
+    <script>kernelName = 'python3'</script>
+
+                </article>
+              
+
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+    <a class="left-prev"
+       href="usage.html"
+       title="previous page">
+      <i class="fa-solid fa-angle-left"></i>
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">previous</p>
+        <p class="prev-next-title">Usage</p>
+      </div>
+    </a>
+    <a class="right-next"
+       href="models.html"
+       title="next page">
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">next</p>
+        <p class="prev-next-title">Available Models</p>
+      </div>
+      <i class="fa-solid fa-angle-right"></i>
+    </a>
+</div>
+                </footer>
+              
+            </div>
+            
+            
+              
+                <div class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item">
+  <div class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> Contents
+  </div>
+  <nav class="bd-toc-nav page-toc">
+    <ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#overall-structure">Overall Structure</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#batch-surf-vars"><code class="docutils literal notranslate"><span class="pre">Batch.surf_vars</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#batch-static-vars"><code class="docutils literal notranslate"><span class="pre">Batch.static_vars</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#batch-atmos-vars"><code class="docutils literal notranslate"><span class="pre">Batch.atmos_vars</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#batch-metadata"><code class="docutils literal notranslate"><span class="pre">Batch.metadata</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#model-output">Model Output</a></li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+          </div>
+          <footer class="bd-footer-content">
+            
+<div class="bd-footer-content__inner container">
+  
+  <div class="footer-item">
+    
+<p class="component-author">
+By Microsoft Corporation
+</p>
+
+  </div>
+  
+  <div class="footer-item">
+    
+
+  <p class="copyright">
+    
+      © Copyright 2024.
+      <br/>
+    
+  </p>
+
+  </div>
+  
+  <div class="footer-item">
+    
+  </div>
+  
+  <div class="footer-item">
+    
+  </div>
+  
+</div>
+          </footer>
+        
+
+      </main>
+    </div>
+  </div>
+  
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script src="_static/scripts/bootstrap.js?digest=dfe6caa3a7d634c4db9b"></script>
+<script src="_static/scripts/pydata-sphinx-theme.js?digest=dfe6caa3a7d634c4db9b"></script>
+
+  <footer class="bd-footer">
+  </footer>
+  </body>
+</html>

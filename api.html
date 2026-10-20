@@ -1,0 +1,1358 @@
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="./" data-theme="light">
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>Application Programming Interface &#8212; Aurora: A Foundation Model of the Atmosphere</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "light";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "light";
+  </script>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="_static/styles/theme.css?digest=dfe6caa3a7d634c4db9b" rel="stylesheet" />
+<link href="_static/styles/bootstrap.css?digest=dfe6caa3a7d634c4db9b" rel="stylesheet" />
+<link href="_static/styles/pydata-sphinx-theme.css?digest=dfe6caa3a7d634c4db9b" rel="stylesheet" />
+
+  
+  <link href="_static/vendor/fontawesome/6.5.2/css/all.min.css?digest=dfe6caa3a7d634c4db9b" rel="stylesheet" />
+  <link rel="preload" as="font" type="font/woff2" crossorigin href="_static/vendor/fontawesome/6.5.2/webfonts/fa-solid-900.woff2" />
+<link rel="preload" as="font" type="font/woff2" crossorigin href="_static/vendor/fontawesome/6.5.2/webfonts/fa-brands-400.woff2" />
+<link rel="preload" as="font" type="font/woff2" crossorigin href="_static/vendor/fontawesome/6.5.2/webfonts/fa-regular-400.woff2" />
+
+    <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=03e43079" />
+    <link rel="stylesheet" type="text/css" href="_static/styles/sphinx-book-theme.css?v=eba8b062" />
+    <link rel="stylesheet" type="text/css" href="_static/togglebutton.css?v=9c3e77be" />
+    <link rel="stylesheet" type="text/css" href="_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="_static/mystnb.11b39860a7a0cbfd473a3ad8a317855267ff0bd372690045ca344a6b62be495e.css" />
+    <link rel="stylesheet" type="text/css" href="_static/sphinx-thebe.css?v=4fa983c6" />
+    <link rel="stylesheet" type="text/css" href="_static/sphinx-design.min.css?v=95c83b7e" />
+  
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="_static/scripts/bootstrap.js?digest=dfe6caa3a7d634c4db9b" />
+<link rel="preload" as="script" href="_static/scripts/pydata-sphinx-theme.js?digest=dfe6caa3a7d634c4db9b" />
+  <script src="_static/vendor/fontawesome/6.5.2/js/all.min.js?digest=dfe6caa3a7d634c4db9b"></script>
+
+    <script src="_static/documentation_options.js?v=9eb32ce0"></script>
+    <script src="_static/doctools.js?v=9a2dae69"></script>
+    <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="_static/copybutton.js?v=f281be69"></script>
+    <script src="_static/scripts/sphinx-book-theme.js?v=887ef09a"></script>
+    <script>let toggleHintShow = 'Click to show';</script>
+    <script>let toggleHintHide = 'Click to hide';</script>
+    <script>let toggleOpenOnPrint = 'true';</script>
+    <script src="_static/togglebutton.js?v=b8b12719"></script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script src="_static/design-tabs.js?v=f930bc37"></script>
+    <script>const THEBE_JS_URL = "https://unpkg.com/thebe@0.8.2/lib/index.js"; const thebe_selector = ".thebe,.cell"; const thebe_selector_input = "pre"; const thebe_selector_output = ".output, .cell_output"</script>
+    <script async="async" src="_static/sphinx-thebe.js?v=c100c467"></script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>const THEBE_JS_URL = "https://unpkg.com/thebe@0.8.2/lib/index.js"; const thebe_selector = ".thebe,.cell"; const thebe_selector_input = "pre"; const thebe_selector_output = ".output, .cell_output"</script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'api';</script>
+    <link rel="index" title="Index" href="genindex.html" />
+    <link rel="search" title="Search" href="search.html" />
+    <link rel="next" title="Predictions for ERA5" href="example_era5.html" />
+    <link rel="prev" title="Plugin for ECMWF’s ai-models" href="ai_models_plugin.html" />
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  </head>
+  
+  
+  <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="light">
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+
+  
+  <input type="checkbox"
+          class="sidebar-toggle"
+          id="pst-primary-sidebar-checkbox"/>
+  <label class="overlay overlay-primary" for="pst-primary-sidebar-checkbox"></label>
+  
+  <input type="checkbox"
+          class="sidebar-toggle"
+          id="pst-secondary-sidebar-checkbox"/>
+  <label class="overlay overlay-secondary" for="pst-secondary-sidebar-checkbox"></label>
+  
+  <div class="search-button__wrapper">
+    <div class="search-button__overlay"></div>
+    <div class="search-button__search-container">
+<form class="bd-search d-flex align-items-center"
+      action="search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         id="search-input"
+         placeholder="Search this book..."
+         aria-label="Search this book..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form></div>
+  </div>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <div class="bd-sidebar-primary bd-sidebar">
+        
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+    
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="intro.html">
+  
+  
+  
+  
+  
+    
+    
+    
+    <img src="_static/aurora.jpg" class="logo__image only-light" alt="Aurora: A Foundation Model of the Atmosphere - Home"/>
+    <script>document.write(`<img src="_static/aurora.jpg" class="logo__image only-dark" alt="Aurora: A Foundation Model of the Atmosphere - Home"/>`);</script>
+  
+  
+</a></div>
+        <div class="sidebar-primary-item">
+
+ <script>
+ document.write(`
+   <button class="btn search-button-field search-button__button" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <i class="fa-solid fa-magnifying-glass"></i>
+    <span class="search-button__default-text">Search</span>
+    <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+   </button>
+ `);
+ </script></div>
+        <div class="sidebar-primary-item"><nav class="bd-links bd-docs-nav" aria-label="Main">
+    <div class="bd-toc-item navbar-nav active">
+        
+        <ul class="nav bd-sidenav bd-sidenav__home-link">
+            <li class="toctree-l1">
+                <a class="reference internal" href="intro.html">
+                    Aurora: A Foundation Model for the Earth System
+                </a>
+            </li>
+        </ul>
+        <p aria-level="2" class="caption" role="heading"><span class="caption-text">Main Usage</span></p>
+<ul class="current nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="usage.html">Usage</a></li>
+<li class="toctree-l1"><a class="reference internal" href="batch.html">Form of a Batch</a></li>
+<li class="toctree-l1"><a class="reference internal" href="models.html">Available Models</a></li>
+<li class="toctree-l1"><a class="reference internal" href="tracking.html">Tropical Cyclone Tracking</a></li>
+<li class="toctree-l1"><a class="reference internal" href="beware.html">Beware!</a></li>
+<li class="toctree-l1"><a class="reference internal" href="finetuning.html">Fine-Tuning</a></li>
+<li class="toctree-l1"><a class="reference internal" href="finetuning_ozone.html">Case Study: Fine-Tuning Aurora Air Pollution on Ozone</a></li>
+<li class="toctree-l1"><a class="reference internal" href="ai_models_plugin.html">Plugin for ECMWF’s <code class="docutils literal notranslate"><span class="pre">ai-models</span></code></a></li>
+<li class="toctree-l1 current active"><a class="current reference internal" href="#">Application Programming Interface</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Examples</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="example_era5.html">Predictions for ERA5</a></li>
+<li class="toctree-l1"><a class="reference internal" href="example_hres_t0.html">Predictions for HRES T0</a></li>
+<li class="toctree-l1"><a class="reference internal" href="example_hres_0.1.html">Predictions for HRES at 0.1 Degrees</a></li>
+<li class="toctree-l1"><a class="reference internal" href="example_cams.html">Predictions for Air Pollution</a></li>
+<li class="toctree-l1"><a class="reference internal" href="example_wave.html">Predictions for Ocean Waves</a></li>
+<li class="toctree-l1"><a class="reference internal" href="example_tc_tracking.html">Track Predictions for Typhoon Nanmadol</a></li>
+<li class="toctree-l1"><a class="reference internal" href="example_v1p5.html">Predictions with Aurora 1.5</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Foundry</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="foundry/intro.html">Aurora on Azure AI Foundry</a></li>
+<li class="toctree-l1"><a class="reference internal" href="foundry/submission.html">Submitting Predictions</a></li>
+<li class="toctree-l1"><a class="reference internal" href="foundry/demo_hres_t0.html">Demo: HRES T0</a></li>
+<li class="toctree-l1"><a class="reference internal" href="foundry/demo_v1p5.html">Demo: Aurora 1.5 on Foundry</a></li>
+<li class="toctree-l1"><a class="reference internal" href="foundry/server.html">Creating an Endpoint</a></li>
+<li class="toctree-l1"><a class="reference internal" href="foundry/api.html">Application Programming Interface</a></li>
+</ul>
+
+    </div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+  </div>
+  
+  <div id="rtd-footer-container"></div>
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+
+<div class="sbt-scroll-pixel-helper"></div>
+
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item"><button class="sidebar-toggle primary-toggle btn btn-sm" title="Toggle primary sidebar" data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <span class="fa-solid fa-bars"></span>
+</button></div>
+      
+    </div>
+  
+  
+    <div class="header-article-items__end">
+      
+        <div class="header-article-item">
+
+<div class="article-header-buttons">
+
+
+
+
+
+<div class="dropdown dropdown-source-buttons">
+  <button class="btn dropdown-toggle" type="button" data-bs-toggle="dropdown" aria-expanded="false" aria-label="Source repositories">
+    <i class="fab fa-github"></i>
+  </button>
+  <ul class="dropdown-menu">
+      
+      
+      
+      <li><a href="https://github.com/microsoft/aurora" target="_blank"
+   class="btn btn-sm btn-source-repository-button dropdown-item"
+   title="Source repository"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fab fa-github"></i>
+  </span>
+<span class="btn__text-container">Repository</span>
+</a>
+</li>
+      
+      
+      
+      
+      <li><a href="https://github.com/microsoft/aurora/issues/new?title=Issue%20on%20page%20%2Fapi.html&body=Your%20issue%20content%20here." target="_blank"
+   class="btn btn-sm btn-source-issues-button dropdown-item"
+   title="Open an issue"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-lightbulb"></i>
+  </span>
+<span class="btn__text-container">Open issue</span>
+</a>
+</li>
+      
+  </ul>
+</div>
+
+
+
+
+
+
+<div class="dropdown dropdown-download-buttons">
+  <button class="btn dropdown-toggle" type="button" data-bs-toggle="dropdown" aria-expanded="false" aria-label="Download this page">
+    <i class="fas fa-download"></i>
+  </button>
+  <ul class="dropdown-menu">
+      
+      
+      
+      <li><a href="_sources/api.rst" target="_blank"
+   class="btn btn-sm btn-download-source-button dropdown-item"
+   title="Download source file"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-file"></i>
+  </span>
+<span class="btn__text-container">.rst</span>
+</a>
+</li>
+      
+      
+      
+      
+      <li>
+<button onclick="window.print()"
+  class="btn btn-sm btn-download-pdf-button dropdown-item"
+  title="Print to PDF"
+  data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-file-pdf"></i>
+  </span>
+<span class="btn__text-container">.pdf</span>
+</button>
+</li>
+      
+  </ul>
+</div>
+
+
+
+
+<button onclick="toggleFullScreen()"
+  class="btn btn-sm btn-fullscreen-button"
+  title="Fullscreen mode"
+  data-bs-placement="bottom" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-expand"></i>
+  </span>
+
+</button>
+
+
+
+<script>
+document.write(`
+  <button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button" title="light/dark" aria-label="light/dark" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <i class="theme-switch fa-solid fa-sun fa-lg" data-mode="light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg" data-mode="dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"></i>
+  </button>
+`);
+</script>
+
+
+<script>
+document.write(`
+  <button class="btn btn-sm pst-navbar-icon search-button search-button__button" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <i class="fa-solid fa-magnifying-glass fa-lg"></i>
+  </button>
+`);
+</script>
+<button class="sidebar-toggle secondary-toggle btn btn-sm" title="Toggle secondary sidebar" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <span class="fa-solid fa-list"></span>
+</button>
+</div></div>
+      
+    </div>
+  
+</div>
+</div>
+              
+              
+
+<div id="jb-print-docs-body" class="onlyprint">
+    <h1>Application Programming Interface</h1>
+    <!-- Table of contents -->
+    <div id="print-main-content">
+        <div id="jb-print-toc">
+            
+            <div>
+                <h2> Contents </h2>
+            </div>
+            <nav aria-label="Page">
+                <ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#batch">Batch</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.Batch"><code class="docutils literal notranslate"><span class="pre">Batch</span></code></a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.Batch.crop"><code class="docutils literal notranslate"><span class="pre">Batch.crop()</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.Batch.from_netcdf"><code class="docutils literal notranslate"><span class="pre">Batch.from_netcdf()</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.Batch.normalise"><code class="docutils literal notranslate"><span class="pre">Batch.normalise()</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.Batch.regrid"><code class="docutils literal notranslate"><span class="pre">Batch.regrid()</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.Batch.spatial_shape"><code class="docutils literal notranslate"><span class="pre">Batch.spatial_shape</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.Batch.to"><code class="docutils literal notranslate"><span class="pre">Batch.to()</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.Batch.to_netcdf"><code class="docutils literal notranslate"><span class="pre">Batch.to_netcdf()</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.Batch.type"><code class="docutils literal notranslate"><span class="pre">Batch.type()</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.Batch.unnormalise"><code class="docutils literal notranslate"><span class="pre">Batch.unnormalise()</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.Metadata"><code class="docutils literal notranslate"><span class="pre">Metadata</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#roll-outs">Roll-Outs</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.rollout"><code class="docutils literal notranslate"><span class="pre">rollout</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tropical-cyclone-tracking">Tropical Cyclone Tracking</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.Tracker"><code class="docutils literal notranslate"><span class="pre">Tracker</span></code></a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.Tracker.results"><code class="docutils literal notranslate"><span class="pre">Tracker.results()</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.Tracker.step"><code class="docutils literal notranslate"><span class="pre">Tracker.step()</span></code></a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#models">Models</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.Aurora"><code class="docutils literal notranslate"><span class="pre">Aurora</span></code></a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.Aurora.__init__"><code class="docutils literal notranslate"><span class="pre">Aurora.__init__()</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.Aurora.adapt_checkpoint_max_history_size"><code class="docutils literal notranslate"><span class="pre">Aurora.adapt_checkpoint_max_history_size()</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.Aurora.apply_rollout_input_clipping"><code class="docutils literal notranslate"><span class="pre">Aurora.apply_rollout_input_clipping()</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.Aurora.batch_transform_hook"><code class="docutils literal notranslate"><span class="pre">Aurora.batch_transform_hook()</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.Aurora.configure_activation_checkpointing"><code class="docutils literal notranslate"><span class="pre">Aurora.configure_activation_checkpointing()</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.Aurora.default_checkpoint_name"><code class="docutils literal notranslate"><span class="pre">Aurora.default_checkpoint_name</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.Aurora.default_checkpoint_repo"><code class="docutils literal notranslate"><span class="pre">Aurora.default_checkpoint_repo</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.Aurora.default_checkpoint_revision"><code class="docutils literal notranslate"><span class="pre">Aurora.default_checkpoint_revision</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.Aurora.forward"><code class="docutils literal notranslate"><span class="pre">Aurora.forward()</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.Aurora.load_checkpoint"><code class="docutils literal notranslate"><span class="pre">Aurora.load_checkpoint()</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.Aurora.load_checkpoint_local"><code class="docutils literal notranslate"><span class="pre">Aurora.load_checkpoint_local()</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.Aurora.reset_noise"><code class="docutils literal notranslate"><span class="pre">Aurora.reset_noise()</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.Aurora.set_noise_accumulation"><code class="docutils literal notranslate"><span class="pre">Aurora.set_noise_accumulation()</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.AuroraPretrained"><code class="docutils literal notranslate"><span class="pre">AuroraPretrained</span></code></a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.AuroraPretrained.default_checkpoint_name"><code class="docutils literal notranslate"><span class="pre">AuroraPretrained.default_checkpoint_name</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.AuroraPretrained.default_checkpoint_revision"><code class="docutils literal notranslate"><span class="pre">AuroraPretrained.default_checkpoint_revision</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.AuroraSmallPretrained"><code class="docutils literal notranslate"><span class="pre">AuroraSmallPretrained</span></code></a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.AuroraSmallPretrained.default_checkpoint_name"><code class="docutils literal notranslate"><span class="pre">AuroraSmallPretrained.default_checkpoint_name</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.AuroraSmallPretrained.default_checkpoint_revision"><code class="docutils literal notranslate"><span class="pre">AuroraSmallPretrained.default_checkpoint_revision</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.Aurora12hPretrained"><code class="docutils literal notranslate"><span class="pre">Aurora12hPretrained</span></code></a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.Aurora12hPretrained.default_checkpoint_name"><code class="docutils literal notranslate"><span class="pre">Aurora12hPretrained.default_checkpoint_name</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.Aurora12hPretrained.default_checkpoint_revision"><code class="docutils literal notranslate"><span class="pre">Aurora12hPretrained.default_checkpoint_revision</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.AuroraHighRes"><code class="docutils literal notranslate"><span class="pre">AuroraHighRes</span></code></a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.AuroraHighRes.default_checkpoint_name"><code class="docutils literal notranslate"><span class="pre">AuroraHighRes.default_checkpoint_name</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.AuroraHighRes.default_checkpoint_revision"><code class="docutils literal notranslate"><span class="pre">AuroraHighRes.default_checkpoint_revision</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.AuroraAirPollution"><code class="docutils literal notranslate"><span class="pre">AuroraAirPollution</span></code></a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.AuroraAirPollution.default_checkpoint_name"><code class="docutils literal notranslate"><span class="pre">AuroraAirPollution.default_checkpoint_name</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.AuroraAirPollution.default_checkpoint_revision"><code class="docutils literal notranslate"><span class="pre">AuroraAirPollution.default_checkpoint_revision</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.AuroraWave"><code class="docutils literal notranslate"><span class="pre">AuroraWave</span></code></a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.AuroraWave.batch_transform_hook"><code class="docutils literal notranslate"><span class="pre">AuroraWave.batch_transform_hook()</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.AuroraWave.default_checkpoint_name"><code class="docutils literal notranslate"><span class="pre">AuroraWave.default_checkpoint_name</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.AuroraWave.default_checkpoint_revision"><code class="docutils literal notranslate"><span class="pre">AuroraWave.default_checkpoint_revision</span></code></a></li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+            </nav>
+        </div>
+    </div>
+</div>
+
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <section id="application-programming-interface">
+<h1>Application Programming Interface<a class="headerlink" href="#application-programming-interface" title="Link to this heading">#</a></h1>
+<section id="batch">
+<h2>Batch<a class="headerlink" href="#batch" title="Link to this heading">#</a></h2>
+<dl class="py class">
+<dt class="sig sig-object py" id="aurora.Batch">
+<em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">aurora.</span></span><span class="sig-name descname"><span class="pre">Batch</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">surf_vars</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">dict</span><span class="p"><span class="pre">[</span></span><span class="pre">str</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="pre">Tensor</span><span class="p"><span class="pre">]</span></span></span></em>, <em class="sig-param"><span class="n"><span class="pre">static_vars</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">dict</span><span class="p"><span class="pre">[</span></span><span class="pre">str</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="pre">Tensor</span><span class="p"><span class="pre">]</span></span></span></em>, <em class="sig-param"><span class="n"><span class="pre">atmos_vars</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">dict</span><span class="p"><span class="pre">[</span></span><span class="pre">str</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="pre">Tensor</span><span class="p"><span class="pre">]</span></span></span></em>, <em class="sig-param"><span class="n"><span class="pre">metadata</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference internal" href="#aurora.Metadata" title="aurora.batch.Metadata"><span class="pre">Metadata</span></a></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/aurora/batch.html#Batch"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#aurora.Batch" title="Link to this definition">#</a></dt>
+<dd><p>A batch of data.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>surf_vars</strong> (dict[str, <code class="xref py py-class docutils literal notranslate"><span class="pre">torch.Tensor</span></code>]) – Surface-level variables with shape
+<cite>(b, t, h, w)</cite>.</p></li>
+<li><p><strong>static_vars</strong> (dict[str, <code class="xref py py-class docutils literal notranslate"><span class="pre">torch.Tensor</span></code>]) – Static variables with shape <cite>(h, w)</cite>.</p></li>
+<li><p><strong>atmos_vars</strong> (dict[str, <code class="xref py py-class docutils literal notranslate"><span class="pre">torch.Tensor</span></code>]) – Atmospheric variables with shape
+<cite>(b, t, c, h, w)</cite>.</p></li>
+<li><p><strong>metadata</strong> (<a class="reference internal" href="#aurora.Metadata" title="aurora.Metadata"><code class="xref py py-class docutils literal notranslate"><span class="pre">Metadata</span></code></a>) – Metadata associated to this batch.</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py method">
+<dt class="sig sig-object py" id="aurora.Batch.crop">
+<span class="sig-name descname"><span class="pre">crop</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">patch_size</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span></span></em><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><a class="reference internal" href="#aurora.Batch" title="aurora.batch.Batch"><span class="pre">Batch</span></a></span></span><a class="reference internal" href="_modules/aurora/batch.html#Batch.crop"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#aurora.Batch.crop" title="Link to this definition">#</a></dt>
+<dd><p>Crop the variables in the batch to patch size <cite>patch_size</cite>.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="aurora.Batch.from_netcdf">
+<em class="property"><span class="pre">classmethod</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">from_netcdf</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">path</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">str</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">Path</span></span></em><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><a class="reference internal" href="#aurora.Batch" title="aurora.batch.Batch"><span class="pre">Batch</span></a></span></span><a class="reference internal" href="_modules/aurora/batch.html#Batch.from_netcdf"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#aurora.Batch.from_netcdf" title="Link to this definition">#</a></dt>
+<dd><p>Load a batch from a file.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="aurora.Batch.normalise">
+<span class="sig-name descname"><span class="pre">normalise</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">surf_stats</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">dict</span><span class="p"><span class="pre">[</span></span><span class="pre">str</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="pre">tuple</span><span class="p"><span class="pre">[</span></span><span class="pre">float</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="pre">float</span><span class="p"><span class="pre">]</span></span><span class="p"><span class="pre">]</span></span></span></em><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><a class="reference internal" href="#aurora.Batch" title="aurora.batch.Batch"><span class="pre">Batch</span></a></span></span><a class="reference internal" href="_modules/aurora/batch.html#Batch.normalise"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#aurora.Batch.normalise" title="Link to this definition">#</a></dt>
+<dd><p>Normalise all variables in the batch.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>surf_stats</strong> (<em>dict</em><em>[</em><em>str</em><em>, </em><em>tuple</em><em>[</em><em>float</em><em>, </em><em>float</em><em>]</em><em>]</em>) – For these surface-level variables, adjust
+the normalisation to the given tuple consisting of a new location and scale.</p>
+</dd>
+<dt class="field-even">Returns<span class="colon">:</span></dt>
+<dd class="field-even"><p>Normalised batch.</p>
+</dd>
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><a class="reference internal" href="#aurora.Batch" title="aurora.Batch"><code class="xref py py-class docutils literal notranslate"><span class="pre">Batch</span></code></a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="aurora.Batch.regrid">
+<span class="sig-name descname"><span class="pre">regrid</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">res</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">float</span></span></em><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><a class="reference internal" href="#aurora.Batch" title="aurora.batch.Batch"><span class="pre">Batch</span></a></span></span><a class="reference internal" href="_modules/aurora/batch.html#Batch.regrid"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#aurora.Batch.regrid" title="Link to this definition">#</a></dt>
+<dd><p>Regrid the batch to a <cite>res</cite> degrees resolution.</p>
+<p>This results in <cite>float32</cite> data on the CPU.</p>
+<p>This function is not optimised for either speed or accuracy. Use at your own risk.</p>
+</dd></dl>
+
+<dl class="py property">
+<dt class="sig sig-object py" id="aurora.Batch.spatial_shape">
+<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">spatial_shape</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">tuple</span><span class="p"><span class="pre">[</span></span><span class="pre">int</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="pre">int</span><span class="p"><span class="pre">]</span></span></em><a class="headerlink" href="#aurora.Batch.spatial_shape" title="Link to this definition">#</a></dt>
+<dd><p>Get the spatial shape from an arbitrary surface-level variable.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="aurora.Batch.to">
+<span class="sig-name descname"><span class="pre">to</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">device</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">str</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">device</span></span></em><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><a class="reference internal" href="#aurora.Batch" title="aurora.batch.Batch"><span class="pre">Batch</span></a></span></span><a class="reference internal" href="_modules/aurora/batch.html#Batch.to"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#aurora.Batch.to" title="Link to this definition">#</a></dt>
+<dd><p>Move the batch to another device.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="aurora.Batch.to_netcdf">
+<span class="sig-name descname"><span class="pre">to_netcdf</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">path</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">str</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">Path</span></span></em><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">None</span></span></span><a class="reference internal" href="_modules/aurora/batch.html#Batch.to_netcdf"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#aurora.Batch.to_netcdf" title="Link to this definition">#</a></dt>
+<dd><p>Write the batch to a file.</p>
+<p>This requires <cite>xarray</cite> and <cite>netcdf4</cite> to be installed.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="aurora.Batch.type">
+<span class="sig-name descname"><span class="pre">type</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">t</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">type</span></span></em><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><a class="reference internal" href="#aurora.Batch" title="aurora.batch.Batch"><span class="pre">Batch</span></a></span></span><a class="reference internal" href="_modules/aurora/batch.html#Batch.type"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#aurora.Batch.type" title="Link to this definition">#</a></dt>
+<dd><p>Convert everything to type <cite>t</cite>.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="aurora.Batch.unnormalise">
+<span class="sig-name descname"><span class="pre">unnormalise</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">surf_stats</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">dict</span><span class="p"><span class="pre">[</span></span><span class="pre">str</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="pre">tuple</span><span class="p"><span class="pre">[</span></span><span class="pre">float</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="pre">float</span><span class="p"><span class="pre">]</span></span><span class="p"><span class="pre">]</span></span></span></em><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><a class="reference internal" href="#aurora.Batch" title="aurora.batch.Batch"><span class="pre">Batch</span></a></span></span><a class="reference internal" href="_modules/aurora/batch.html#Batch.unnormalise"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#aurora.Batch.unnormalise" title="Link to this definition">#</a></dt>
+<dd><p>Unnormalise all variables in the batch.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>surf_stats</strong> (<em>dict</em><em>[</em><em>str</em><em>, </em><em>tuple</em><em>[</em><em>float</em><em>, </em><em>float</em><em>]</em><em>]</em>) – For these surface-level variables, adjust
+the normalisation to the given tuple consisting of a new location and scale.</p>
+</dd>
+<dt class="field-even">Returns<span class="colon">:</span></dt>
+<dd class="field-even"><p>Unnormalised batch.</p>
+</dd>
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><a class="reference internal" href="#aurora.Batch" title="aurora.Batch"><code class="xref py py-class docutils literal notranslate"><span class="pre">Batch</span></code></a></p>
+</dd>
+</dl>
+</dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="aurora.Metadata">
+<em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">aurora.</span></span><span class="sig-name descname"><span class="pre">Metadata</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">lat</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Tensor</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">lon</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Tensor</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">time</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">tuple</span><span class="p"><span class="pre">[</span></span><span class="pre">datetime</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="p"><span class="pre">...</span></span><span class="p"><span class="pre">]</span></span></span></em>, <em class="sig-param"><span class="n"><span class="pre">atmos_levels</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">tuple</span><span class="p"><span class="pre">[</span></span><span class="pre">int</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">float</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="p"><span class="pre">...</span></span><span class="p"><span class="pre">]</span></span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rollout_step</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">0</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/aurora/batch.html#Metadata"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#aurora.Metadata" title="Link to this definition">#</a></dt>
+<dd><p>Metadata in a batch.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>lat</strong> (<code class="xref py py-class docutils literal notranslate"><span class="pre">torch.Tensor</span></code>) – Latitudes.</p></li>
+<li><p><strong>lon</strong> (<code class="xref py py-class docutils literal notranslate"><span class="pre">torch.Tensor</span></code>) – Longitudes.</p></li>
+<li><p><strong>time</strong> (<em>tuple</em><em>[</em><em>datetime</em><em>, </em><em>...</em><em>]</em>) – For every batch element, the time.</p></li>
+<li><p><strong>atmos_levels</strong> (<em>tuple</em><em>[</em><em>int</em><em> | </em><em>float</em><em>, </em><em>...</em><em>]</em>) – Pressure levels for the atmospheric variables in
+hPa.</p></li>
+<li><p><strong>rollout_step</strong> (<em>int</em><em>, </em><em>optional</em>) – How many roll-out steps were used to produce this prediction.
+If equal to <cite>0</cite>, which is the default, then this means that this is not a prediction,
+but actual data. This field is automatically populated by the model and used to use a
+separate LoRA for every roll-out step. Generally, you are safe to ignore this field.</p></li>
+</ul>
+</dd>
+</dl>
+</dd></dl>
+
+</section>
+<section id="roll-outs">
+<h2>Roll-Outs<a class="headerlink" href="#roll-outs" title="Link to this heading">#</a></h2>
+<dl class="py class">
+<dt class="sig sig-object py" id="aurora.rollout">
+<em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">aurora.</span></span><span class="sig-name descname"><span class="pre">rollout</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">model</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference internal" href="#aurora.Aurora" title="aurora.model.aurora.Aurora"><span class="pre">Aurora</span></a></span></em>, <em class="sig-param"><span class="n"><span class="pre">batch</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference internal" href="#aurora.Batch" title="aurora.batch.Batch"><span class="pre">Batch</span></a></span></em>, <em class="sig-param"><span class="n"><span class="pre">steps</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">fine_lead_times</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Sequence</span><span class="p"><span class="pre">[</span></span><span class="pre">float</span><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">use_noise_accumulation</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">True</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">apply_rollout_input_clipping</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">True</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/aurora/rollout.html#rollout"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#aurora.rollout" title="Link to this definition">#</a></dt>
+<dd><p>Perform a roll-out to make long-term predictions.</p>
+<p>For Aurora models prior to Aurora 1.5, the rollout is straightforward: iteratively make a
+prediction based on inputs, then feed that prediction back as the new input for the next step.
+Aurora 1.5 introduces support for variable lead times, which enables sub-stepping within each
+main step. When <cite>fine_lead_times</cite> is provided, the model will produce predictions at each of the
+specified lead times within each main step, all of which are initialised from the same previous
+step and thus do not autoregress onto each other. We do require that the last <cite>fine_lead_time</cite>
+be the same as the model time step so we can construct proper next inputs. For instance, if
+specifying <cite>fine_lead_times = [3, 6]</cite> for a model with a 6-hour time step, the model will
+produce predictions at +3 and +6 hours, but only the +6 hour prediction will be fed back as
+input to continue the rollout.</p>
+<p>Aurora 1.5 Ensemble also introduces stochasticity. When <cite>use_noise_accumulation</cite> is <cite>True</cite>,
+noise will be continuously accumulated across both fine and major steps, introducing an auto-
+correlation between noise samples for more continuous predictions. Conveniently, setting the
+number of accumulation steps to the same length as <cite>fine_lead_times</cite> ensures the noise is
+effectively new between each major step, which matches the training regimen.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>model</strong> (<a class="reference internal" href="#aurora.Aurora" title="aurora.Aurora"><code class="xref py py-class docutils literal notranslate"><span class="pre">aurora.Aurora</span></code></a>) – The model to roll out.</p></li>
+<li><p><strong>batch</strong> (<a class="reference internal" href="#aurora.Batch" title="aurora.Batch"><code class="xref py py-class docutils literal notranslate"><span class="pre">aurora.Batch</span></code></a>) – The batch to start the roll-out from.</p></li>
+<li><p><strong>steps</strong> (<em>int</em>) – The number of main roll-out steps.  Each step advances the
+forecast by the model’s base time-step (typically 6 hours).</p></li>
+<li><p><strong>fine_lead_times</strong> (<em>sequence</em><em> of </em><em>float</em><em>, </em><em>optional</em>) – Sub-step lead times in hours to iterate
+within each main step. These sub-steps are all initialised from the previous main step
+and thus do not autoregress onto each other. For example, <cite>[1, 2, 3, 4, 5, 6]</cite> produces
+predictions at every hour. The <em>last</em> entry should equal the model’s base time-step
+and is the one that advances the autoregressive state. Requires
+<cite>model.variable_lead_time == True</cite>. When <cite>None</cite> (default), no sub-stepping is performed
+and behaviour is unchanged from the original <cite>rollout</cite>.</p></li>
+<li><p><strong>use_noise_accumulation</strong> (<em>bool</em>) – Whether to enable noise accumulation when the model is
+stochastic and sub-stepping. This enables smoother transitions between <cite>fine_lead_time</cite>
+intermediate steps. It is intended to continue caching across fine and major steps to
+optimise smoothness across all lead times in the forecast. Has no effect when
+<cite>fine_lead_times</cite> is <cite>None</cite>. Default: <cite>True</cite>.</p></li>
+<li><p><strong>apply_rollout_input_clipping</strong> (<em>bool</em>) – Whether to apply the model’s input clipping during
+roll-out. This is typically desirable to prevent unrealistic predictions from being fed
+back into the model during roll-out, but may be undesirable if the model was not trained
+with clipping and the user wants to preserve the raw model predictions for analysis.
+Default: <cite>True</cite>.</p></li>
+</ul>
+</dd>
+<dt class="field-even">Yields<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference internal" href="#aurora.Batch" title="aurora.Batch"><code class="xref py py-class docutils literal notranslate"><span class="pre">aurora.Batch</span></code></a> – The prediction after every (sub-)step.</p>
+</dd>
+</dl>
+</dd></dl>
+
+</section>
+<section id="tropical-cyclone-tracking">
+<h2>Tropical Cyclone Tracking<a class="headerlink" href="#tropical-cyclone-tracking" title="Link to this heading">#</a></h2>
+<dl class="py class">
+<dt class="sig sig-object py" id="aurora.Tracker">
+<em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">aurora.</span></span><span class="sig-name descname"><span class="pre">Tracker</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">init_lat</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">float</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">init_lon</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">float</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">init_time</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">datetime</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/aurora/tracker.html#Tracker"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#aurora.Tracker" title="Link to this definition">#</a></dt>
+<dd><p>Simple tropical cyclone tracker.</p>
+<p>This algorithm was originally designed and implemented by Anna Allen. This particular
+implementation is by Wessel Bruinsma and features various improvements over the original design.</p>
+<dl class="py method">
+<dt class="sig sig-object py" id="aurora.Tracker.results">
+<span class="sig-name descname"><span class="pre">results</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">DataFrame</span></span></span><a class="reference internal" href="_modules/aurora/tracker.html#Tracker.results"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#aurora.Tracker.results" title="Link to this definition">#</a></dt>
+<dd><p>Assemble the track into a convenient DataFrame.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="aurora.Tracker.step">
+<span class="sig-name descname"><span class="pre">step</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">batch</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference internal" href="#aurora.Batch" title="aurora.batch.Batch"><span class="pre">Batch</span></a></span></em><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">None</span></span></span><a class="reference internal" href="_modules/aurora/tracker.html#Tracker.step"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#aurora.Tracker.step" title="Link to this definition">#</a></dt>
+<dd><p>Track the next step.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>batch</strong> (<a class="reference internal" href="#aurora.Batch" title="aurora.Batch"><code class="xref py py-class docutils literal notranslate"><span class="pre">aurora.Batch</span></code></a>) – Prediction.</p>
+</dd>
+</dl>
+</dd></dl>
+
+</dd></dl>
+
+</section>
+<section id="models">
+<h2>Models<a class="headerlink" href="#models" title="Link to this heading">#</a></h2>
+<dl class="py class">
+<dt class="sig sig-object py" id="aurora.Aurora">
+<em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">aurora.</span></span><span class="sig-name descname"><span class="pre">Aurora</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="o"><span class="pre">*</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">surf_vars</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">tuple</span><span class="p"><span class="pre">[</span></span><span class="pre">str</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="p"><span class="pre">...</span></span><span class="p"><span class="pre">]</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">('2t',</span> <span class="pre">'10u',</span> <span class="pre">'10v',</span> <span class="pre">'msl')</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">static_vars</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">tuple</span><span class="p"><span class="pre">[</span></span><span class="pre">str</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="p"><span class="pre">...</span></span><span class="p"><span class="pre">]</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">('lsm',</span> <span class="pre">'z',</span> <span class="pre">'slt')</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">atmos_vars</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">tuple</span><span class="p"><span class="pre">[</span></span><span class="pre">str</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="p"><span class="pre">...</span></span><span class="p"><span class="pre">]</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">('z',</span> <span class="pre">'u',</span> <span class="pre">'v',</span> <span class="pre">'t',</span> <span class="pre">'q')</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">window_size</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">tuple</span><span class="p"><span class="pre">[</span></span><span class="pre">int</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="pre">int</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="pre">int</span><span class="p"><span class="pre">]</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">(2,</span> <span class="pre">6,</span> <span class="pre">12)</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">encoder_depths</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">tuple</span><span class="p"><span class="pre">[</span></span><span class="pre">int</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="p"><span class="pre">...</span></span><span class="p"><span class="pre">]</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">(6,</span> <span class="pre">10,</span> <span class="pre">8)</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">encoder_num_heads</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">tuple</span><span class="p"><span class="pre">[</span></span><span class="pre">int</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="p"><span class="pre">...</span></span><span class="p"><span class="pre">]</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">(8,</span> <span class="pre">16,</span> <span class="pre">32)</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">decoder_depths</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">tuple</span><span class="p"><span class="pre">[</span></span><span class="pre">int</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="p"><span class="pre">...</span></span><span class="p"><span class="pre">]</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">(8,</span> <span class="pre">10,</span> <span class="pre">6)</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">decoder_num_heads</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">tuple</span><span class="p"><span class="pre">[</span></span><span class="pre">int</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="p"><span class="pre">...</span></span><span class="p"><span class="pre">]</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">(32,</span> <span class="pre">16,</span> <span class="pre">8)</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">latent_levels</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">4</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">patch_size</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">4</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">embed_dim</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">512</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_heads</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">16</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">mlp_ratio</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">float</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">4.0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">drop_path</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">float</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">0.0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">drop_rate</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">float</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">0.0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">enc_depth</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">1</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">dec_depth</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">1</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">dec_mlp_ratio</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">float</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">2.0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">perceiver_ln_eps</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">float</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">1e-05</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">max_history_size</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">2</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">timestep</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">timedelta</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">datetime.timedelta(seconds=21600)</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">stabilise_level_agg</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">use_lora</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">True</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">lora_steps</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">40</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">lora_mode</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Literal</span><span class="p"><span class="pre">[</span></span><span class="s"><span class="pre">'single'</span></span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="s"><span class="pre">'from_second'</span></span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="s"><span class="pre">'all'</span></span><span class="p"><span class="pre">]</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">'single'</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">surf_stats</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">dict</span><span class="p"><span class="pre">[</span></span><span class="pre">str</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="pre">tuple</span><span class="p"><span class="pre">[</span></span><span class="pre">float</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="pre">float</span><span class="p"><span class="pre">]</span></span><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">autocast</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">autocast_dtype</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">dtype</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">torch.bfloat16</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">bf16_mode</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">use_fp16_safe_attention</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">level_condition</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">tuple</span><span class="p"><span class="pre">[</span></span><span class="pre">int</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">float</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="p"><span class="pre">...</span></span><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">dynamic_vars</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">atmos_static_vars</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">separate_perceiver</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">tuple</span><span class="p"><span class="pre">[</span></span><span class="pre">str</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="p"><span class="pre">...</span></span><span class="p"><span class="pre">]</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">()</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">modulation_heads</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">tuple</span><span class="p"><span class="pre">[</span></span><span class="pre">str</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="p"><span class="pre">...</span></span><span class="p"><span class="pre">]</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">()</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">positive_surf_vars</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">tuple</span><span class="p"><span class="pre">[</span></span><span class="pre">str</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="p"><span class="pre">...</span></span><span class="p"><span class="pre">]</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">()</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">positive_atmos_vars</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">tuple</span><span class="p"><span class="pre">[</span></span><span class="pre">str</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="p"><span class="pre">...</span></span><span class="p"><span class="pre">]</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">()</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">clamp_at_first_step</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">simulate_indexing_bug</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">stochastic</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">use_updated_lead_time_embedding</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">variable_lead_time</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rollout_input_clipping</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">dict</span><span class="p"><span class="pre">[</span></span><span class="pre">str</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="pre">dict</span><span class="p"><span class="pre">[</span></span><span class="pre">str</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="pre">float</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span><span class="p"><span class="pre">]</span></span><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">output_only_surf_vars</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">tuple</span><span class="p"><span class="pre">[</span></span><span class="pre">str</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="p"><span class="pre">...</span></span><span class="p"><span class="pre">]</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">()</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">output_only_atmos_vars</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">tuple</span><span class="p"><span class="pre">[</span></span><span class="pre">str</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="p"><span class="pre">...</span></span><span class="p"><span class="pre">]</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">()</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/aurora/model/aurora.html#Aurora"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#aurora.Aurora" title="Link to this definition">#</a></dt>
+<dd><p>The Aurora model.</p>
+<p>Defaults to the 1.3 B parameter configuration.</p>
+<p>Also supports ensemble forecasts.</p>
+<dl class="py method">
+<dt class="sig sig-object py" id="aurora.Aurora.__init__">
+<span class="sig-name descname"><span class="pre">__init__</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="o"><span class="pre">*</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">surf_vars</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">tuple</span><span class="p"><span class="pre">[</span></span><span class="pre">str</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="p"><span class="pre">...</span></span><span class="p"><span class="pre">]</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">('2t',</span> <span class="pre">'10u',</span> <span class="pre">'10v',</span> <span class="pre">'msl')</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">static_vars</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">tuple</span><span class="p"><span class="pre">[</span></span><span class="pre">str</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="p"><span class="pre">...</span></span><span class="p"><span class="pre">]</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">('lsm',</span> <span class="pre">'z',</span> <span class="pre">'slt')</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">atmos_vars</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">tuple</span><span class="p"><span class="pre">[</span></span><span class="pre">str</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="p"><span class="pre">...</span></span><span class="p"><span class="pre">]</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">('z',</span> <span class="pre">'u',</span> <span class="pre">'v',</span> <span class="pre">'t',</span> <span class="pre">'q')</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">window_size</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">tuple</span><span class="p"><span class="pre">[</span></span><span class="pre">int</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="pre">int</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="pre">int</span><span class="p"><span class="pre">]</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">(2,</span> <span class="pre">6,</span> <span class="pre">12)</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">encoder_depths</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">tuple</span><span class="p"><span class="pre">[</span></span><span class="pre">int</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="p"><span class="pre">...</span></span><span class="p"><span class="pre">]</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">(6,</span> <span class="pre">10,</span> <span class="pre">8)</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">encoder_num_heads</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">tuple</span><span class="p"><span class="pre">[</span></span><span class="pre">int</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="p"><span class="pre">...</span></span><span class="p"><span class="pre">]</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">(8,</span> <span class="pre">16,</span> <span class="pre">32)</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">decoder_depths</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">tuple</span><span class="p"><span class="pre">[</span></span><span class="pre">int</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="p"><span class="pre">...</span></span><span class="p"><span class="pre">]</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">(8,</span> <span class="pre">10,</span> <span class="pre">6)</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">decoder_num_heads</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">tuple</span><span class="p"><span class="pre">[</span></span><span class="pre">int</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="p"><span class="pre">...</span></span><span class="p"><span class="pre">]</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">(32,</span> <span class="pre">16,</span> <span class="pre">8)</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">latent_levels</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">4</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">patch_size</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">4</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">embed_dim</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">512</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_heads</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">16</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">mlp_ratio</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">float</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">4.0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">drop_path</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">float</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">0.0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">drop_rate</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">float</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">0.0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">enc_depth</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">1</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">dec_depth</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">1</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">dec_mlp_ratio</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">float</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">2.0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">perceiver_ln_eps</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">float</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">1e-05</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">max_history_size</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">2</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">timestep</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">timedelta</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">datetime.timedelta(seconds=21600)</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">stabilise_level_agg</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">use_lora</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">True</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">lora_steps</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">40</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">lora_mode</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Literal</span><span class="p"><span class="pre">[</span></span><span class="s"><span class="pre">'single'</span></span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="s"><span class="pre">'from_second'</span></span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="s"><span class="pre">'all'</span></span><span class="p"><span class="pre">]</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">'single'</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">surf_stats</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">dict</span><span class="p"><span class="pre">[</span></span><span class="pre">str</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="pre">tuple</span><span class="p"><span class="pre">[</span></span><span class="pre">float</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="pre">float</span><span class="p"><span class="pre">]</span></span><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">autocast</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">autocast_dtype</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">dtype</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">torch.bfloat16</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">bf16_mode</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">use_fp16_safe_attention</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">level_condition</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">tuple</span><span class="p"><span class="pre">[</span></span><span class="pre">int</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">float</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="p"><span class="pre">...</span></span><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">dynamic_vars</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">atmos_static_vars</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">separate_perceiver</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">tuple</span><span class="p"><span class="pre">[</span></span><span class="pre">str</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="p"><span class="pre">...</span></span><span class="p"><span class="pre">]</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">()</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">modulation_heads</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">tuple</span><span class="p"><span class="pre">[</span></span><span class="pre">str</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="p"><span class="pre">...</span></span><span class="p"><span class="pre">]</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">()</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">positive_surf_vars</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">tuple</span><span class="p"><span class="pre">[</span></span><span class="pre">str</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="p"><span class="pre">...</span></span><span class="p"><span class="pre">]</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">()</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">positive_atmos_vars</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">tuple</span><span class="p"><span class="pre">[</span></span><span class="pre">str</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="p"><span class="pre">...</span></span><span class="p"><span class="pre">]</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">()</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">clamp_at_first_step</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">simulate_indexing_bug</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">stochastic</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">use_updated_lead_time_embedding</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">variable_lead_time</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rollout_input_clipping</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">dict</span><span class="p"><span class="pre">[</span></span><span class="pre">str</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="pre">dict</span><span class="p"><span class="pre">[</span></span><span class="pre">str</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="pre">float</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span><span class="p"><span class="pre">]</span></span><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">output_only_surf_vars</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">tuple</span><span class="p"><span class="pre">[</span></span><span class="pre">str</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="p"><span class="pre">...</span></span><span class="p"><span class="pre">]</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">()</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">output_only_atmos_vars</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">tuple</span><span class="p"><span class="pre">[</span></span><span class="pre">str</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="p"><span class="pre">...</span></span><span class="p"><span class="pre">]</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">()</span></span></em><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">None</span></span></span><a class="reference internal" href="_modules/aurora/model/aurora.html#Aurora.__init__"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#aurora.Aurora.__init__" title="Link to this definition">#</a></dt>
+<dd><p>Construct an instance of the model.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>surf_vars</strong> (<em>tuple</em><em>[</em><em>str</em><em>, </em><em>...</em><em>]</em><em>, </em><em>optional</em>) – All surface-level variables supported by the
+model.</p></li>
+<li><p><strong>static_vars</strong> (<em>tuple</em><em>[</em><em>str</em><em>, </em><em>...</em><em>]</em><em>, </em><em>optional</em>) – All static variables supported by the
+model.</p></li>
+<li><p><strong>atmos_vars</strong> (<em>tuple</em><em>[</em><em>str</em><em>, </em><em>...</em><em>]</em><em>, </em><em>optional</em>) – All atmospheric variables supported by the
+model.</p></li>
+<li><p><strong>window_size</strong> (<em>tuple</em><em>[</em><em>int</em><em>, </em><em>int</em><em>, </em><em>int</em><em>]</em><em>, </em><em>optional</em>) – Vertical height, height, and width of the
+window of the underlying Swin transformer.</p></li>
+<li><p><strong>encoder_depths</strong> (<em>tuple</em><em>[</em><em>int</em><em>, </em><em>...</em><em>]</em><em>, </em><em>optional</em>) – Number of blocks in each encoder layer.</p></li>
+<li><p><strong>encoder_num_heads</strong> (<em>tuple</em><em>[</em><em>int</em><em>, </em><em>...</em><em>]</em><em>, </em><em>optional</em>) – Number of attention heads in each encoder
+layer. The dimensionality doubles after every layer. To keep the dimensionality of
+every head constant, you want to double the number of heads after every layer. The
+dimensionality of attention head of the first layer is determined by <cite>embed_dim</cite>
+divided by the value here. For all cases except one, this is equal to <cite>64</cite>.</p></li>
+<li><p><strong>decoder_depths</strong> (<em>tuple</em><em>[</em><em>int</em><em>, </em><em>...</em><em>]</em><em>, </em><em>optional</em>) – Number of blocks in each decoder layer.
+Generally, you want this to be the reversal of <cite>encoder_depths</cite>.</p></li>
+<li><p><strong>decoder_num_heads</strong> (<em>tuple</em><em>[</em><em>int</em><em>, </em><em>...</em><em>]</em><em>, </em><em>optional</em>) – Number of attention heads in each decoder
+layer. Generally, you want this to be the reversal of <cite>encoder_num_heads</cite>.</p></li>
+<li><p><strong>latent_levels</strong> (<em>int</em><em>, </em><em>optional</em>) – Number of latent pressure levels.</p></li>
+<li><p><strong>patch_size</strong> (<em>int</em><em>, </em><em>optional</em>) – Patch size.</p></li>
+<li><p><strong>embed_dim</strong> (<em>int</em><em>, </em><em>optional</em>) – Patch embedding dimension.</p></li>
+<li><p><strong>num_heads</strong> (<em>int</em><em>, </em><em>optional</em>) – Number of attention heads in the aggregation and
+deaggregation blocks. The dimensionality of these attention heads will be equal to
+<cite>embed_dim</cite> divided by this value.</p></li>
+<li><p><strong>mlp_ratio</strong> (<em>float</em><em>, </em><em>optional</em>) – Hidden dim. to embedding dim. ratio for MLPs.</p></li>
+<li><p><strong>drop_rate</strong> (<em>float</em><em>, </em><em>optional</em>) – Drop-out rate.</p></li>
+<li><p><strong>drop_path</strong> (<em>float</em><em>, </em><em>optional</em>) – Drop-path rate.</p></li>
+<li><p><strong>enc_depth</strong> (<em>int</em><em>, </em><em>optional</em>) – Number of Perceiver blocks in the encoder.</p></li>
+<li><p><strong>dec_depth</strong> (<em>int</em><em>, </em><em>optional</em>) – Number of Perceiver blocks in the decoder.</p></li>
+<li><p><strong>dec_mlp_ratio</strong> (<em>float</em><em>, </em><em>optional</em>) – Hidden dim. to embedding dim. ratio for MLPs in the
+decoder. The embedding dimensionality here is different, which is why this is a
+separate parameter.</p></li>
+<li><p><strong>perceiver_ln_eps</strong> (<em>float</em><em>, </em><em>optional</em>) – Epsilon in the perceiver layer norm. layers. Used
+to stabilise the model.</p></li>
+<li><p><strong>max_history_size</strong> (<em>int</em><em>, </em><em>optional</em>) – Maximum number of history steps. You can load
+checkpoints with a smaller <cite>max_history_size</cite>, but you cannot load checkpoints
+with a larger <cite>max_history_size</cite>.</p></li>
+<li><p><strong>timestep</strong> (<em>timedelta</em><em>, </em><em>optional</em>) – Timestep of the model. Defaults to 6 hours.</p></li>
+<li><p><strong>stabilise_level_agg</strong> (<em>bool</em><em>, </em><em>optional</em>) – Stabilise the level aggregation by inserting an
+additional layer normalisation. Defaults to <cite>False</cite>.</p></li>
+<li><p><strong>use_lora</strong> (<em>bool</em><em>, </em><em>optional</em>) – Use LoRA adaptation.</p></li>
+<li><p><strong>lora_steps</strong> (<em>int</em><em>, </em><em>optional</em>) – Use different LoRA adaptation for the first so-many roll-out
+steps.</p></li>
+<li><p><strong>lora_mode</strong> (<em>str</em><em>, </em><em>optional</em>) – LoRA mode. <cite>“single”</cite> uses the same LoRA for all roll-out
+steps, <cite>“from_second”</cite> uses the same LoRA from the second roll-out step on, and
+<cite>“all”</cite> uses a different LoRA for every roll-out step. Defaults to <cite>“single”</cite>.</p></li>
+<li><p><strong>surf_stats</strong> (<em>dict</em><em>[</em><em>str</em><em>, </em><em>tuple</em><em>[</em><em>float</em><em>, </em><em>float</em><em>]</em><em>]</em><em>, </em><em>optional</em>) – For these surface-level
+variables, adjust the normalisation to the given tuple consisting of a new location
+and scale.</p></li>
+<li><p><strong>autocast</strong> (<em>bool</em><em>, </em><em>optional</em>) – To reduce memory usage, <cite>torch.autocast</cite> only the backbone
+to a lower-precision dtype. This is critical to enable fine-tuning.</p></li>
+<li><p><strong>autocast_dtype</strong> (<em>torch.dtype</em><em>, </em><em>optional</em>) – Data type to use when <cite>autocast</cite> is enabled.
+Defaults to <cite>torch.bfloat16</cite>.</p></li>
+<li><p><strong>use_fp16_safe_attention</strong> (<em>bool</em><em>, </em><em>optional</em>) – Replace
+<code class="xref py py-func docutils literal notranslate"><span class="pre">torch.nn.functional.scaled_dot_product_attention()</span></code> with a manual
+implementation that clamps intermediate values to prevent float16 overflow.
+Recommended when running with <cite>autocast_dtype=torch.float16</cite>.
+Defaults to <cite>False</cite>.</p></li>
+<li><p><strong>level_condition</strong> (<em>tuple</em><em>[</em><em>int</em><em> | </em><em>float</em><em>, </em><em>...</em><em>]</em><em>, </em><em>optional</em>) – Make the patch embeddings dependent
+on pressure level. If you want to enable this feature, provide a tuple of all
+possible pressure levels.</p></li>
+<li><p><strong>dynamic_vars</strong> (<em>bool</em><em>, </em><em>optional</em>) – Use dynamically generated static variables, like time
+of day. Defaults to <cite>False</cite>.</p></li>
+<li><p><strong>atmos_static_vars</strong> (<em>bool</em><em>, </em><em>optional</em>) – Also concatenate the static variables to the
+atmospheric variables. Defaults to <cite>False</cite>.</p></li>
+<li><p><strong>separate_perceiver</strong> (<em>tuple</em><em>[</em><em>str</em><em>, </em><em>...</em><em>]</em><em>, </em><em>optional</em>) – In the decoder, use a separate Perceiver
+for specific atmospheric variables. This can be helpful at fine-tuning time to deal
+with variables that have a significantly different behaviour. If you want to enable
+this features, set this to the collection of variables that should be run on a
+separate Perceiver.</p></li>
+<li><p><strong>modulation_heads</strong> (<em>tuple</em><em>[</em><em>str</em><em>, </em><em>...</em><em>]</em><em>, </em><em>optional</em>) – Names of every variable for which to
+enable an additional head, the so-called modulation head, that can be used to
+predict the difference.</p></li>
+<li><p><strong>positive_surf_vars</strong> (<em>tuple</em><em>[</em><em>str</em><em>, </em><em>...</em><em>]</em><em>, </em><em>optional</em>) – Mark these surface-level variables as
+positive. Clamp them before running them through the encoder, and also clamp them
+when autoregressively rolling out the model. The variables are not clamped for the
+first roll-out step.</p></li>
+<li><p><strong>positive_atmos_vars</strong> (<em>tuple</em><em>[</em><em>str</em><em>, </em><em>...</em><em>]</em><em>, </em><em>optional</em>) – Mark these atmospheric variables as
+positive. Clamp them before running them through the encoder, and also clamp them
+when autoregressively rolling out the model. The variables are not clamped for the
+first roll-out step.</p></li>
+<li><p><strong>clamp_at_first_step</strong> (<em>bool</em><em>, </em><em>optional</em>) – Clamp the positive variables for the first
+roll-out step. Should only be used for inference. Defaults to <cite>False</cite>.</p></li>
+<li><p><strong>simulate_indexing_bug</strong> (<em>bool</em><em>, </em><em>optional</em>) – Simulate an indexing bug that’s present for the
+air pollution version of Aurora. This is necessary to obtain numerical equivalence
+to the original implementation. Defaults to <cite>False</cite>.</p></li>
+<li><p><strong>stochastic</strong> (<em>bool</em><em>, </em><em>optional</em>) – If <cite>True</cite>, enable stochastic mode with noise injection.
+Defaults to <cite>False</cite>.</p></li>
+<li><p><strong>use_updated_lead_time_embedding</strong> (<em>bool</em><em>, </em><em>optional</em>) – Whether to use the updated lead time
+embedding with a minimum wavelength of 2 hours. Defaults to <cite>False</cite>.</p></li>
+<li><p><strong>variable_lead_time</strong> (<em>bool</em><em>, </em><em>optional</em>) – If <cite>True</cite>, use per-sample lead times passed
+via the <cite>lead_times</cite> argument to <cite>forward</cite> (a tensor of shape <cite>(batch,)</cite> in
+hours) instead of the fixed <cite>timestep</cite>. When enabled, <cite>lead_times</cite> must be
+provided.
+Defaults to <cite>False</cite>.</p></li>
+<li><p><strong>rollout_input_clipping</strong> (<em>dict</em><em>[</em><em>str</em><em>, </em><em>dict</em><em>[</em><em>str</em><em>, </em><em>float</em><em>]</em><em>]</em><em>, </em><em>optional</em>) – Per-variable
+clipping bounds applied to predictions during autoregressive rollout before they
+become the next input. Keys are variable names (must match <cite>surf_vars</cite> or
+<cite>atmos_vars</cite>). Values are dicts with optional <cite>“min”</cite> and <cite>“max”</cite> keys.
+Example: <cite>{“tcc”: {“min”: 0, “max”: 1}}</cite>. Defaults to <cite>None</cite>.</p></li>
+<li><p><strong>output_only_surf_vars</strong> (<em>tuple</em><em>[</em><em>str</em><em>, </em><em>...</em><em>]</em><em>, </em><em>optional</em>) – Surface-level variables that the
+model predicts but that are not present in real input data. These will be
+zero-padded in the input batch during rollout. Defaults to <cite>()</cite>.</p></li>
+<li><p><strong>output_only_atmos_vars</strong> (<em>tuple</em><em>[</em><em>str</em><em>, </em><em>...</em><em>]</em><em>, </em><em>optional</em>) – Atmospheric variables that the
+model predicts but that are not present in real input data. These will be
+zero-padded in the input batch during rollout. Defaults to <cite>()</cite>.</p></li>
+</ul>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="aurora.Aurora.adapt_checkpoint_max_history_size">
+<span class="sig-name descname"><span class="pre">adapt_checkpoint_max_history_size</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">checkpoint</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">dict</span><span class="p"><span class="pre">[</span></span><span class="pre">str</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="pre">Tensor</span><span class="p"><span class="pre">]</span></span></span></em><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">None</span></span></span><a class="reference internal" href="_modules/aurora/model/aurora.html#Aurora.adapt_checkpoint_max_history_size"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#aurora.Aurora.adapt_checkpoint_max_history_size" title="Link to this definition">#</a></dt>
+<dd><p>Adapt a checkpoint with smaller <cite>max_history_size</cite> to a model with a larger
+<cite>max_history_size</cite> than the current model.</p>
+<p>If a checkpoint was trained with a larger <cite>max_history_size</cite> than the current model,
+this function will assert fail to prevent loading the checkpoint. This is to
+prevent loading a checkpoint which will likely cause the checkpoint to degrade its
+performance.</p>
+<p>This implementation copies weights from the checkpoint to the model and fills zeros
+for the new history width dimension. It mutates <cite>checkpoint</cite>.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="aurora.Aurora.apply_rollout_input_clipping">
+<span class="sig-name descname"><span class="pre">apply_rollout_input_clipping</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">pred</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference internal" href="#aurora.Batch" title="aurora.batch.Batch"><span class="pre">Batch</span></a></span></em><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><a class="reference internal" href="#aurora.Batch" title="aurora.batch.Batch"><span class="pre">Batch</span></a></span></span><a class="reference internal" href="_modules/aurora/model/aurora.html#Aurora.apply_rollout_input_clipping"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#aurora.Aurora.apply_rollout_input_clipping" title="Link to this definition">#</a></dt>
+<dd><p>Clamp specified variables according to <cite>rollout_input_clipping</cite>.</p>
+<p>This is intended to be called during autoregressive rollout <em>before</em> feeding a prediction
+back as input, so that the unclipped prediction remains available for loss computation
+during training. To minimize any other changes to the data flow from models prior to V1p5,
+this is not called automatically in <a class="reference internal" href="#aurora.Aurora.forward" title="aurora.Aurora.forward"><code class="xref py py-meth docutils literal notranslate"><span class="pre">forward()</span></code></a>.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="aurora.Aurora.batch_transform_hook">
+<span class="sig-name descname"><span class="pre">batch_transform_hook</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">batch</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference internal" href="#aurora.Batch" title="aurora.batch.Batch"><span class="pre">Batch</span></a></span></em><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><a class="reference internal" href="#aurora.Batch" title="aurora.batch.Batch"><span class="pre">Batch</span></a></span></span><a class="reference internal" href="_modules/aurora/model/aurora.html#Aurora.batch_transform_hook"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#aurora.Aurora.batch_transform_hook" title="Link to this definition">#</a></dt>
+<dd><p>Transform the batch right after receiving it and before normalisation.</p>
+<p>This function should be idempotent.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="aurora.Aurora.configure_activation_checkpointing">
+<span class="sig-name descname"><span class="pre">configure_activation_checkpointing</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">module_names</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">tuple</span><span class="p"><span class="pre">[</span></span><span class="pre">str</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="p"><span class="pre">...</span></span><span class="p"><span class="pre">]</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">('Basic3DDecoderLayer',</span> <span class="pre">'Basic3DEncoderLayer',</span> <span class="pre">'LinearPatchReconstruction',</span> <span class="pre">'Perceiver3DDecoder',</span> <span class="pre">'Perceiver3DEncoder',</span> <span class="pre">'Swin3DTransformerBackbone',</span> <span class="pre">'Swin3DTransformerBlock')</span></span></em><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">None</span></span></span><a class="reference internal" href="_modules/aurora/model/aurora.html#Aurora.configure_activation_checkpointing"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#aurora.Aurora.configure_activation_checkpointing" title="Link to this definition">#</a></dt>
+<dd><p>Configure activation checkpointing.</p>
+<p>This is required in order to compute gradients without running out of memory.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>module_names</strong> (<em>tuple</em><em>[</em><em>str</em><em>, </em><em>...</em><em>]</em><em>, </em><em>optional</em>) – Names of the modules to checkpoint
+on.</p>
+</dd>
+<dt class="field-even">Raises<span class="colon">:</span></dt>
+<dd class="field-even"><p><strong>RuntimeError</strong> – If any module specifies in <cite>module_names</cite> was not found and
+    thus could not be checkpointed.</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="aurora.Aurora.default_checkpoint_name">
+<span class="sig-name descname"><span class="pre">default_checkpoint_name</span></span><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'aurora-0.25-finetuned.ckpt'</span></em><a class="headerlink" href="#aurora.Aurora.default_checkpoint_name" title="Link to this definition">#</a></dt>
+<dd><p>Name of the default checkpoint.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>str</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="aurora.Aurora.default_checkpoint_repo">
+<span class="sig-name descname"><span class="pre">default_checkpoint_repo</span></span><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'microsoft/aurora'</span></em><a class="headerlink" href="#aurora.Aurora.default_checkpoint_repo" title="Link to this definition">#</a></dt>
+<dd><p>Name of the HuggingFace repository to load the default checkpoint from.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>str</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="aurora.Aurora.default_checkpoint_revision">
+<span class="sig-name descname"><span class="pre">default_checkpoint_revision</span></span><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'0be7e57c685dac86b78c4a19a3ab149d13c6a3dd'</span></em><a class="headerlink" href="#aurora.Aurora.default_checkpoint_revision" title="Link to this definition">#</a></dt>
+<dd><p>Commit hash of the default checkpoint.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>str</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="aurora.Aurora.forward">
+<span class="sig-name descname"><span class="pre">forward</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">batch</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference internal" href="#aurora.Batch" title="aurora.batch.Batch"><span class="pre">Batch</span></a></span></em>, <em class="sig-param"><span class="n"><span class="pre">lead_times</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Tensor</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><a class="reference internal" href="#aurora.Batch" title="aurora.batch.Batch"><span class="pre">Batch</span></a></span></span><a class="reference internal" href="_modules/aurora/model/aurora.html#Aurora.forward"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#aurora.Aurora.forward" title="Link to this definition">#</a></dt>
+<dd><p>Forward pass.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>batch</strong> (<a class="reference internal" href="#aurora.Batch" title="aurora.Batch"><code class="xref py py-class docutils literal notranslate"><span class="pre">aurora.Batch</span></code></a>) – Batch to run the model on.</p></li>
+<li><p><strong>lead_times</strong> (<code class="xref py py-class docutils literal notranslate"><span class="pre">torch.Tensor</span></code>, optional) – Per-sample lead times of shape
+<cite>(batch,)</cite> in hours. Required when the model was configured with
+<cite>variable_lead_time=True</cite>. Ignored otherwise.</p></li>
+</ul>
+</dd>
+<dt class="field-even">Returns<span class="colon">:</span></dt>
+<dd class="field-even"><p>Prediction for the batch.</p>
+</dd>
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><a class="reference internal" href="#aurora.Batch" title="aurora.Batch"><code class="xref py py-class docutils literal notranslate"><span class="pre">Batch</span></code></a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="aurora.Aurora.load_checkpoint">
+<span class="sig-name descname"><span class="pre">load_checkpoint</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">repo</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">str</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">name</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">str</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">revision</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">str</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">strict</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">True</span></span></em><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">None</span></span></span><a class="reference internal" href="_modules/aurora/model/aurora.html#Aurora.load_checkpoint"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#aurora.Aurora.load_checkpoint" title="Link to this definition">#</a></dt>
+<dd><p>Load a checkpoint from HuggingFace.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>repo</strong> (<em>str</em><em>, </em><em>optional</em>) – Name of the repository of the form <cite>user/repo</cite>.</p></li>
+<li><p><strong>name</strong> (<em>str</em><em>, </em><em>optional</em>) – Path to the checkpoint relative to the root of the repository,
+e.g. <cite>checkpoint.cpkt</cite>.</p></li>
+<li><p><strong>revision</strong> (<em>str</em><em>, </em><em>optional</em>) – Version hash of the Huggingface git repository commit.</p></li>
+<li><p><strong>strict</strong> (<em>bool</em><em>, </em><em>optional</em>) – Error if the model parameters are not exactly equal to the
+parameters in the checkpoint. Defaults to <cite>True</cite>.</p></li>
+</ul>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="aurora.Aurora.load_checkpoint_local">
+<span class="sig-name descname"><span class="pre">load_checkpoint_local</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">path</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">str</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">strict</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">True</span></span></em><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">None</span></span></span><a class="reference internal" href="_modules/aurora/model/aurora.html#Aurora.load_checkpoint_local"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#aurora.Aurora.load_checkpoint_local" title="Link to this definition">#</a></dt>
+<dd><p>Load a checkpoint directly from a file.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>path</strong> (<em>str</em>) – Path to the checkpoint.</p></li>
+<li><p><strong>strict</strong> (<em>bool</em><em>, </em><em>optional</em>) – Error if the model parameters are not exactly equal to the
+parameters in the checkpoint. Defaults to <cite>True</cite>.</p></li>
+</ul>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="aurora.Aurora.reset_noise">
+<span class="sig-name descname"><span class="pre">reset_noise</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">None</span></span></span><a class="reference internal" href="_modules/aurora/model/aurora.html#Aurora.reset_noise"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#aurora.Aurora.reset_noise" title="Link to this definition">#</a></dt>
+<dd><p>Flush the backbone noise cache.</p>
+<p>See <code class="xref py py-meth docutils literal notranslate"><span class="pre">Swin3DTransformerBackbone.reset_noise()</span></code>.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="aurora.Aurora.set_noise_accumulation">
+<span class="sig-name descname"><span class="pre">set_noise_accumulation</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">n</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">0</span></span></em><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">None</span></span></span><a class="reference internal" href="_modules/aurora/model/aurora.html#Aurora.set_noise_accumulation"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#aurora.Aurora.set_noise_accumulation" title="Link to this definition">#</a></dt>
+<dd><p>Enable or disable noise caching in the backbone.</p>
+<p>See <code class="xref py py-meth docutils literal notranslate"><span class="pre">Swin3DTransformerBackbone.set_noise_accumulation()</span></code>.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>n</strong> (<em>int</em>) – Number of steps for noise accumulation. Disables accumulation if <cite>n=0</cite>.</p>
+</dd>
+</dl>
+</dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="aurora.AuroraPretrained">
+<em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">aurora.</span></span><span class="sig-name descname"><span class="pre">AuroraPretrained</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="o"><span class="pre">*</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">use_lora</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">kw_args</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/aurora/model/aurora.html#AuroraPretrained"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#aurora.AuroraPretrained" title="Link to this definition">#</a></dt>
+<dd><p>Pretrained version of Aurora.</p>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="aurora.AuroraPretrained.default_checkpoint_name">
+<span class="sig-name descname"><span class="pre">default_checkpoint_name</span></span><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'aurora-0.25-pretrained.ckpt'</span></em><a class="headerlink" href="#aurora.AuroraPretrained.default_checkpoint_name" title="Link to this definition">#</a></dt>
+<dd><p>Name of the default checkpoint.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>str</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="aurora.AuroraPretrained.default_checkpoint_revision">
+<span class="sig-name descname"><span class="pre">default_checkpoint_revision</span></span><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'0be7e57c685dac86b78c4a19a3ab149d13c6a3dd'</span></em><a class="headerlink" href="#aurora.AuroraPretrained.default_checkpoint_revision" title="Link to this definition">#</a></dt>
+<dd><p>Commit hash of the default checkpoint.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>str</p>
+</dd>
+</dl>
+</dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="aurora.AuroraSmallPretrained">
+<em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">aurora.</span></span><span class="sig-name descname"><span class="pre">AuroraSmallPretrained</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="o"><span class="pre">*</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">encoder_depths</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">tuple</span><span class="p"><span class="pre">[</span></span><span class="pre">int</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="p"><span class="pre">...</span></span><span class="p"><span class="pre">]</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">(2,</span> <span class="pre">6,</span> <span class="pre">2)</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">encoder_num_heads</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">tuple</span><span class="p"><span class="pre">[</span></span><span class="pre">int</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="p"><span class="pre">...</span></span><span class="p"><span class="pre">]</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">(4,</span> <span class="pre">8,</span> <span class="pre">16)</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">decoder_depths</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">tuple</span><span class="p"><span class="pre">[</span></span><span class="pre">int</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="p"><span class="pre">...</span></span><span class="p"><span class="pre">]</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">(2,</span> <span class="pre">6,</span> <span class="pre">2)</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">decoder_num_heads</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">tuple</span><span class="p"><span class="pre">[</span></span><span class="pre">int</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="p"><span class="pre">...</span></span><span class="p"><span class="pre">]</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">(16,</span> <span class="pre">8,</span> <span class="pre">4)</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">embed_dim</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">256</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_heads</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">8</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">use_lora</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">kw_args</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/aurora/model/aurora.html#AuroraSmallPretrained"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#aurora.AuroraSmallPretrained" title="Link to this definition">#</a></dt>
+<dd><p>Small pretrained version of Aurora.</p>
+<p>Should only be used for debugging.</p>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="aurora.AuroraSmallPretrained.default_checkpoint_name">
+<span class="sig-name descname"><span class="pre">default_checkpoint_name</span></span><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'aurora-0.25-small-pretrained.ckpt'</span></em><a class="headerlink" href="#aurora.AuroraSmallPretrained.default_checkpoint_name" title="Link to this definition">#</a></dt>
+<dd><p>Name of the default checkpoint.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>str</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="aurora.AuroraSmallPretrained.default_checkpoint_revision">
+<span class="sig-name descname"><span class="pre">default_checkpoint_revision</span></span><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'0be7e57c685dac86b78c4a19a3ab149d13c6a3dd'</span></em><a class="headerlink" href="#aurora.AuroraSmallPretrained.default_checkpoint_revision" title="Link to this definition">#</a></dt>
+<dd><p>Commit hash of the default checkpoint.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>str</p>
+</dd>
+</dl>
+</dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="aurora.Aurora12hPretrained">
+<em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">aurora.</span></span><span class="sig-name descname"><span class="pre">Aurora12hPretrained</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="o"><span class="pre">*</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">timestep</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">timedelta</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">datetime.timedelta(seconds=43200)</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">use_lora</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">kw_args</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/aurora/model/aurora.html#Aurora12hPretrained"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#aurora.Aurora12hPretrained" title="Link to this definition">#</a></dt>
+<dd><p>Pretrained version of Aurora with time step 12 hours.</p>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="aurora.Aurora12hPretrained.default_checkpoint_name">
+<span class="sig-name descname"><span class="pre">default_checkpoint_name</span></span><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'aurora-0.25-12h-pretrained.ckpt'</span></em><a class="headerlink" href="#aurora.Aurora12hPretrained.default_checkpoint_name" title="Link to this definition">#</a></dt>
+<dd><p>Name of the default checkpoint.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>str</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="aurora.Aurora12hPretrained.default_checkpoint_revision">
+<span class="sig-name descname"><span class="pre">default_checkpoint_revision</span></span><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'15e76e47b65bf4b28fd2246b7b5b951d6e2443b9'</span></em><a class="headerlink" href="#aurora.Aurora12hPretrained.default_checkpoint_revision" title="Link to this definition">#</a></dt>
+<dd><p>Commit hash of the default checkpoint.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>str</p>
+</dd>
+</dl>
+</dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="aurora.AuroraHighRes">
+<em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">aurora.</span></span><span class="sig-name descname"><span class="pre">AuroraHighRes</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="o"><span class="pre">*</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">patch_size</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">10</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">encoder_depths</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">tuple</span><span class="p"><span class="pre">[</span></span><span class="pre">int</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="p"><span class="pre">...</span></span><span class="p"><span class="pre">]</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">(6,</span> <span class="pre">8,</span> <span class="pre">8)</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">decoder_depths</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">tuple</span><span class="p"><span class="pre">[</span></span><span class="pre">int</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="p"><span class="pre">...</span></span><span class="p"><span class="pre">]</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">(8,</span> <span class="pre">8,</span> <span class="pre">6)</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">kw_args</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/aurora/model/aurora.html#AuroraHighRes"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#aurora.AuroraHighRes" title="Link to this definition">#</a></dt>
+<dd><p>High-resolution version of Aurora.</p>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="aurora.AuroraHighRes.default_checkpoint_name">
+<span class="sig-name descname"><span class="pre">default_checkpoint_name</span></span><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'aurora-0.1-finetuned.ckpt'</span></em><a class="headerlink" href="#aurora.AuroraHighRes.default_checkpoint_name" title="Link to this definition">#</a></dt>
+<dd><p>Name of the default checkpoint.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>str</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="aurora.AuroraHighRes.default_checkpoint_revision">
+<span class="sig-name descname"><span class="pre">default_checkpoint_revision</span></span><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'0be7e57c685dac86b78c4a19a3ab149d13c6a3dd'</span></em><a class="headerlink" href="#aurora.AuroraHighRes.default_checkpoint_revision" title="Link to this definition">#</a></dt>
+<dd><p>Commit hash of the default checkpoint.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>str</p>
+</dd>
+</dl>
+</dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="aurora.AuroraAirPollution">
+<em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">aurora.</span></span><span class="sig-name descname"><span class="pre">AuroraAirPollution</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="o"><span class="pre">*</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">surf_vars</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">tuple</span><span class="p"><span class="pre">[</span></span><span class="pre">str</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="p"><span class="pre">...</span></span><span class="p"><span class="pre">]</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">('2t',</span> <span class="pre">'10u',</span> <span class="pre">'10v',</span> <span class="pre">'msl',</span> <span class="pre">'pm1',</span> <span class="pre">'pm2p5',</span> <span class="pre">'pm10',</span> <span class="pre">'tcco',</span> <span class="pre">'tc_no',</span> <span class="pre">'tcno2',</span> <span class="pre">'gtco3',</span> <span class="pre">'tcso2')</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">static_vars</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">tuple</span><span class="p"><span class="pre">[</span></span><span class="pre">str</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="p"><span class="pre">...</span></span><span class="p"><span class="pre">]</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">('lsm',</span> <span class="pre">'z',</span> <span class="pre">'slt',</span> <span class="pre">'static_ammonia',</span> <span class="pre">'static_ammonia_log',</span> <span class="pre">'static_co',</span> <span class="pre">'static_co_log',</span> <span class="pre">'static_nox',</span> <span class="pre">'static_nox_log',</span> <span class="pre">'static_so2',</span> <span class="pre">'static_so2_log')</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">atmos_vars</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">tuple</span><span class="p"><span class="pre">[</span></span><span class="pre">str</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="p"><span class="pre">...</span></span><span class="p"><span class="pre">]</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">('z',</span> <span class="pre">'u',</span> <span class="pre">'v',</span> <span class="pre">'t',</span> <span class="pre">'q',</span> <span class="pre">'co',</span> <span class="pre">'no',</span> <span class="pre">'no2',</span> <span class="pre">'go3',</span> <span class="pre">'so2')</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">patch_size</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">3</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">timestep</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">timedelta</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">datetime.timedelta(seconds=43200)</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">level_condition</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">tuple</span><span class="p"><span class="pre">[</span></span><span class="pre">int</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">float</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="p"><span class="pre">...</span></span><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">(50,</span> <span class="pre">100,</span> <span class="pre">150,</span> <span class="pre">200,</span> <span class="pre">250,</span> <span class="pre">300,</span> <span class="pre">400,</span> <span class="pre">500,</span> <span class="pre">600,</span> <span class="pre">700,</span> <span class="pre">850,</span> <span class="pre">925,</span> <span class="pre">1000)</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">dynamic_vars</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">True</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">atmos_static_vars</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">True</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">separate_perceiver</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">tuple</span><span class="p"><span class="pre">[</span></span><span class="pre">str</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="p"><span class="pre">...</span></span><span class="p"><span class="pre">]</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">('co',</span> <span class="pre">'no',</span> <span class="pre">'no2',</span> <span class="pre">'go3',</span> <span class="pre">'so2')</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">modulation_heads</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">tuple</span><span class="p"><span class="pre">[</span></span><span class="pre">str</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="p"><span class="pre">...</span></span><span class="p"><span class="pre">]</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">('pm1',</span> <span class="pre">'pm2p5',</span> <span class="pre">'pm10',</span> <span class="pre">'co',</span> <span class="pre">'tcco',</span> <span class="pre">'no',</span> <span class="pre">'tc_no',</span> <span class="pre">'no2',</span> <span class="pre">'tcno2',</span> <span class="pre">'so2',</span> <span class="pre">'tcso2',</span> <span class="pre">'go3',</span> <span class="pre">'gtco3')</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">positive_surf_vars</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">tuple</span><span class="p"><span class="pre">[</span></span><span class="pre">str</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="p"><span class="pre">...</span></span><span class="p"><span class="pre">]</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">('pm1',</span> <span class="pre">'pm2p5',</span> <span class="pre">'pm10',</span> <span class="pre">'tcco',</span> <span class="pre">'tc_no',</span> <span class="pre">'tcno2',</span> <span class="pre">'gtco3',</span> <span class="pre">'tcso2')</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">positive_atmos_vars</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">tuple</span><span class="p"><span class="pre">[</span></span><span class="pre">str</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="p"><span class="pre">...</span></span><span class="p"><span class="pre">]</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">('co',</span> <span class="pre">'no',</span> <span class="pre">'no2',</span> <span class="pre">'go3',</span> <span class="pre">'so2')</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">simulate_indexing_bug</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">True</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">kw_args</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/aurora/model/aurora.html#AuroraAirPollution"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#aurora.AuroraAirPollution" title="Link to this definition">#</a></dt>
+<dd><p>Fine-tuned version of Aurora for air pollution.</p>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="aurora.AuroraAirPollution.default_checkpoint_name">
+<span class="sig-name descname"><span class="pre">default_checkpoint_name</span></span><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'aurora-0.4-air-pollution.ckpt'</span></em><a class="headerlink" href="#aurora.AuroraAirPollution.default_checkpoint_name" title="Link to this definition">#</a></dt>
+<dd><p>Name of the default checkpoint.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>str</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="aurora.AuroraAirPollution.default_checkpoint_revision">
+<span class="sig-name descname"><span class="pre">default_checkpoint_revision</span></span><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'1764d5630a53d3d7a7d169ca335236fc343e4bfc'</span></em><a class="headerlink" href="#aurora.AuroraAirPollution.default_checkpoint_revision" title="Link to this definition">#</a></dt>
+<dd><p>Commit hash of the default checkpoint.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>str</p>
+</dd>
+</dl>
+</dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="aurora.AuroraWave">
+<em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">aurora.</span></span><span class="sig-name descname"><span class="pre">AuroraWave</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="o"><span class="pre">*</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">surf_vars</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">tuple</span><span class="p"><span class="pre">[</span></span><span class="pre">str</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="p"><span class="pre">...</span></span><span class="p"><span class="pre">]</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">('2t',</span> <span class="pre">'10u',</span> <span class="pre">'10v',</span> <span class="pre">'msl',</span> <span class="pre">'swh',</span> <span class="pre">'mwd',</span> <span class="pre">'mwp',</span> <span class="pre">'pp1d',</span> <span class="pre">'shww',</span> <span class="pre">'mdww',</span> <span class="pre">'mpww',</span> <span class="pre">'shts',</span> <span class="pre">'mdts',</span> <span class="pre">'mpts',</span> <span class="pre">'swh1',</span> <span class="pre">'mwd1',</span> <span class="pre">'mwp1',</span> <span class="pre">'swh2',</span> <span class="pre">'mwd2',</span> <span class="pre">'mwp2',</span> <span class="pre">'wind',</span> <span class="pre">'10u_wave',</span> <span class="pre">'10v_wave')</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">static_vars</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">tuple</span><span class="p"><span class="pre">[</span></span><span class="pre">str</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="p"><span class="pre">...</span></span><span class="p"><span class="pre">]</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">('lsm',</span> <span class="pre">'z',</span> <span class="pre">'slt',</span> <span class="pre">'wmb',</span> <span class="pre">'lat_mask')</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">lora_mode</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Literal</span><span class="p"><span class="pre">[</span></span><span class="s"><span class="pre">'single'</span></span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="s"><span class="pre">'from_second'</span></span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="s"><span class="pre">'all'</span></span><span class="p"><span class="pre">]</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">'from_second'</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">stabilise_level_agg</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">True</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">density_channel_surf_vars</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">tuple</span><span class="p"><span class="pre">[</span></span><span class="pre">str</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="p"><span class="pre">...</span></span><span class="p"><span class="pre">]</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">('swh',</span> <span class="pre">'mwd',</span> <span class="pre">'mwp',</span> <span class="pre">'pp1d',</span> <span class="pre">'shww',</span> <span class="pre">'mdww',</span> <span class="pre">'mpww',</span> <span class="pre">'shts',</span> <span class="pre">'mdts',</span> <span class="pre">'mpts',</span> <span class="pre">'swh1',</span> <span class="pre">'mwd1',</span> <span class="pre">'mwp1',</span> <span class="pre">'swh2',</span> <span class="pre">'mwd2',</span> <span class="pre">'mwp2',</span> <span class="pre">'wind',</span> <span class="pre">'10u_wave',</span> <span class="pre">'10v_wave')</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">angle_surf_vars</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">tuple</span><span class="p"><span class="pre">[</span></span><span class="pre">str</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="p"><span class="pre">...</span></span><span class="p"><span class="pre">]</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">('mwd',</span> <span class="pre">'mdww',</span> <span class="pre">'mdts',</span> <span class="pre">'mwd1',</span> <span class="pre">'mwd2')</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">kw_args</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/aurora/model/aurora.html#AuroraWave"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#aurora.AuroraWave" title="Link to this definition">#</a></dt>
+<dd><p>Version of Aurora fined-tuned to HRES-WAM ocean wave data.</p>
+<dl class="py method">
+<dt class="sig sig-object py" id="aurora.AuroraWave.batch_transform_hook">
+<span class="sig-name descname"><span class="pre">batch_transform_hook</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">batch</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference internal" href="#aurora.Batch" title="aurora.batch.Batch"><span class="pre">Batch</span></a></span></em><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><a class="reference internal" href="#aurora.Batch" title="aurora.batch.Batch"><span class="pre">Batch</span></a></span></span><a class="reference internal" href="_modules/aurora/model/aurora.html#AuroraWave.batch_transform_hook"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#aurora.AuroraWave.batch_transform_hook" title="Link to this definition">#</a></dt>
+<dd><p>Transform the batch right after receiving it and before normalisation.</p>
+<p>This function should be idempotent.</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="aurora.AuroraWave.default_checkpoint_name">
+<span class="sig-name descname"><span class="pre">default_checkpoint_name</span></span><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'aurora-0.25-wave.ckpt'</span></em><a class="headerlink" href="#aurora.AuroraWave.default_checkpoint_name" title="Link to this definition">#</a></dt>
+<dd><p>Name of the default checkpoint.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>str</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="aurora.AuroraWave.default_checkpoint_revision">
+<span class="sig-name descname"><span class="pre">default_checkpoint_revision</span></span><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'74598e8c65d53a96077c08bb91acdfa5525340c9'</span></em><a class="headerlink" href="#aurora.AuroraWave.default_checkpoint_revision" title="Link to this definition">#</a></dt>
+<dd><p>Commit hash of the default checkpoint.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>str</p>
+</dd>
+</dl>
+</dd></dl>
+
+</dd></dl>
+
+</section>
+</section>
+
+    <script type="text/x-thebe-config">
+    {
+        requestKernel: true,
+        binderOptions: {
+            repo: "binder-examples/jupyter-stacks-datascience",
+            ref: "master",
+        },
+        codeMirrorConfig: {
+            theme: "abcdef",
+            mode: "python"
+        },
+        kernelOptions: {
+            name: "python3",
+            path: "./."
+        },
+        predefinedOutput: true
+    }
+    </script>
+    <script>kernelName = 'python3'</script>
+
+                </article>
+              
+
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+    <a class="left-prev"
+       href="ai_models_plugin.html"
+       title="previous page">
+      <i class="fa-solid fa-angle-left"></i>
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">previous</p>
+        <p class="prev-next-title">Plugin for ECMWF’s <code class="docutils literal notranslate"><span class="pre">ai-models</span></code></p>
+      </div>
+    </a>
+    <a class="right-next"
+       href="example_era5.html"
+       title="next page">
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">next</p>
+        <p class="prev-next-title">Predictions for ERA5</p>
+      </div>
+      <i class="fa-solid fa-angle-right"></i>
+    </a>
+</div>
+                </footer>
+              
+            </div>
+            
+            
+              
+                <div class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item">
+  <div class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> Contents
+  </div>
+  <nav class="bd-toc-nav page-toc">
+    <ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#batch">Batch</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.Batch"><code class="docutils literal notranslate"><span class="pre">Batch</span></code></a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.Batch.crop"><code class="docutils literal notranslate"><span class="pre">Batch.crop()</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.Batch.from_netcdf"><code class="docutils literal notranslate"><span class="pre">Batch.from_netcdf()</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.Batch.normalise"><code class="docutils literal notranslate"><span class="pre">Batch.normalise()</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.Batch.regrid"><code class="docutils literal notranslate"><span class="pre">Batch.regrid()</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.Batch.spatial_shape"><code class="docutils literal notranslate"><span class="pre">Batch.spatial_shape</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.Batch.to"><code class="docutils literal notranslate"><span class="pre">Batch.to()</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.Batch.to_netcdf"><code class="docutils literal notranslate"><span class="pre">Batch.to_netcdf()</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.Batch.type"><code class="docutils literal notranslate"><span class="pre">Batch.type()</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.Batch.unnormalise"><code class="docutils literal notranslate"><span class="pre">Batch.unnormalise()</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.Metadata"><code class="docutils literal notranslate"><span class="pre">Metadata</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#roll-outs">Roll-Outs</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.rollout"><code class="docutils literal notranslate"><span class="pre">rollout</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tropical-cyclone-tracking">Tropical Cyclone Tracking</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.Tracker"><code class="docutils literal notranslate"><span class="pre">Tracker</span></code></a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.Tracker.results"><code class="docutils literal notranslate"><span class="pre">Tracker.results()</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.Tracker.step"><code class="docutils literal notranslate"><span class="pre">Tracker.step()</span></code></a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#models">Models</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.Aurora"><code class="docutils literal notranslate"><span class="pre">Aurora</span></code></a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.Aurora.__init__"><code class="docutils literal notranslate"><span class="pre">Aurora.__init__()</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.Aurora.adapt_checkpoint_max_history_size"><code class="docutils literal notranslate"><span class="pre">Aurora.adapt_checkpoint_max_history_size()</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.Aurora.apply_rollout_input_clipping"><code class="docutils literal notranslate"><span class="pre">Aurora.apply_rollout_input_clipping()</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.Aurora.batch_transform_hook"><code class="docutils literal notranslate"><span class="pre">Aurora.batch_transform_hook()</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.Aurora.configure_activation_checkpointing"><code class="docutils literal notranslate"><span class="pre">Aurora.configure_activation_checkpointing()</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.Aurora.default_checkpoint_name"><code class="docutils literal notranslate"><span class="pre">Aurora.default_checkpoint_name</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.Aurora.default_checkpoint_repo"><code class="docutils literal notranslate"><span class="pre">Aurora.default_checkpoint_repo</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.Aurora.default_checkpoint_revision"><code class="docutils literal notranslate"><span class="pre">Aurora.default_checkpoint_revision</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.Aurora.forward"><code class="docutils literal notranslate"><span class="pre">Aurora.forward()</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.Aurora.load_checkpoint"><code class="docutils literal notranslate"><span class="pre">Aurora.load_checkpoint()</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.Aurora.load_checkpoint_local"><code class="docutils literal notranslate"><span class="pre">Aurora.load_checkpoint_local()</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.Aurora.reset_noise"><code class="docutils literal notranslate"><span class="pre">Aurora.reset_noise()</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.Aurora.set_noise_accumulation"><code class="docutils literal notranslate"><span class="pre">Aurora.set_noise_accumulation()</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.AuroraPretrained"><code class="docutils literal notranslate"><span class="pre">AuroraPretrained</span></code></a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.AuroraPretrained.default_checkpoint_name"><code class="docutils literal notranslate"><span class="pre">AuroraPretrained.default_checkpoint_name</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.AuroraPretrained.default_checkpoint_revision"><code class="docutils literal notranslate"><span class="pre">AuroraPretrained.default_checkpoint_revision</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.AuroraSmallPretrained"><code class="docutils literal notranslate"><span class="pre">AuroraSmallPretrained</span></code></a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.AuroraSmallPretrained.default_checkpoint_name"><code class="docutils literal notranslate"><span class="pre">AuroraSmallPretrained.default_checkpoint_name</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.AuroraSmallPretrained.default_checkpoint_revision"><code class="docutils literal notranslate"><span class="pre">AuroraSmallPretrained.default_checkpoint_revision</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.Aurora12hPretrained"><code class="docutils literal notranslate"><span class="pre">Aurora12hPretrained</span></code></a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.Aurora12hPretrained.default_checkpoint_name"><code class="docutils literal notranslate"><span class="pre">Aurora12hPretrained.default_checkpoint_name</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.Aurora12hPretrained.default_checkpoint_revision"><code class="docutils literal notranslate"><span class="pre">Aurora12hPretrained.default_checkpoint_revision</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.AuroraHighRes"><code class="docutils literal notranslate"><span class="pre">AuroraHighRes</span></code></a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.AuroraHighRes.default_checkpoint_name"><code class="docutils literal notranslate"><span class="pre">AuroraHighRes.default_checkpoint_name</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.AuroraHighRes.default_checkpoint_revision"><code class="docutils literal notranslate"><span class="pre">AuroraHighRes.default_checkpoint_revision</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.AuroraAirPollution"><code class="docutils literal notranslate"><span class="pre">AuroraAirPollution</span></code></a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.AuroraAirPollution.default_checkpoint_name"><code class="docutils literal notranslate"><span class="pre">AuroraAirPollution.default_checkpoint_name</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.AuroraAirPollution.default_checkpoint_revision"><code class="docutils literal notranslate"><span class="pre">AuroraAirPollution.default_checkpoint_revision</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.AuroraWave"><code class="docutils literal notranslate"><span class="pre">AuroraWave</span></code></a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.AuroraWave.batch_transform_hook"><code class="docutils literal notranslate"><span class="pre">AuroraWave.batch_transform_hook()</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.AuroraWave.default_checkpoint_name"><code class="docutils literal notranslate"><span class="pre">AuroraWave.default_checkpoint_name</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#aurora.AuroraWave.default_checkpoint_revision"><code class="docutils literal notranslate"><span class="pre">AuroraWave.default_checkpoint_revision</span></code></a></li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+          </div>
+          <footer class="bd-footer-content">
+            
+<div class="bd-footer-content__inner container">
+  
+  <div class="footer-item">
+    
+<p class="component-author">
+By Microsoft Corporation
+</p>
+
+  </div>
+  
+  <div class="footer-item">
+    
+
+  <p class="copyright">
+    
+      © Copyright 2024.
+      <br/>
+    
+  </p>
+
+  </div>
+  
+  <div class="footer-item">
+    
+  </div>
+  
+  <div class="footer-item">
+    
+  </div>
+  
+</div>
+          </footer>
+        
+
+      </main>
+    </div>
+  </div>
+  
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script src="_static/scripts/bootstrap.js?digest=dfe6caa3a7d634c4db9b"></script>
+<script src="_static/scripts/pydata-sphinx-theme.js?digest=dfe6caa3a7d634c4db9b"></script>
+
+  <footer class="bd-footer">
+  </footer>
+  </body>
+</html>

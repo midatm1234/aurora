@@ -1,0 +1,725 @@
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="./" data-theme="light">
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>Fine-Tuning &#8212; Aurora: A Foundation Model of the Atmosphere</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "light";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "light";
+  </script>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="_static/styles/theme.css?digest=dfe6caa3a7d634c4db9b" rel="stylesheet" />
+<link href="_static/styles/bootstrap.css?digest=dfe6caa3a7d634c4db9b" rel="stylesheet" />
+<link href="_static/styles/pydata-sphinx-theme.css?digest=dfe6caa3a7d634c4db9b" rel="stylesheet" />
+
+  
+  <link href="_static/vendor/fontawesome/6.5.2/css/all.min.css?digest=dfe6caa3a7d634c4db9b" rel="stylesheet" />
+  <link rel="preload" as="font" type="font/woff2" crossorigin href="_static/vendor/fontawesome/6.5.2/webfonts/fa-solid-900.woff2" />
+<link rel="preload" as="font" type="font/woff2" crossorigin href="_static/vendor/fontawesome/6.5.2/webfonts/fa-brands-400.woff2" />
+<link rel="preload" as="font" type="font/woff2" crossorigin href="_static/vendor/fontawesome/6.5.2/webfonts/fa-regular-400.woff2" />
+
+    <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=03e43079" />
+    <link rel="stylesheet" type="text/css" href="_static/styles/sphinx-book-theme.css?v=eba8b062" />
+    <link rel="stylesheet" type="text/css" href="_static/togglebutton.css?v=9c3e77be" />
+    <link rel="stylesheet" type="text/css" href="_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="_static/mystnb.11b39860a7a0cbfd473a3ad8a317855267ff0bd372690045ca344a6b62be495e.css" />
+    <link rel="stylesheet" type="text/css" href="_static/sphinx-thebe.css?v=4fa983c6" />
+    <link rel="stylesheet" type="text/css" href="_static/sphinx-design.min.css?v=95c83b7e" />
+  
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="_static/scripts/bootstrap.js?digest=dfe6caa3a7d634c4db9b" />
+<link rel="preload" as="script" href="_static/scripts/pydata-sphinx-theme.js?digest=dfe6caa3a7d634c4db9b" />
+  <script src="_static/vendor/fontawesome/6.5.2/js/all.min.js?digest=dfe6caa3a7d634c4db9b"></script>
+
+    <script src="_static/documentation_options.js?v=9eb32ce0"></script>
+    <script src="_static/doctools.js?v=9a2dae69"></script>
+    <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="_static/copybutton.js?v=f281be69"></script>
+    <script src="_static/scripts/sphinx-book-theme.js?v=887ef09a"></script>
+    <script>let toggleHintShow = 'Click to show';</script>
+    <script>let toggleHintHide = 'Click to hide';</script>
+    <script>let toggleOpenOnPrint = 'true';</script>
+    <script src="_static/togglebutton.js?v=b8b12719"></script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script src="_static/design-tabs.js?v=f930bc37"></script>
+    <script>const THEBE_JS_URL = "https://unpkg.com/thebe@0.8.2/lib/index.js"; const thebe_selector = ".thebe,.cell"; const thebe_selector_input = "pre"; const thebe_selector_output = ".output, .cell_output"</script>
+    <script async="async" src="_static/sphinx-thebe.js?v=c100c467"></script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>const THEBE_JS_URL = "https://unpkg.com/thebe@0.8.2/lib/index.js"; const thebe_selector = ".thebe,.cell"; const thebe_selector_input = "pre"; const thebe_selector_output = ".output, .cell_output"</script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'finetuning';</script>
+    <link rel="index" title="Index" href="genindex.html" />
+    <link rel="search" title="Search" href="search.html" />
+    <link rel="next" title="Case Study: Fine-Tuning Aurora Air Pollution on Ozone" href="finetuning_ozone.html" />
+    <link rel="prev" title="Beware!" href="beware.html" />
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  </head>
+  
+  
+  <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="light">
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+
+  
+  <input type="checkbox"
+          class="sidebar-toggle"
+          id="pst-primary-sidebar-checkbox"/>
+  <label class="overlay overlay-primary" for="pst-primary-sidebar-checkbox"></label>
+  
+  <input type="checkbox"
+          class="sidebar-toggle"
+          id="pst-secondary-sidebar-checkbox"/>
+  <label class="overlay overlay-secondary" for="pst-secondary-sidebar-checkbox"></label>
+  
+  <div class="search-button__wrapper">
+    <div class="search-button__overlay"></div>
+    <div class="search-button__search-container">
+<form class="bd-search d-flex align-items-center"
+      action="search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         id="search-input"
+         placeholder="Search this book..."
+         aria-label="Search this book..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form></div>
+  </div>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <div class="bd-sidebar-primary bd-sidebar">
+        
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+    
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="intro.html">
+  
+  
+  
+  
+  
+    
+    
+    
+    <img src="_static/aurora.jpg" class="logo__image only-light" alt="Aurora: A Foundation Model of the Atmosphere - Home"/>
+    <script>document.write(`<img src="_static/aurora.jpg" class="logo__image only-dark" alt="Aurora: A Foundation Model of the Atmosphere - Home"/>`);</script>
+  
+  
+</a></div>
+        <div class="sidebar-primary-item">
+
+ <script>
+ document.write(`
+   <button class="btn search-button-field search-button__button" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <i class="fa-solid fa-magnifying-glass"></i>
+    <span class="search-button__default-text">Search</span>
+    <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+   </button>
+ `);
+ </script></div>
+        <div class="sidebar-primary-item"><nav class="bd-links bd-docs-nav" aria-label="Main">
+    <div class="bd-toc-item navbar-nav active">
+        
+        <ul class="nav bd-sidenav bd-sidenav__home-link">
+            <li class="toctree-l1">
+                <a class="reference internal" href="intro.html">
+                    Aurora: A Foundation Model for the Earth System
+                </a>
+            </li>
+        </ul>
+        <p aria-level="2" class="caption" role="heading"><span class="caption-text">Main Usage</span></p>
+<ul class="current nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="usage.html">Usage</a></li>
+<li class="toctree-l1"><a class="reference internal" href="batch.html">Form of a Batch</a></li>
+<li class="toctree-l1"><a class="reference internal" href="models.html">Available Models</a></li>
+<li class="toctree-l1"><a class="reference internal" href="tracking.html">Tropical Cyclone Tracking</a></li>
+<li class="toctree-l1"><a class="reference internal" href="beware.html">Beware!</a></li>
+<li class="toctree-l1 current active"><a class="current reference internal" href="#">Fine-Tuning</a></li>
+<li class="toctree-l1"><a class="reference internal" href="finetuning_ozone.html">Case Study: Fine-Tuning Aurora Air Pollution on Ozone</a></li>
+<li class="toctree-l1"><a class="reference internal" href="ai_models_plugin.html">Plugin for ECMWF’s <code class="docutils literal notranslate"><span class="pre">ai-models</span></code></a></li>
+<li class="toctree-l1"><a class="reference internal" href="api.html">Application Programming Interface</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Examples</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="example_era5.html">Predictions for ERA5</a></li>
+<li class="toctree-l1"><a class="reference internal" href="example_hres_t0.html">Predictions for HRES T0</a></li>
+<li class="toctree-l1"><a class="reference internal" href="example_hres_0.1.html">Predictions for HRES at 0.1 Degrees</a></li>
+<li class="toctree-l1"><a class="reference internal" href="example_cams.html">Predictions for Air Pollution</a></li>
+<li class="toctree-l1"><a class="reference internal" href="example_wave.html">Predictions for Ocean Waves</a></li>
+<li class="toctree-l1"><a class="reference internal" href="example_tc_tracking.html">Track Predictions for Typhoon Nanmadol</a></li>
+<li class="toctree-l1"><a class="reference internal" href="example_v1p5.html">Predictions with Aurora 1.5</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Foundry</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="foundry/intro.html">Aurora on Azure AI Foundry</a></li>
+<li class="toctree-l1"><a class="reference internal" href="foundry/submission.html">Submitting Predictions</a></li>
+<li class="toctree-l1"><a class="reference internal" href="foundry/demo_hres_t0.html">Demo: HRES T0</a></li>
+<li class="toctree-l1"><a class="reference internal" href="foundry/demo_v1p5.html">Demo: Aurora 1.5 on Foundry</a></li>
+<li class="toctree-l1"><a class="reference internal" href="foundry/server.html">Creating an Endpoint</a></li>
+<li class="toctree-l1"><a class="reference internal" href="foundry/api.html">Application Programming Interface</a></li>
+</ul>
+
+    </div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+  </div>
+  
+  <div id="rtd-footer-container"></div>
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+
+<div class="sbt-scroll-pixel-helper"></div>
+
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item"><button class="sidebar-toggle primary-toggle btn btn-sm" title="Toggle primary sidebar" data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <span class="fa-solid fa-bars"></span>
+</button></div>
+      
+    </div>
+  
+  
+    <div class="header-article-items__end">
+      
+        <div class="header-article-item">
+
+<div class="article-header-buttons">
+
+
+
+
+
+<div class="dropdown dropdown-source-buttons">
+  <button class="btn dropdown-toggle" type="button" data-bs-toggle="dropdown" aria-expanded="false" aria-label="Source repositories">
+    <i class="fab fa-github"></i>
+  </button>
+  <ul class="dropdown-menu">
+      
+      
+      
+      <li><a href="https://github.com/microsoft/aurora" target="_blank"
+   class="btn btn-sm btn-source-repository-button dropdown-item"
+   title="Source repository"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fab fa-github"></i>
+  </span>
+<span class="btn__text-container">Repository</span>
+</a>
+</li>
+      
+      
+      
+      
+      <li><a href="https://github.com/microsoft/aurora/issues/new?title=Issue%20on%20page%20%2Ffinetuning.html&body=Your%20issue%20content%20here." target="_blank"
+   class="btn btn-sm btn-source-issues-button dropdown-item"
+   title="Open an issue"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-lightbulb"></i>
+  </span>
+<span class="btn__text-container">Open issue</span>
+</a>
+</li>
+      
+  </ul>
+</div>
+
+
+
+
+
+
+<div class="dropdown dropdown-download-buttons">
+  <button class="btn dropdown-toggle" type="button" data-bs-toggle="dropdown" aria-expanded="false" aria-label="Download this page">
+    <i class="fas fa-download"></i>
+  </button>
+  <ul class="dropdown-menu">
+      
+      
+      
+      <li><a href="_sources/finetuning.md" target="_blank"
+   class="btn btn-sm btn-download-source-button dropdown-item"
+   title="Download source file"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-file"></i>
+  </span>
+<span class="btn__text-container">.md</span>
+</a>
+</li>
+      
+      
+      
+      
+      <li>
+<button onclick="window.print()"
+  class="btn btn-sm btn-download-pdf-button dropdown-item"
+  title="Print to PDF"
+  data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-file-pdf"></i>
+  </span>
+<span class="btn__text-container">.pdf</span>
+</button>
+</li>
+      
+  </ul>
+</div>
+
+
+
+
+<button onclick="toggleFullScreen()"
+  class="btn btn-sm btn-fullscreen-button"
+  title="Fullscreen mode"
+  data-bs-placement="bottom" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-expand"></i>
+  </span>
+
+</button>
+
+
+
+<script>
+document.write(`
+  <button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button" title="light/dark" aria-label="light/dark" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <i class="theme-switch fa-solid fa-sun fa-lg" data-mode="light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg" data-mode="dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"></i>
+  </button>
+`);
+</script>
+
+
+<script>
+document.write(`
+  <button class="btn btn-sm pst-navbar-icon search-button search-button__button" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <i class="fa-solid fa-magnifying-glass fa-lg"></i>
+  </button>
+`);
+</script>
+<button class="sidebar-toggle secondary-toggle btn btn-sm" title="Toggle secondary sidebar" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <span class="fa-solid fa-list"></span>
+</button>
+</div></div>
+      
+    </div>
+  
+</div>
+</div>
+              
+              
+
+<div id="jb-print-docs-body" class="onlyprint">
+    <h1>Fine-Tuning</h1>
+    <!-- Table of contents -->
+    <div id="print-main-content">
+        <div id="jb-print-toc">
+            
+            <div>
+                <h2> Contents </h2>
+            </div>
+            <nav aria-label="Page">
+                <ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#fine-tuning-environment">Fine-Tuning Environment</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#computing-gradients">Computing Gradients</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#exploding-gradients">Exploding Gradients</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#extending-aurora-with-new-variables">Extending Aurora with New Variables</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#other-model-extensions">Other Model Extensions</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#triple-check-your-fine-tuning-data">Triple Check Your Fine-Tuning Data!</a></li>
+</ul>
+            </nav>
+        </div>
+    </div>
+</div>
+
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <section id="fine-tuning">
+<h1>Fine-Tuning<a class="headerlink" href="#fine-tuning" title="Link to this heading">#</a></h1>
+<p>Generally, if you wish to fine-tune Aurora for a specific application,
+you should build on the pretrained version:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">aurora</span><span class="w"> </span><span class="kn">import</span> <span class="n">AuroraPretrained</span>
+
+<span class="n">model</span> <span class="o">=</span> <span class="n">AuroraPretrained</span><span class="p">()</span>
+<span class="n">model</span><span class="o">.</span><span class="n">load_checkpoint</span><span class="p">()</span>
+</pre></div>
+</div>
+<section id="fine-tuning-environment">
+<h2>Fine-Tuning Environment<a class="headerlink" href="#fine-tuning-environment" title="Link to this heading">#</a></h2>
+<p>We provide a very basic Docker image and fine-tuning loop to get you started.
+This Docker image is built from a NVIDIA PyTorch base image,
+so is tailored to work for NVIDIA GPUs, and has been tested on an 80 GB A100.
+The image can be found at <code class="docutils literal notranslate"><span class="pre">finetuning/Dockerfile</span></code> and the fine-tuning
+loop at <code class="docutils literal notranslate"><span class="pre">finetuning/finetune.py</span></code>.
+Assuming that you have cloned the Aurora repository, you can build and run
+the image by running the following from the root of the repository:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>docker<span class="w"> </span>build<span class="w"> </span>.<span class="w"> </span>-t<span class="w"> </span>aurora:latest<span class="w"> </span>-f<span class="w"> </span>finetuning/Dockerfile
+docker<span class="w"> </span>run<span class="w"> </span>--rm<span class="w"> </span>-it<span class="w"> </span>-v<span class="w"> </span>.:/app/aurora<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--gpus<span class="w"> </span>all<span class="w"> </span>--ipc<span class="o">=</span>host<span class="w"> </span>--ulimit<span class="w"> </span><span class="nv">memlock</span><span class="o">=</span>-1<span class="w"> </span>--ulimit<span class="w"> </span><span class="nv">stack</span><span class="o">=</span><span class="m">67108864</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>aurora:latest
+</pre></div>
+</div>
+<p>Then, within the image, execute</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nv">PYTORCH_CUDA_ALLOC_CONF</span><span class="o">=</span>backend:cudaMallocAsync<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>python<span class="w"> </span>finetuning/finetune.py
+</pre></div>
+</div>
+<p>to run the sample fine-tuning loop.
+<code class="docutils literal notranslate"><span class="pre">PYTORCH_CUDA_ALLOC_CONF=backend:cudaMallocAsync</span></code> enables CUDA’s built-in
+asynchronous memory allocator, which is recommended for Aurora.
+This loop should run on an A100 with 80 GB of memory.
+If you need to reduce memory usage, you could try the following:
+(a) split the model and optimiser parameters across multiple GPUs with
+<a class="reference external" href="https://docs.pytorch.org/tutorials/intermediate/FSDP_tutorial.html">FSDP</a>;
+(b) use a more memory-efficient optimiser, such as
+<a class="reference external" href="https://docs.pytorch.org/docs/stable/generated/torch.optim.Adafactor.html">Adafactor</a>;
+(c) split the model activations across multiple GPUs with model parallelism
+(you will need to implement this yourself or use an existing framework);
+(d) do CPU offloading of model or optimiser parameters; or
+(e) run everything in pure <code class="docutils literal notranslate"><span class="pre">bfloat16</span></code> (this might lead to more unstable training).
+You could also try to optimise the activation checkpointing strategy, to
+see if there is something more to gain there.</p>
+<p>For a worked example of fine-tuning Aurora Air Pollution on ozone, including results and lessons
+learned, see <a class="reference internal" href="finetuning_ozone.html"><span class="doc std std-doc">Case Study: Fine-Tuning Aurora Air Pollution on Ozone</span></a>.</p>
+<p>For example, on Azure, launch a VM with size <code class="docutils literal notranslate"><span class="pre">Standard_NC24ads_A100_v4</span></code>, image
+Ubuntu 24.04 LTS (x64), and 256 GB of disk space.
+Then <a class="reference external" href="https://learn.microsoft.com/en-us/azure/virtual-machines/linux/n-series-driver-setup">install CUDA</a>.
+Be sure to install the latest supported version of the CUDA Toolkit by
+checking <code class="docutils literal notranslate"><span class="pre">nvidia-smi</span></code> after installing the drivers with
+<code class="docutils literal notranslate"><span class="pre">sudo</span> <span class="pre">ubuntu-drivers</span> <span class="pre">autoinstall</span></code> and rebooting.
+Best performance is achieved with CUDA Toolkit 13.0 or higher, which
+requires drivers that support CUDA 13.0 or higher.
+Then install Docker with <code class="docutils literal notranslate"><span class="pre">sudo</span> <span class="pre">apt</span> <span class="pre">install</span> <span class="pre">docker.io</span></code>,
+set the right permissions for the current user with
+<code class="docutils literal notranslate"><span class="pre">sudo</span> <span class="pre">usermod</span> <span class="pre">-a</span> <span class="pre">-G</span> <span class="pre">docker</span> <span class="pre">$USER</span></code>,
+<a class="reference external" href="https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html">install the NVIDIA Container Toolkit</a>,
+and reboot.
+You should now be able to clone the repo and build and run the image using
+the instructions above.</p>
+</section>
+<section id="computing-gradients">
+<h2>Computing Gradients<a class="headerlink" href="#computing-gradients" title="Link to this heading">#</a></h2>
+<p>To compute gradients, you will need an A100 with 80 GB of memory.
+In addition, you will need to use reduced precision and gradient checkpointing.
+You can do this as follows:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">aurora</span><span class="w"> </span><span class="kn">import</span> <span class="n">AuroraPretrained</span>
+
+<span class="n">model</span> <span class="o">=</span> <span class="n">AuroraPretrained</span><span class="p">(</span><span class="n">autocast</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="n">model</span><span class="o">.</span><span class="n">load_checkpoint</span><span class="p">()</span>
+
+<span class="n">batch</span> <span class="o">=</span> <span class="o">...</span>  <span class="c1"># Load some data.</span>
+
+<span class="n">model</span> <span class="o">=</span> <span class="n">model</span><span class="o">.</span><span class="n">cuda</span><span class="p">()</span>
+<span class="n">model</span><span class="o">.</span><span class="n">train</span><span class="p">()</span>
+<span class="n">model</span><span class="o">.</span><span class="n">configure_activation_checkpointing</span><span class="p">()</span>
+
+<span class="n">pred</span> <span class="o">=</span> <span class="n">model</span><span class="o">.</span><span class="n">forward</span><span class="p">(</span><span class="n">batch</span><span class="p">)</span>
+<span class="n">loss</span> <span class="o">=</span> <span class="o">...</span>
+<span class="n">loss</span><span class="o">.</span><span class="n">backward</span><span class="p">()</span>
+</pre></div>
+</div>
+<p>Here <code class="docutils literal notranslate"><span class="pre">autocast</span></code> enables AMP with <code class="docutils literal notranslate"><span class="pre">bfloat16</span></code> for only the backbone.
+This is necessary to be able to fit gradients in memory.</p>
+</section>
+<section id="exploding-gradients">
+<h2>Exploding Gradients<a class="headerlink" href="#exploding-gradients" title="Link to this heading">#</a></h2>
+<p>When fine-tuning, you may run into very large gradient values.
+Gradient clipping and internal layer normalisation layers mitigate the impact
+of large gradients,
+meaning that large gradients will not immediately lead to abnormal model outputs and loss values.
+Nevertheless, if gradients do blow up, the model will not learn anymore and eventually the loss value
+will also blow up.
+You should carefully monitor the value of the gradients to detect exploding gradients.</p>
+<p>One cause of exploding gradients is too large values for internal activations.
+Typically this can be fixed by judiciously inserting a layer normalisation layer.</p>
+<p>We have identified the level aggregation as weak point of the model that can be susceptible
+to exploding gradients.
+You can stabilise the level aggregation of the model
+by setting the following flag in the constructor: <code class="docutils literal notranslate"><span class="pre">stabilise_level_agg=True</span></code>.
+Note that <code class="docutils literal notranslate"><span class="pre">stabilise_level_agg=True</span></code> will considerably perturb the model,
+so significant additional fine-tuning may be required to get to the desired level of performance.</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">aurora</span><span class="w"> </span><span class="kn">import</span> <span class="n">AuroraPretrained</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">aurora.normalisation</span><span class="w"> </span><span class="kn">import</span> <span class="n">locations</span><span class="p">,</span> <span class="n">scales</span>
+
+<span class="n">model</span> <span class="o">=</span> <span class="n">AuroraPretrained</span><span class="p">(</span><span class="n">stabilise_level_agg</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>  <span class="c1"># Insert extra layer norm. to mitigate exploding gradients.</span>
+<span class="n">model</span><span class="o">.</span><span class="n">load_checkpoint</span><span class="p">(</span><span class="n">strict</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+</pre></div>
+</div>
+</section>
+<section id="extending-aurora-with-new-variables">
+<h2>Extending Aurora with New Variables<a class="headerlink" href="#extending-aurora-with-new-variables" title="Link to this heading">#</a></h2>
+<p>Aurora can be extended with new variables by adjusting the keyword arguments <code class="docutils literal notranslate"><span class="pre">surf_vars</span></code>,
+<code class="docutils literal notranslate"><span class="pre">static_vars</span></code>, and <code class="docutils literal notranslate"><span class="pre">atmos_vars</span></code>.
+When you add a new variable, you also need to set the normalisation statistics.</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">aurora</span><span class="w"> </span><span class="kn">import</span> <span class="n">AuroraPretrained</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">aurora.normalisation</span><span class="w"> </span><span class="kn">import</span> <span class="n">locations</span><span class="p">,</span> <span class="n">scales</span>
+
+<span class="n">model</span> <span class="o">=</span> <span class="n">AuroraPretrained</span><span class="p">(</span>
+    <span class="n">surf_vars</span><span class="o">=</span><span class="p">(</span><span class="s2">"2t"</span><span class="p">,</span> <span class="s2">"10u"</span><span class="p">,</span> <span class="s2">"10v"</span><span class="p">,</span> <span class="s2">"msl"</span><span class="p">,</span> <span class="s2">"new_surf_var"</span><span class="p">),</span>
+    <span class="n">static_vars</span><span class="o">=</span><span class="p">(</span><span class="s2">"lsm"</span><span class="p">,</span> <span class="s2">"z"</span><span class="p">,</span> <span class="s2">"slt"</span><span class="p">,</span> <span class="s2">"new_static_var"</span><span class="p">),</span>
+    <span class="n">atmos_vars</span><span class="o">=</span><span class="p">(</span><span class="s2">"z"</span><span class="p">,</span> <span class="s2">"u"</span><span class="p">,</span> <span class="s2">"v"</span><span class="p">,</span> <span class="s2">"t"</span><span class="p">,</span> <span class="s2">"q"</span><span class="p">,</span> <span class="s2">"new_atmos_var"</span><span class="p">),</span>
+<span class="p">)</span>
+<span class="n">model</span><span class="o">.</span><span class="n">load_checkpoint</span><span class="p">(</span><span class="n">strict</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+
+<span class="c1"># Normalisation means:</span>
+<span class="n">locations</span><span class="p">[</span><span class="s2">"new_surf_var"</span><span class="p">]</span> <span class="o">=</span> <span class="mf">0.0</span>
+<span class="n">locations</span><span class="p">[</span><span class="s2">"new_static_var"</span><span class="p">]</span> <span class="o">=</span> <span class="mf">0.0</span>
+<span class="n">locations</span><span class="p">[</span><span class="s2">"new_atmos_var"</span><span class="p">]</span> <span class="o">=</span> <span class="mf">0.0</span>
+
+<span class="c1"># Normalisation standard deviations:</span>
+<span class="n">scales</span><span class="p">[</span><span class="s2">"new_surf_var"</span><span class="p">]</span> <span class="o">=</span> <span class="mf">1.0</span>
+<span class="n">scales</span><span class="p">[</span><span class="s2">"new_static_var"</span><span class="p">]</span> <span class="o">=</span> <span class="mf">1.0</span>
+<span class="n">scales</span><span class="p">[</span><span class="s2">"new_atmos_var"</span><span class="p">]</span> <span class="o">=</span> <span class="mf">1.0</span>
+</pre></div>
+</div>
+<p>To more efficiently learn new variables, it is recommended to use a separate learning rate for
+the patch embeddings of the new variables in the encoder and decoder.
+For example, if you are using Adam, you can try <code class="docutils literal notranslate"><span class="pre">1e-3</span></code> for the new patch embeddings
+and <code class="docutils literal notranslate"><span class="pre">3e-4</span></code> for the other parameters.</p>
+<p>By default, patch embeddings in the encoder for new variables are initialised randomly.
+This means that adding new variables to the model perturbs the predictions for the existing
+variables.
+If you do not want this, you can alternatively initialise the new patch embeddings in the encoder
+to zero.
+The relevant parameter dictionaries are <code class="docutils literal notranslate"><span class="pre">model.encoder.{surf,atmos}_token_embeds.weights</span></code>.</p>
+</section>
+<section id="other-model-extensions">
+<h2>Other Model Extensions<a class="headerlink" href="#other-model-extensions" title="Link to this heading">#</a></h2>
+<p>It is possible to extend to model in any way you like.
+If you do this, you will likely add or remove parameters.
+Then <code class="docutils literal notranslate"><span class="pre">model.load_checkpoint</span></code> will error,
+because the existing checkpoint now mismatches with the model’s parameters.
+Simply set <code class="docutils literal notranslate"><span class="pre">model.load_checkpoint(...,</span> <span class="pre">strict=False)</span></code> to ignore the mismatches:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">aurora</span><span class="w"> </span><span class="kn">import</span> <span class="n">AuroraPretrained</span>
+
+<span class="n">model</span> <span class="o">=</span> <span class="n">AuroraPretrained</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+
+<span class="o">...</span> <span class="c1"># Modify `model`.</span>
+
+<span class="n">model</span><span class="o">.</span><span class="n">load_checkpoint</span><span class="p">(</span><span class="n">strict</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+</pre></div>
+</div>
+</section>
+<section id="triple-check-your-fine-tuning-data">
+<h2>Triple Check Your Fine-Tuning Data!<a class="headerlink" href="#triple-check-your-fine-tuning-data" title="Link to this heading">#</a></h2>
+<p>When fine-tuning the model, it is absolutely essential to carefully check your fine-tuning data.</p>
+<ul class="simple">
+<li><p>Are the old (and possibly new) normalisation statistics appropriate for the new data?</p></li>
+<li><p>Is any data missing?</p></li>
+<li><p>Does the data contains zeros or NaNs?</p></li>
+<li><p>Does the data contain any outliers that could possibly interfere with fine-tuning?</p></li>
+</ul>
+<p><em>Et cetera.</em></p>
+</section>
+</section>
+
+    <script type="text/x-thebe-config">
+    {
+        requestKernel: true,
+        binderOptions: {
+            repo: "binder-examples/jupyter-stacks-datascience",
+            ref: "master",
+        },
+        codeMirrorConfig: {
+            theme: "abcdef",
+            mode: "python"
+        },
+        kernelOptions: {
+            name: "python3",
+            path: "./."
+        },
+        predefinedOutput: true
+    }
+    </script>
+    <script>kernelName = 'python3'</script>
+
+                </article>
+              
+
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+    <a class="left-prev"
+       href="beware.html"
+       title="previous page">
+      <i class="fa-solid fa-angle-left"></i>
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">previous</p>
+        <p class="prev-next-title">Beware!</p>
+      </div>
+    </a>
+    <a class="right-next"
+       href="finetuning_ozone.html"
+       title="next page">
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">next</p>
+        <p class="prev-next-title">Case Study: Fine-Tuning Aurora Air Pollution on Ozone</p>
+      </div>
+      <i class="fa-solid fa-angle-right"></i>
+    </a>
+</div>
+                </footer>
+              
+            </div>
+            
+            
+              
+                <div class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item">
+  <div class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> Contents
+  </div>
+  <nav class="bd-toc-nav page-toc">
+    <ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#fine-tuning-environment">Fine-Tuning Environment</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#computing-gradients">Computing Gradients</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#exploding-gradients">Exploding Gradients</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#extending-aurora-with-new-variables">Extending Aurora with New Variables</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#other-model-extensions">Other Model Extensions</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#triple-check-your-fine-tuning-data">Triple Check Your Fine-Tuning Data!</a></li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+          </div>
+          <footer class="bd-footer-content">
+            
+<div class="bd-footer-content__inner container">
+  
+  <div class="footer-item">
+    
+<p class="component-author">
+By Microsoft Corporation
+</p>
+
+  </div>
+  
+  <div class="footer-item">
+    
+
+  <p class="copyright">
+    
+      © Copyright 2024.
+      <br/>
+    
+  </p>
+
+  </div>
+  
+  <div class="footer-item">
+    
+  </div>
+  
+  <div class="footer-item">
+    
+  </div>
+  
+</div>
+          </footer>
+        
+
+      </main>
+    </div>
+  </div>
+  
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script src="_static/scripts/bootstrap.js?digest=dfe6caa3a7d634c4db9b"></script>
+<script src="_static/scripts/pydata-sphinx-theme.js?digest=dfe6caa3a7d634c4db9b"></script>
+
+  <footer class="bd-footer">
+  </footer>
+  </body>
+</html>

@@ -1,0 +1,706 @@
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="./" data-theme="light">
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>Case Study: Fine-Tuning Aurora Air Pollution on Ozone &#8212; Aurora: A Foundation Model of the Atmosphere</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "light";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "light";
+  </script>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="_static/styles/theme.css?digest=dfe6caa3a7d634c4db9b" rel="stylesheet" />
+<link href="_static/styles/bootstrap.css?digest=dfe6caa3a7d634c4db9b" rel="stylesheet" />
+<link href="_static/styles/pydata-sphinx-theme.css?digest=dfe6caa3a7d634c4db9b" rel="stylesheet" />
+
+  
+  <link href="_static/vendor/fontawesome/6.5.2/css/all.min.css?digest=dfe6caa3a7d634c4db9b" rel="stylesheet" />
+  <link rel="preload" as="font" type="font/woff2" crossorigin href="_static/vendor/fontawesome/6.5.2/webfonts/fa-solid-900.woff2" />
+<link rel="preload" as="font" type="font/woff2" crossorigin href="_static/vendor/fontawesome/6.5.2/webfonts/fa-brands-400.woff2" />
+<link rel="preload" as="font" type="font/woff2" crossorigin href="_static/vendor/fontawesome/6.5.2/webfonts/fa-regular-400.woff2" />
+
+    <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=03e43079" />
+    <link rel="stylesheet" type="text/css" href="_static/styles/sphinx-book-theme.css?v=eba8b062" />
+    <link rel="stylesheet" type="text/css" href="_static/togglebutton.css?v=9c3e77be" />
+    <link rel="stylesheet" type="text/css" href="_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="_static/mystnb.11b39860a7a0cbfd473a3ad8a317855267ff0bd372690045ca344a6b62be495e.css" />
+    <link rel="stylesheet" type="text/css" href="_static/sphinx-thebe.css?v=4fa983c6" />
+    <link rel="stylesheet" type="text/css" href="_static/sphinx-design.min.css?v=95c83b7e" />
+  
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="_static/scripts/bootstrap.js?digest=dfe6caa3a7d634c4db9b" />
+<link rel="preload" as="script" href="_static/scripts/pydata-sphinx-theme.js?digest=dfe6caa3a7d634c4db9b" />
+  <script src="_static/vendor/fontawesome/6.5.2/js/all.min.js?digest=dfe6caa3a7d634c4db9b"></script>
+
+    <script src="_static/documentation_options.js?v=9eb32ce0"></script>
+    <script src="_static/doctools.js?v=9a2dae69"></script>
+    <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="_static/copybutton.js?v=f281be69"></script>
+    <script src="_static/scripts/sphinx-book-theme.js?v=887ef09a"></script>
+    <script>let toggleHintShow = 'Click to show';</script>
+    <script>let toggleHintHide = 'Click to hide';</script>
+    <script>let toggleOpenOnPrint = 'true';</script>
+    <script src="_static/togglebutton.js?v=b8b12719"></script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script src="_static/design-tabs.js?v=f930bc37"></script>
+    <script>const THEBE_JS_URL = "https://unpkg.com/thebe@0.8.2/lib/index.js"; const thebe_selector = ".thebe,.cell"; const thebe_selector_input = "pre"; const thebe_selector_output = ".output, .cell_output"</script>
+    <script async="async" src="_static/sphinx-thebe.js?v=c100c467"></script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>const THEBE_JS_URL = "https://unpkg.com/thebe@0.8.2/lib/index.js"; const thebe_selector = ".thebe,.cell"; const thebe_selector_input = "pre"; const thebe_selector_output = ".output, .cell_output"</script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'finetuning_ozone';</script>
+    <link rel="index" title="Index" href="genindex.html" />
+    <link rel="search" title="Search" href="search.html" />
+    <link rel="next" title="Plugin for ECMWF’s ai-models" href="ai_models_plugin.html" />
+    <link rel="prev" title="Fine-Tuning" href="finetuning.html" />
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  </head>
+  
+  
+  <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="light">
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+
+  
+  <input type="checkbox"
+          class="sidebar-toggle"
+          id="pst-primary-sidebar-checkbox"/>
+  <label class="overlay overlay-primary" for="pst-primary-sidebar-checkbox"></label>
+  
+  <input type="checkbox"
+          class="sidebar-toggle"
+          id="pst-secondary-sidebar-checkbox"/>
+  <label class="overlay overlay-secondary" for="pst-secondary-sidebar-checkbox"></label>
+  
+  <div class="search-button__wrapper">
+    <div class="search-button__overlay"></div>
+    <div class="search-button__search-container">
+<form class="bd-search d-flex align-items-center"
+      action="search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         id="search-input"
+         placeholder="Search this book..."
+         aria-label="Search this book..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form></div>
+  </div>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <div class="bd-sidebar-primary bd-sidebar">
+        
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+    
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="intro.html">
+  
+  
+  
+  
+  
+    
+    
+    
+    <img src="_static/aurora.jpg" class="logo__image only-light" alt="Aurora: A Foundation Model of the Atmosphere - Home"/>
+    <script>document.write(`<img src="_static/aurora.jpg" class="logo__image only-dark" alt="Aurora: A Foundation Model of the Atmosphere - Home"/>`);</script>
+  
+  
+</a></div>
+        <div class="sidebar-primary-item">
+
+ <script>
+ document.write(`
+   <button class="btn search-button-field search-button__button" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <i class="fa-solid fa-magnifying-glass"></i>
+    <span class="search-button__default-text">Search</span>
+    <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+   </button>
+ `);
+ </script></div>
+        <div class="sidebar-primary-item"><nav class="bd-links bd-docs-nav" aria-label="Main">
+    <div class="bd-toc-item navbar-nav active">
+        
+        <ul class="nav bd-sidenav bd-sidenav__home-link">
+            <li class="toctree-l1">
+                <a class="reference internal" href="intro.html">
+                    Aurora: A Foundation Model for the Earth System
+                </a>
+            </li>
+        </ul>
+        <p aria-level="2" class="caption" role="heading"><span class="caption-text">Main Usage</span></p>
+<ul class="current nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="usage.html">Usage</a></li>
+<li class="toctree-l1"><a class="reference internal" href="batch.html">Form of a Batch</a></li>
+<li class="toctree-l1"><a class="reference internal" href="models.html">Available Models</a></li>
+<li class="toctree-l1"><a class="reference internal" href="tracking.html">Tropical Cyclone Tracking</a></li>
+<li class="toctree-l1"><a class="reference internal" href="beware.html">Beware!</a></li>
+<li class="toctree-l1"><a class="reference internal" href="finetuning.html">Fine-Tuning</a></li>
+<li class="toctree-l1 current active"><a class="current reference internal" href="#">Case Study: Fine-Tuning Aurora Air Pollution on Ozone</a></li>
+<li class="toctree-l1"><a class="reference internal" href="ai_models_plugin.html">Plugin for ECMWF’s <code class="docutils literal notranslate"><span class="pre">ai-models</span></code></a></li>
+<li class="toctree-l1"><a class="reference internal" href="api.html">Application Programming Interface</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Examples</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="example_era5.html">Predictions for ERA5</a></li>
+<li class="toctree-l1"><a class="reference internal" href="example_hres_t0.html">Predictions for HRES T0</a></li>
+<li class="toctree-l1"><a class="reference internal" href="example_hres_0.1.html">Predictions for HRES at 0.1 Degrees</a></li>
+<li class="toctree-l1"><a class="reference internal" href="example_cams.html">Predictions for Air Pollution</a></li>
+<li class="toctree-l1"><a class="reference internal" href="example_wave.html">Predictions for Ocean Waves</a></li>
+<li class="toctree-l1"><a class="reference internal" href="example_tc_tracking.html">Track Predictions for Typhoon Nanmadol</a></li>
+<li class="toctree-l1"><a class="reference internal" href="example_v1p5.html">Predictions with Aurora 1.5</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Foundry</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="foundry/intro.html">Aurora on Azure AI Foundry</a></li>
+<li class="toctree-l1"><a class="reference internal" href="foundry/submission.html">Submitting Predictions</a></li>
+<li class="toctree-l1"><a class="reference internal" href="foundry/demo_hres_t0.html">Demo: HRES T0</a></li>
+<li class="toctree-l1"><a class="reference internal" href="foundry/demo_v1p5.html">Demo: Aurora 1.5 on Foundry</a></li>
+<li class="toctree-l1"><a class="reference internal" href="foundry/server.html">Creating an Endpoint</a></li>
+<li class="toctree-l1"><a class="reference internal" href="foundry/api.html">Application Programming Interface</a></li>
+</ul>
+
+    </div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+  </div>
+  
+  <div id="rtd-footer-container"></div>
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+
+<div class="sbt-scroll-pixel-helper"></div>
+
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item"><button class="sidebar-toggle primary-toggle btn btn-sm" title="Toggle primary sidebar" data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <span class="fa-solid fa-bars"></span>
+</button></div>
+      
+    </div>
+  
+  
+    <div class="header-article-items__end">
+      
+        <div class="header-article-item">
+
+<div class="article-header-buttons">
+
+
+
+
+
+<div class="dropdown dropdown-source-buttons">
+  <button class="btn dropdown-toggle" type="button" data-bs-toggle="dropdown" aria-expanded="false" aria-label="Source repositories">
+    <i class="fab fa-github"></i>
+  </button>
+  <ul class="dropdown-menu">
+      
+      
+      
+      <li><a href="https://github.com/microsoft/aurora" target="_blank"
+   class="btn btn-sm btn-source-repository-button dropdown-item"
+   title="Source repository"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fab fa-github"></i>
+  </span>
+<span class="btn__text-container">Repository</span>
+</a>
+</li>
+      
+      
+      
+      
+      <li><a href="https://github.com/microsoft/aurora/issues/new?title=Issue%20on%20page%20%2Ffinetuning_ozone.html&body=Your%20issue%20content%20here." target="_blank"
+   class="btn btn-sm btn-source-issues-button dropdown-item"
+   title="Open an issue"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-lightbulb"></i>
+  </span>
+<span class="btn__text-container">Open issue</span>
+</a>
+</li>
+      
+  </ul>
+</div>
+
+
+
+
+
+
+<div class="dropdown dropdown-download-buttons">
+  <button class="btn dropdown-toggle" type="button" data-bs-toggle="dropdown" aria-expanded="false" aria-label="Download this page">
+    <i class="fas fa-download"></i>
+  </button>
+  <ul class="dropdown-menu">
+      
+      
+      
+      <li><a href="_sources/finetuning_ozone.md" target="_blank"
+   class="btn btn-sm btn-download-source-button dropdown-item"
+   title="Download source file"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-file"></i>
+  </span>
+<span class="btn__text-container">.md</span>
+</a>
+</li>
+      
+      
+      
+      
+      <li>
+<button onclick="window.print()"
+  class="btn btn-sm btn-download-pdf-button dropdown-item"
+  title="Print to PDF"
+  data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-file-pdf"></i>
+  </span>
+<span class="btn__text-container">.pdf</span>
+</button>
+</li>
+      
+  </ul>
+</div>
+
+
+
+
+<button onclick="toggleFullScreen()"
+  class="btn btn-sm btn-fullscreen-button"
+  title="Fullscreen mode"
+  data-bs-placement="bottom" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-expand"></i>
+  </span>
+
+</button>
+
+
+
+<script>
+document.write(`
+  <button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button" title="light/dark" aria-label="light/dark" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <i class="theme-switch fa-solid fa-sun fa-lg" data-mode="light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg" data-mode="dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"></i>
+  </button>
+`);
+</script>
+
+
+<script>
+document.write(`
+  <button class="btn btn-sm pst-navbar-icon search-button search-button__button" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <i class="fa-solid fa-magnifying-glass fa-lg"></i>
+  </button>
+`);
+</script>
+<button class="sidebar-toggle secondary-toggle btn btn-sm" title="Toggle secondary sidebar" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <span class="fa-solid fa-list"></span>
+</button>
+</div></div>
+      
+    </div>
+  
+</div>
+</div>
+              
+              
+
+<div id="jb-print-docs-body" class="onlyprint">
+    <h1>Case Study: Fine-Tuning Aurora Air Pollution on Ozone</h1>
+    <!-- Table of contents -->
+    <div id="print-main-content">
+        <div id="jb-print-toc">
+            
+            <div>
+                <h2> Contents </h2>
+            </div>
+            <nav aria-label="Page">
+                <ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#what-is-included">What Is Included</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#setup">Setup</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#results">Results</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#what-worked">What Worked</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#what-did-not-work">What Did Not Work</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#suggestions">Suggestions</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#reproducing">Reproducing</a></li>
+</ul>
+            </nav>
+        </div>
+    </div>
+</div>
+
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <section id="case-study-fine-tuning-aurora-air-pollution-on-ozone">
+<h1>Case Study: Fine-Tuning Aurora Air Pollution on Ozone<a class="headerlink" href="#case-study-fine-tuning-aurora-air-pollution-on-ozone" title="Link to this heading">#</a></h1>
+<p>This page reports a small fine-tuning test of <code class="docutils literal notranslate"><span class="pre">AuroraAirPollution</span></code> (0.4°, 12-hour time step) on
+one week of CAMS analyses, with a focus on ozone: <code class="docutils literal notranslate"><span class="pre">go3</span></code> (13 pressure levels) and <code class="docutils literal notranslate"><span class="pre">gtco3</span></code> (total
+column).
+It covers what worked, what did not, and suggestions for anyone doing something similar.
+The goal was to check the fine-tuning pipeline end to end, not to train a better model.</p>
+<section id="what-is-included">
+<h2>What Is Included<a class="headerlink" href="#what-is-included" title="Link to this heading">#</a></h2>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>File</p></th>
+<th class="head"><p>Purpose</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">finetuning/prepare_cams_ozone.py</span></code></p></td>
+<td><p>Download CAMS analyses (00/12 UTC, <code class="docutils literal notranslate"><span class="pre">leadtime_hour=0</span></code>) for a date range plus the static variables, using the same request as the <a class="reference internal" href="example_cams.html"><span class="doc std std-doc">CAMS example</span></a>.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">finetuning/finetune_ozone.py</span></code></p></td>
+<td><p>Fine-tuning loop: data QC, baseline evaluation, training, periodic validation, saving the checkpoint and reloading it. <code class="docutils literal notranslate"><span class="pre">--synthetic</span> <span class="pre">N</span></code> runs on random data to test the pipeline.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">finetuning/submit_aml_ozone.py</span></code></p></td>
+<td><p>Submit the fine-tuning loop as a single-GPU Azure Machine Learning job.</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>The loop follows <a class="reference internal" href="finetuning.html"><span class="doc std std-doc">Fine-Tuning</span></a>: full fine-tuning with AdamW, <code class="docutils literal notranslate"><span class="pre">autocast=True</span></code> and
+<code class="docutils literal notranslate"><span class="pre">configure_activation_checkpointing()</span></code>, run with
+<code class="docutils literal notranslate"><span class="pre">PYTORCH_CUDA_ALLOC_CONF=backend:cudaMallocAsync</span></code>.
+In addition, gradients are clipped to norm 1 and the gradient norm is logged at every step.
+The loss is a latitude-weighted MAE in normalised space, averaged over all predicted variables.
+Ozone metrics are logged separately.</p>
+</section>
+<section id="setup">
+<h2>Setup<a class="headerlink" href="#setup" title="Link to this heading">#</a></h2>
+<ul class="simple">
+<li><p><strong>Data:</strong> CAMS global composition analyses, 2022-06-01 to 2022-06-08 (16 time steps, about 3.5 GB).
+Every sample uses two history steps and a 12-hour target, which gives 14 samples.
+The last 2 samples are used for validation and the other 12 for training.</p></li>
+<li><p><strong>Compute:</strong> one H100 (94 GB) on an Azure ML cluster (<code class="docutils literal notranslate"><span class="pre">Standard_NC40ads_H100_v5</span></code>).
+The environment is the curated <code class="docutils literal notranslate"><span class="pre">acpt-pytorch-2.8-cuda12.6</span></code> image with this repository
+installed via <code class="docutils literal notranslate"><span class="pre">pip</span> <span class="pre">install</span> <span class="pre">-e</span> <span class="pre">.</span></code>.</p></li>
+<li><p><strong>Steps:</strong> 100 steps of batch size 1, which is about 8 passes over the training samples.</p></li>
+</ul>
+</section>
+<section id="results">
+<h2>Results<a class="headerlink" href="#results" title="Link to this heading">#</a></h2>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Run</p></th>
+<th class="head"><p>LR</p></th>
+<th class="head"><p>Val. loss (step 0 → 100)</p></th>
+<th class="head"><p><code class="docutils literal notranslate"><span class="pre">gtco3</span></code> RMSE (kg m⁻²)</p></th>
+<th class="head"><p><code class="docutils literal notranslate"><span class="pre">go3</span></code> normalised MAE</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Synthetic data (pipeline test)</p></td>
+<td><p>3e-4</p></td>
+<td><p>n/a</p></td>
+<td><p>n/a</p></td>
+<td><p>n/a</p></td>
+</tr>
+<tr class="row-odd"><td><p>CAMS</p></td>
+<td><p>3e-4</p></td>
+<td><p>0.0461 → <strong>0.0671</strong> (worse)</p></td>
+<td><p>9.27e-5 → 1.09e-4 (worse)</p></td>
+<td><p>0.0157 → 0.0239 (worse)</p></td>
+</tr>
+<tr class="row-even"><td><p>CAMS</p></td>
+<td><p>1e-5</p></td>
+<td><p>0.0461 → <strong>0.0443</strong> (−4%)</p></td>
+<td><p>9.27e-5 → 8.75e-5 (−5.5%)</p></td>
+<td><p>0.0157 → 0.0158 (flat)</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Resources and stability:</p>
+<ul class="simple">
+<li><p>1.27 B trainable parameters, 74 GB peak GPU memory and about 5.6 s per step.</p></li>
+<li><p>Gradient norms ranged from 0.06 to 0.47 at LR 1e-5 and from 0.11 to 1.9 at LR 3e-4. There were no NaNs.</p></li>
+<li><p>In both CAMS runs the saved checkpoint reloaded and gave identical validation metrics.</p></li>
+</ul>
+</section>
+<section id="what-worked">
+<h2>What Worked<a class="headerlink" href="#what-worked" title="Link to this heading">#</a></h2>
+<ul class="simple">
+<li><p>The recipe in <a class="reference internal" href="finetuning.html"><span class="doc std std-doc">Fine-Tuning</span></a> fits on a single 94 GB GPU for the 0.4° air-pollution
+model with full fine-tuning and AdamW, with about 20 GB to spare.</p></li>
+<li><p>Running on synthetic data first (<code class="docutils literal notranslate"><span class="pre">--synthetic</span> <span class="pre">16</span></code>) checked the environment, checkpoint
+download, memory, step time and checkpoint round-trip before any real data was needed.</p></li>
+<li><p>Downloading the data locally and mounting it into the AML job kept the ADS API key out of the job.</p></li>
+<li><p>At a low learning rate (1e-5), a short fine-tune slightly improved the validation loss and total-column ozone.</p></li>
+</ul>
+</section>
+<section id="what-did-not-work">
+<h2>What Did Not Work<a class="headerlink" href="#what-did-not-work" title="Link to this heading">#</a></h2>
+<ul class="simple">
+<li><p><strong>The default learning rate (3e-4) from <code class="docutils literal notranslate"><span class="pre">finetuning/finetune.py</span></code> damaged the pretrained model.</strong>
+The first steps increased the training loss eightfold (0.045 → 0.37).
+After 100 steps the validation loss was still 45% worse than the pretrained model.
+The pretrained model is already very good on CAMS analyses, so it needs a much gentler update.</p></li>
+<li><p><strong>Ozone on pressure levels (<code class="docutils literal notranslate"><span class="pre">go3</span></code>) did not improve</strong> at 1e-5 within 100 steps.
+With only 2 validation samples from the same week, small differences are not meaningful.</p></li>
+<li><p><strong>ADS access:</strong> a key in <code class="docutils literal notranslate"><span class="pre">.cdsapirc</span></code> authenticates against ADS, but requests fail with
+<code class="docutils literal notranslate"><span class="pre">403</span> <span class="pre">...</span> <span class="pre">user</span> <span class="pre">didn't</span> <span class="pre">accept</span> <span class="pre">all</span> <span class="pre">required</span> <span class="pre">site</span> <span class="pre">policies</span></code> until the ADS terms of use and privacy
+statement are accepted on the ADS website. The CAMS dataset licence must also be accepted.
+The CDS and ADS share the API key but not the URL, so <code class="docutils literal notranslate"><span class="pre">prepare_cams_ozone.py</span></code> always uses the ADS URL.</p></li>
+<li><p><strong>xarray versions:</strong> older xarray versions, such as the one in the curated ACPT image, fail to
+decode the <code class="docutils literal notranslate"><span class="pre">forecast_period</span></code> timedelta in the CAMS NetCDF files.
+<code class="docutils literal notranslate"><span class="pre">finetune_ozone.py</span></code> opens the files with <code class="docutils literal notranslate"><span class="pre">decode_timedelta=False</span></code> to avoid this.</p></li>
+</ul>
+</section>
+<section id="suggestions">
+<h2>Suggestions<a class="headerlink" href="#suggestions" title="Link to this heading">#</a></h2>
+<ol class="arabic simple">
+<li><p><strong>Start with a low learning rate (around 1e-5)</strong> when fine-tuning on data close to the
+pretraining data. Consider warmup, or a higher learning rate only for new parameters, as
+suggested in <a class="reference internal" href="#finetuning#extending-aurora-with-new-variables"><span class="xref myst">Fine-Tuning</span></a>.</p></li>
+<li><p><strong>Always evaluate the pretrained model first</strong> (step 0). Without a baseline, the falling loss
+at LR 3e-4 would have looked like learning, when it was only recovery from the first steps.</p></li>
+<li><p><strong>Test the pipeline on synthetic data</strong> with the real grid and variables before spending time
+on data downloads.</p></li>
+<li><p><strong>Use more data and a separate validation period</strong> for real experiments, for example months of
+training data and a validation period that does not overlap the training window.
+One week is only enough for a smoke test.</p></li>
+<li><p><strong>Report ozone-specific metrics</strong> per pressure level alongside the overall loss. Improvements
+in the overall loss can hide regressions for individual variables.</p></li>
+<li><p><strong>Check the data</strong> before training: shapes, NaNs and value ranges compared with the
+normalisation statistics. <code class="docutils literal notranslate"><span class="pre">finetune_ozone.py</span></code> logs this as a <code class="docutils literal notranslate"><span class="pre">data_qc</span></code> record.</p></li>
+</ol>
+</section>
+<section id="reproducing">
+<h2>Reproducing<a class="headerlink" href="#reproducing" title="Link to this heading">#</a></h2>
+<p>Download the data. This needs an ADS account with the terms and the CAMS licence accepted:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>finetuning/prepare_cams_ozone.py<span class="w"> </span>--start<span class="w"> </span><span class="m">2022</span>-06-01<span class="w"> </span>--end<span class="w"> </span><span class="m">2022</span>-06-08<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--out-dir<span class="w"> </span>~/cams_ozone<span class="w"> </span>--rc-file<span class="w"> </span>~/.cdsapirc
+</pre></div>
+</div>
+<p>Run locally on a GPU with at least 80 GB of memory:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nv">PYTORCH_CUDA_ALLOC_CONF</span><span class="o">=</span>backend:cudaMallocAsync<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>python<span class="w"> </span>finetuning/finetune_ozone.py<span class="w"> </span>--data-dir<span class="w"> </span>~/cams_ozone<span class="w"> </span>--out-dir<span class="w"> </span>~/ozone_ft<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--max-steps<span class="w"> </span><span class="m">100</span><span class="w"> </span>--lr<span class="w"> </span>1e-5
+</pre></div>
+</div>
+<p>Or submit to Azure ML, after making the data available on a datastore:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>finetuning/submit_aml_ozone.py<span class="w"> </span>--compute<span class="w"> </span>&lt;gpu-cluster&gt;<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--data-uri<span class="w"> </span>azureml://datastores/&lt;datastore&gt;/paths/&lt;path&gt;/
+</pre></div>
+</div>
+<p>Metrics are written to <code class="docutils literal notranslate"><span class="pre">metrics.jsonl</span></code> in the output directory, one JSON record per event
+(<code class="docutils literal notranslate"><span class="pre">data_qc</span></code>, <code class="docutils literal notranslate"><span class="pre">eval</span></code>, <code class="docutils literal notranslate"><span class="pre">train</span></code> and <code class="docutils literal notranslate"><span class="pre">reload_eval</span></code>).</p>
+</section>
+</section>
+
+    <script type="text/x-thebe-config">
+    {
+        requestKernel: true,
+        binderOptions: {
+            repo: "binder-examples/jupyter-stacks-datascience",
+            ref: "master",
+        },
+        codeMirrorConfig: {
+            theme: "abcdef",
+            mode: "python"
+        },
+        kernelOptions: {
+            name: "python3",
+            path: "./."
+        },
+        predefinedOutput: true
+    }
+    </script>
+    <script>kernelName = 'python3'</script>
+
+                </article>
+              
+
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+    <a class="left-prev"
+       href="finetuning.html"
+       title="previous page">
+      <i class="fa-solid fa-angle-left"></i>
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">previous</p>
+        <p class="prev-next-title">Fine-Tuning</p>
+      </div>
+    </a>
+    <a class="right-next"
+       href="ai_models_plugin.html"
+       title="next page">
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">next</p>
+        <p class="prev-next-title">Plugin for ECMWF’s <code class="docutils literal notranslate"><span class="pre">ai-models</span></code></p>
+      </div>
+      <i class="fa-solid fa-angle-right"></i>
+    </a>
+</div>
+                </footer>
+              
+            </div>
+            
+            
+              
+                <div class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item">
+  <div class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> Contents
+  </div>
+  <nav class="bd-toc-nav page-toc">
+    <ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#what-is-included">What Is Included</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#setup">Setup</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#results">Results</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#what-worked">What Worked</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#what-did-not-work">What Did Not Work</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#suggestions">Suggestions</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#reproducing">Reproducing</a></li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+          </div>
+          <footer class="bd-footer-content">
+            
+<div class="bd-footer-content__inner container">
+  
+  <div class="footer-item">
+    
+<p class="component-author">
+By Microsoft Corporation
+</p>
+
+  </div>
+  
+  <div class="footer-item">
+    
+
+  <p class="copyright">
+    
+      © Copyright 2024.
+      <br/>
+    
+  </p>
+
+  </div>
+  
+  <div class="footer-item">
+    
+  </div>
+  
+  <div class="footer-item">
+    
+  </div>
+  
+</div>
+          </footer>
+        
+
+      </main>
+    </div>
+  </div>
+  
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script src="_static/scripts/bootstrap.js?digest=dfe6caa3a7d634c4db9b"></script>
+<script src="_static/scripts/pydata-sphinx-theme.js?digest=dfe6caa3a7d634c4db9b"></script>
+
+  <footer class="bd-footer">
+  </footer>
+  </body>
+</html>
