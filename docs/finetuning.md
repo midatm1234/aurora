@@ -50,6 +50,9 @@ If you need to reduce memory usage, you could try the following:
 You could also try to optimise the activation checkpointing strategy, to
 see if there is something more to gain there.
 
+For a worked example of fine-tuning Aurora Air Pollution on ozone, including results and lessons
+learned, see [Case Study: Fine-Tuning Aurora Air Pollution on Ozone](finetuning_ozone).
+
 For example, on Azure, launch a VM with size `Standard_NC24ads_A100_v4`, image
 Ubuntu 24.04 LTS (x64), and 256 GB of disk space.
 Then [install CUDA](https://learn.microsoft.com/en-us/azure/virtual-machines/linux/n-series-driver-setup).
